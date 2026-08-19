@@ -8,6 +8,8 @@ defaults:
 
 agentlightning:
   port: 9999
+  prefix_grouper:
+    enabled: false
   trace_aggregator:
     level: transition  # transition or trajectory, docs refer to https://agent-lightning.github.io/posts/trajectory_level_aggregation/
     trajectory_max_prompt_length: 2048  # supported in trajectory level aggregation, suggest to set as maximum length for the prompt in first turn

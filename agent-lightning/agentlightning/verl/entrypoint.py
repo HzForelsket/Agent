@@ -127,20 +127,39 @@ class TaskRunner:
             from verl.single_controller.ray import RayWorkerGroup
             from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
 
-            actor_rollout_cls = (
-                AsyncActorRolloutRefWorker
-                if config.actor_rollout_ref.rollout.mode == "async"
-                else ActorRolloutRefWorker
-            )
+            if config.agentlightning.prefix_grouper.enabled:
+                from .prefix_grouper import (
+                    PrefixGrouperActorRolloutRefWorker,
+                    PrefixGrouperAsyncActorRolloutRefWorker,
+                )
+
+                if config.actor_rollout_ref.model.get("use_remove_padding", False):
+                    raise ValueError("PrefixGrouper requires actor_rollout_ref.model.use_remove_padding=false.")
+                actor_rollout_cls = (
+                    PrefixGrouperAsyncActorRolloutRefWorker
+                    if config.actor_rollout_ref.rollout.mode == "async"
+                    else PrefixGrouperActorRolloutRefWorker
+                )
+                ref_worker_cls = PrefixGrouperActorRolloutRefWorker
+            else:
+                actor_rollout_cls = (
+                    AsyncActorRolloutRefWorker
+                    if config.actor_rollout_ref.rollout.mode == "async"
+                    else ActorRolloutRefWorker
+                )
+                ref_worker_cls = ActorRolloutRefWorker
             ray_worker_group_cls = RayWorkerGroup
 
         elif config.actor_rollout_ref.actor.strategy == "megatron":
+            if config.agentlightning.prefix_grouper.enabled:
+                raise ValueError("PrefixGrouper requires the FSDP or FSDP2 actor strategy.")
             assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
             # FIXME: This import is outdated
             from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup  # type: ignore
             from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
 
             actor_rollout_cls = ActorRolloutRefWorker
+            ref_worker_cls = ActorRolloutRefWorker
             ray_worker_group_cls = NVMegatronRayWorkerGroup
 
         else:
@@ -187,7 +206,7 @@ class TaskRunner:
 
         # use reference model
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
-            role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
+            role_worker_mapping[Role.RefPolicy] = ray.remote(ref_worker_cls)
             mapping[Role.RefPolicy] = global_pool_id
 
         reward_fn = load_reward_manager(

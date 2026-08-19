@@ -272,6 +272,11 @@ class AgentLightningTrainer(RayPPOTrainer):
                 self.agent_mode_daemon.clear_data_and_server()
                 self.async_rollout_manager.sleep()
 
+            if self.config.agentlightning.prefix_grouper.enabled:
+                from .prefix_grouper import reorder_by_prompt
+
+                reorder_by_prompt(batch)
+
             if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                 with _timer("gen_max", timing_raw):
                     gen_baseline_batch = deepcopy(gen_batch)
@@ -377,9 +382,14 @@ class AgentLightningTrainer(RayPPOTrainer):
             # next, round to minibatch size
             mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
             n_transition = len(batch)
-            random_indices = list(range(n_transition))
-            random.shuffle(random_indices)
-            batch.reorder(torch.tensor(random_indices).type(torch.int32))
+            if self.config.agentlightning.prefix_grouper.enabled:
+                from .prefix_grouper import reorder_by_prompt
+
+                reorder_by_prompt(batch)
+            else:
+                random_indices = list(range(n_transition))
+                random.shuffle(random_indices)
+                batch.reorder(torch.tensor(random_indices).type(torch.int32))
             n_remained_transition = n_transition // mini_batch_size * mini_batch_size
             batch = batch[list(range(n_remained_transition))]
             metrics["training/n_triplets_dropped_remainder"] = n_transition - n_remained_transition

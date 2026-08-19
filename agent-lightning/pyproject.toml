@@ -34,6 +34,7 @@ apo = [
 # It's not recommended to use agentlightning[verl] to install VERL and its dependencies.
 # though it's listed here for completeness.
 verl = [
+  "prefix_grouper>=0.0.1.post1",
   "verl>=0.5.0",
   "vllm>=0.8.4", # Due to interface change of ExternalZeroMQDistributedExecutor
 ]

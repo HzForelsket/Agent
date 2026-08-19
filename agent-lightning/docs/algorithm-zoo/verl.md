@@ -45,6 +45,32 @@ Internally, [VERL][agentlightning.algorithm.verl.VERL] decomposes each agent exe
 
 At present, [VERL][agentlightning.algorithm.verl.VERL] does not expose fine-grained control over its reward propagation or credit assignment mechanisms. Users requiring customized reward shaping or trajectory decomposition are advised to clone and modify the [VERL][agentlightning.algorithm.verl.VERL] source implementation directly.
 
+### Shared-prefix training with PrefixGrouper
+
+For text-only GRPO workloads, VERL can use [PrefixGrouper](https://github.com/CASIA-IVA-Lab/PrefixGrouper) to compute an identical prompt once for the responses that share it. Enable it in the Agent Lightning section of the VERL configuration and keep padded inputs enabled:
+
+```python
+algorithm = agl.VERL(
+    config={
+        "agentlightning": {"prefix_grouper": {"enabled": True}},
+        "algorithm": {"adv_estimator": "grpo"},
+        "actor_rollout_ref": {
+            "model": {
+                "path": "Qwen/Qwen2.5-0.5B-Instruct",
+                "use_remove_padding": False,
+            },
+            "rollout": {"n": 4, "log_prob_micro_batch_size_per_gpu": 4},
+            "actor": {"ppo_micro_batch_size_per_gpu": 4},
+            "ref": {"log_prob_micro_batch_size_per_gpu": 4},
+        },
+    }
+)
+```
+
+The optimization applies to the actor update and the old/reference-policy log-probability passes; rollout generation remains on the configured vLLM server. Rows are grouped only when their non-padding prompt token IDs match exactly. For best reuse, make the three per-GPU micro-batch sizes multiples of `rollout.n`.
+
+PrefixGrouper currently requires FSDP/FSDP2, `use_remove_padding=False`, fused kernels disabled, Ulysses sequence parallel size 1, and text-only batches. Unsupported multimodal batches fall back to the standard VERL forward.
+
 ## Tutorials Using VERL
 
 - [Train SQL Agent with RL](../how-to/train-sql-agent.md) - A practical example of training a SQL agent using VERL.
