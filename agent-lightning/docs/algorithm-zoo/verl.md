@@ -67,25 +67,28 @@ algorithm = agl.VERL(
 )
 ```
 
-The optimization applies to the actor update and the old/reference-policy log-probability passes; rollout generation remains on the configured vLLM server. Rows are grouped only when their non-padding prompt token IDs match exactly. For best reuse, make the three per-GPU micro-batch sizes multiples of `rollout.n`.
+The optimization applies to the actor update and the old/reference-policy log-probability passes; rollout generation remains on the configured vLLM server. Rows are grouped only when their non-padding prompt token IDs match exactly. The integration targets VERL 0.9's `TrainingWorker`/FSDP model-engine stack and uses VERL's native attention patch.
 
-PrefixGrouper currently requires FSDP/FSDP2, `use_remove_padding=False`, fused kernels disabled, Ulysses sequence parallel size 1, and text-only batches. Unsupported multimodal batches fall back to the standard VERL forward.
+PrefixGrouper currently requires FSDP/FSDP2, `use_remove_padding=False`, fused kernels disabled, Ulysses sequence parallel size 1, and text-only batches. Unsupported multimodal, distillation-top-k, and sum-pi-squared batches fall back to the standard VERL forward.
 
 To compare the standard and shared-prefix paths on a CUDA device, run the benchmark script with one or more Hugging Face model IDs:
 
 ```bash
-python tests/benchmark/prefix_grouper_benchmark.py \
-    --models Qwen/Qwen2.5-0.5B-Instruct HuggingFaceTB/SmolLM2-360M-Instruct \
+pip install -r scripts/requirements_prefix_grouper.txt
+
+python scripts/benchmark_prefix_grouper.py \
+    --models Qwen/Qwen2.5-0.5B-Instruct HuggingFaceTB/SmolLM2-135M-Instruct TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --case 1024:4 \
     --case 1536:8 \
     --batch-size 8 \
     --response-length 64 \
-    --modes forward forward-backward \
     --output-json prefix-grouper-results.json \
     --output-markdown prefix-grouper-results.md
 ```
 
-Each case uses `PROMPT_LENGTH:GROUP_SIZE`. The default `--weights random` mode downloads only model configurations and instantiates the complete architectures, which is sufficient for dense-kernel timing and memory comparisons. Use `--weights pretrained` when learned weights are specifically required. The script checks output equivalence before reporting median latency, speedup, peak memory, and memory reduction.
+Each case uses `PROMPT_LENGTH:GROUP_SIZE`. The script requires and records `torch==2.11.0`, `vllm==0.22.1`, and `verl==0.9.0`. The default `--weights random` mode downloads only model configurations and instantiates the complete architectures, which is sufficient for dense-kernel timing and memory comparisons. Use `--weights pretrained` when learned weights are specifically required. The script checks response log-probability equivalence before reporting median latency, response-token throughput, speedup, peak memory, and memory reduction.
+
+The benchmark requirements select vLLM's official CUDA 12.9 build. For a manual pip installation, add `--extra-index-url https://wheels.vllm.ai/0.22.1/cu129` when installing vLLM 0.22.1; the generic PyPI wheel targets a newer CUDA runtime.
 
 ## Tutorials Using VERL
 

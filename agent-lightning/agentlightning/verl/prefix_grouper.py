@@ -2,287 +2,373 @@
 
 # type: ignore
 
-"""PrefixGrouper integration for VERL's data-parallel actor."""
+"""PrefixGrouper support for the VERL 0.9 model-engine worker stack.
+
+VERL 0.9 ships the attention wrapper and basic PrefixGrouper helpers, but its
+FSDP language-model engine does not call the grouped forward path.  This module
+connects that path to ``FSDPEngineWithLMHead.forward_step`` while preserving the
+nested-tensor output layout expected by VERL's PPO losses.
+"""
 
 from __future__ import annotations
 
-import logging
 from collections import OrderedDict
 from contextlib import nullcontext
-from typing import Any, Dict, List, Tuple
+from types import MethodType
+from typing import Any, Iterable
 
 import torch
 from packaging.version import Version
 from prefix_grouper import PrefixGrouper
-from torch import nn
-from verl.single_controller.base.decorator import Dispatch, register
-from verl.utils.torch_functional import logprobs_from_logits
-from verl.workers.actor import DataParallelPPOActor
-from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
-
-logger = logging.getLogger(__name__)
-
-PREFIX_GROUPER_ATTENTION = "agentlightning_prefix_grouper"
+from tensordict import TensorDict
+from verl.models.transformers.monkey_patch import apply_prefix_grouper_patch as _apply_verl_prefix_grouper_patch
+from verl.trainer.ppo.prefix_grouper_utils import build_position_ids_for_prefix_grouper, pg_forward
+from verl.utils import tensordict_utils as tu
+from verl.utils.device import get_device_id, get_device_name
+from verl.workers.engine.fsdp import FSDPEngineWithLMHead
+from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
 
 __all__ = [
-    "PREFIX_GROUPER_ATTENTION",
     "PrefixGrouperActorRolloutRefWorker",
-    "PrefixGrouperAsyncActorRolloutRefWorker",
-    "PrefixGrouperDataParallelPPOActor",
-    "register_prefix_grouper_attention",
+    "PrefixGrouperTrainingWorker",
+    "apply_prefix_grouper_patch",
+    "forward_with_prefix_grouper",
+    "group_prompt_indices",
     "reorder_by_prompt",
 ]
 
+_PATCHED = False
 
-def _repeat_kv(hidden_states: torch.Tensor, num_attention_heads: int) -> torch.Tensor:
-    """Expand grouped-query key/value heads to the number of query heads."""
-    num_key_value_heads = hidden_states.shape[1]
-    if num_key_value_heads == num_attention_heads:
+
+def _repeat_kv(hidden_states: torch.Tensor, query_heads: int) -> torch.Tensor:
+    key_value_heads = hidden_states.shape[1]
+    if key_value_heads == query_heads:
         return hidden_states
-    if num_attention_heads % num_key_value_heads != 0:
-        raise ValueError(
-            f"The number of attention heads ({num_attention_heads}) must be divisible by the number of "
-            f"key/value heads ({num_key_value_heads})."
-        )
-    return hidden_states.repeat_interleave(num_attention_heads // num_key_value_heads, dim=1)
+    if query_heads % key_value_heads:
+        raise ValueError(f"Query heads ({query_heads}) must be divisible by KV heads ({key_value_heads}).")
+    return hidden_states.repeat_interleave(query_heads // key_value_heads, dim=1)
 
 
-def _causal_padding_mask(
-    padding_mask: torch.Tensor,
-    query_length: int,
-    key_value_length: int,
-) -> torch.Tensor:
-    """Create PrefixGrouper's causal boolean SDPA mask from its 2-D padding mask."""
-    padding_mask = padding_mask.bool()
-    suffix_offset = key_value_length - query_length
+def _causal_sdpa_mask(padding_mask: torch.Tensor, query_length: int, key_length: int) -> torch.Tensor:
+    """Expand PrefixGrouper's 2-D padding mask into SDPA's causal mask."""
+    suffix_offset = key_length - query_length
     if suffix_offset < 0:
-        raise ValueError(f"Key/value length ({key_value_length}) cannot be smaller than query length ({query_length}).")
-
-    query_mask = padding_mask[:, -query_length:]
-    key_value_mask = padding_mask[:, :key_value_length]
+        raise ValueError(f"Key length ({key_length}) cannot be smaller than query length ({query_length}).")
+    padding_mask = padding_mask.bool()
+    query_valid = padding_mask[:, -query_length:]
+    key_valid = padding_mask[:, :key_length]
     query_positions = torch.arange(query_length, device=padding_mask.device).unsqueeze(-1)
-    key_positions = torch.arange(key_value_length, device=padding_mask.device).unsqueeze(0)
-    causal_mask = key_positions <= query_positions + suffix_offset
-    return query_mask[:, None, :, None] & key_value_mask[:, None, None, :] & causal_mask[None, None, :, :]
+    key_positions = torch.arange(key_length, device=padding_mask.device).unsqueeze(0)
+    causal = key_positions <= query_positions + suffix_offset
+    return query_valid[:, None, :, None] & key_valid[:, None, None, :] & causal[None, None, :, :]
 
 
-def _prefix_grouper_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    *args: Any,
-    prefix_grouper: PrefixGrouper | None = None,
-    dropout: float = 0.0,
-    scaling: float | None = None,
-    **kwargs: Any,
-) -> Tuple[torch.Tensor, None]:
-    """Run SDPA normally or split it into shared-prefix and suffix attention."""
-    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+def _sdpa_prefix_grouper_wrapper(original_fn):
+    def wrapped(module, query, key, value, attention_mask, *args, **kwargs):
+        prefix_grouper = kwargs.pop("prefix_grouper", None)
+        if prefix_grouper is None:
+            return original_fn(module, query, key, value, attention_mask, *args, **kwargs)
 
-    if prefix_grouper is None:
-        return sdpa_attention_forward(
-            module,
-            query,
-            key,
-            value,
-            attention_mask,
-            dropout=dropout,
-            scaling=scaling,
-            **kwargs,
-        )
+        dropout = kwargs.pop("dropout", 0.0)
+        scaling = kwargs.pop("scaling", None)
 
-    def attention_forward(
-        inner_query: torch.Tensor,
-        inner_key: torch.Tensor,
-        inner_value: torch.Tensor,
-        padding_mask: torch.Tensor,
-        *_args: Any,
-        **_kwargs: Any,
-    ) -> torch.Tensor:
-        inner_key = _repeat_kv(inner_key, inner_query.shape[1])
-        inner_value = _repeat_kv(inner_value, inner_query.shape[1])
-        causal_mask = _causal_padding_mask(padding_mask, inner_query.shape[2], inner_key.shape[2])
-        output = torch.nn.functional.scaled_dot_product_attention(
-            inner_query,
-            inner_key,
-            inner_value,
-            attn_mask=causal_mask,
-            dropout_p=dropout,
-            scale=scaling,
-        )
-        return output.transpose(1, 2).contiguous()
+        def attention_forward(inner_query, inner_key, inner_value, padding_mask, *_args, **_kwargs):
+            inner_key = _repeat_kv(inner_key, inner_query.shape[1])
+            inner_value = _repeat_kv(inner_value, inner_query.shape[1])
+            causal_mask = _causal_sdpa_mask(padding_mask, inner_query.shape[2], inner_key.shape[2])
+            output = torch.nn.functional.scaled_dot_product_attention(
+                inner_query,
+                inner_key,
+                inner_value,
+                attn_mask=causal_mask,
+                dropout_p=dropout,
+                scale=scaling,
+            )
+            return output.transpose(1, 2).contiguous()
 
-    return prefix_grouper.forward(attention_forward, query, key, value), None
+        return prefix_grouper.forward(attention_forward, query, key, value), None
+
+    return wrapped
 
 
-def register_prefix_grouper_attention() -> None:
-    """Register the custom attention and its standard SDPA fallback mask."""
-    from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
+def apply_prefix_grouper_patch() -> None:
+    """Apply VERL's patch plus a causal-mask fix for its SDPA adapter."""
+    global _PATCHED
+    if _PATCHED:
+        return
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-    ALL_ATTENTION_FUNCTIONS.register(PREFIX_GROUPER_ATTENTION, _prefix_grouper_attention_forward)
-    ALL_MASK_ATTENTION_FUNCTIONS.register(
-        PREFIX_GROUPER_ATTENTION,
-        ALL_MASK_ATTENTION_FUNCTIONS["sdpa"],
-    )
+    original_sdpa = ALL_ATTENTION_FUNCTIONS["sdpa"]
+    _apply_verl_prefix_grouper_patch()
+    ALL_ATTENTION_FUNCTIONS["sdpa"] = _sdpa_prefix_grouper_wrapper(original_sdpa)
+    _PATCHED = True
 
 
-def _prompt_groups(
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    response_length: int,
-) -> List[List[int]]:
-    """Group row indices whose non-padding prompt token IDs are identical."""
-    prompt_ids = input_ids[:, :-response_length]
-    prompt_mask = attention_mask[:, :-response_length].bool()
-    groups: OrderedDict[Tuple[int, ...], List[int]] = OrderedDict()
-    for row_index in range(input_ids.shape[0]):
-        key = tuple(prompt_ids[row_index][prompt_mask[row_index]].detach().cpu().tolist())
-        groups.setdefault(key, []).append(row_index)
+def _check_verl_version() -> None:
+    import verl
+
+    current = Version(verl.__version__)
+    if not Version("0.9.0") <= current < Version("0.10.0"):
+        raise RuntimeError(f"This PrefixGrouper integration requires VERL 0.9.x, found {verl.__version__}.")
+
+
+def _prompt_key(prompt: torch.Tensor, pad_token_id: int) -> tuple[int, ...]:
+    return tuple(prompt[prompt.ne(pad_token_id)].detach().cpu().tolist())
+
+
+def group_prompt_indices(prompts: torch.Tensor, pad_token_id: int) -> list[list[int]]:
+    """Return stable groups of rows with exactly equal non-padding prompts."""
+    groups: OrderedDict[tuple[int, ...], list[int]] = OrderedDict()
+    for row, prompt in enumerate(prompts):
+        groups.setdefault(_prompt_key(prompt, pad_token_id), []).append(row)
     return list(groups.values())
 
 
-def reorder_by_prompt(batch: Any) -> None:
-    """Place larger identical-prompt groups first so VERL micro-batches keep them together."""
-    response_length = batch.batch["responses"].shape[-1]
-    groups = _prompt_groups(batch.batch["input_ids"], batch.batch["attention_mask"], response_length)
-    groups.sort(key=lambda indices: -len(indices))
-    order = [row_index for indices in groups for row_index in indices]
-    batch.reorder(torch.tensor(order, dtype=torch.int32))
+def _group_order(groups: Iterable[list[int]], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    order = torch.tensor([row for group in groups for row in group], dtype=torch.long, device=device)
+    inverse = torch.empty_like(order)
+    inverse[order] = torch.arange(order.numel(), device=device)
+    return order, inverse
 
 
-class PrefixGrouperDataParallelPPOActor(DataParallelPPOActor):
-    """VERL actor that uses one prompt forward for responses sharing exact token prefixes."""
+def _as_scalar(value: Any) -> float:
+    value = tu.unwrap_non_tensor_data(value)
+    if torch.is_tensor(value):
+        if value.numel() != 1:
+            raise ValueError("PrefixGrouper currently requires a scalar temperature.")
+        return float(value.item())
+    return float(value)
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        if self.use_remove_padding:
-            raise ValueError("PrefixGrouper requires actor_rollout_ref.model.use_remove_padding=false.")
-        if self.use_fused_kernels:
-            raise ValueError("PrefixGrouper does not support VERL fused kernels.")
-        if self.ulysses_sequence_parallel_size != 1:
-            raise ValueError("PrefixGrouper does not support Ulysses sequence parallelism.")
 
-    def update_policy(self, data: Any) -> Any:
-        # VERL's global token balancing can interleave prompt groups. Restore
-        # group locality within each data-parallel rank before making micro-batches.
-        reorder_by_prompt(data)
-        return super().update_policy(data)
+def _response_values_to_nested(
+    values: torch.Tensor,
+    *,
+    input_ids: torch.Tensor,
+    prompt_lengths: torch.Tensor,
+    response_lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Place response predictions in VERL's full-sequence jagged layout."""
+    if not input_ids.is_nested:
+        raise ValueError("VERL 0.9 PrefixGrouper expects no-padding nested input_ids.")
 
-    def _forward_micro_batch(
-        self,
-        micro_batch: Dict[str, Any],
-        temperature: float,
-        calculate_entropy: bool = False,
-    ) -> Tuple[torch.Tensor | None, torch.Tensor]:
-        if "multi_modal_inputs" in micro_batch:
-            if not getattr(self, "_prefix_grouper_warned_multimodal", False):
-                logger.warning("PrefixGrouper currently supports text-only batches; using the standard VERL forward.")
-                self._prefix_grouper_warned_multimodal = True
-            return super()._forward_micro_batch(micro_batch, temperature, calculate_entropy)
-
-        input_ids = micro_batch["input_ids"]
-        attention_mask = micro_batch["attention_mask"]
-        position_ids = micro_batch["position_ids"]
-        responses = micro_batch["responses"]
-        response_length = responses.shape[-1]
-        prompt_length = input_ids.shape[-1] - response_length
-        groups = _prompt_groups(input_ids, attention_mask, response_length)
-        if all(len(indices) == 1 for indices in groups):
-            return super()._forward_micro_batch(micro_batch, temperature, calculate_entropy)
-
-        order = torch.tensor(
-            [row_index for indices in groups for row_index in indices],
-            dtype=torch.long,
-            device=input_ids.device,
-        )
-        representatives = torch.tensor(
-            [indices[0] for indices in groups],
-            dtype=torch.long,
-            device=input_ids.device,
-        )
-        inverse_order = torch.empty_like(order)
-        inverse_order[order] = torch.arange(order.shape[0], device=order.device)
-
-        prompt_ids = input_ids[representatives, :prompt_length]
-        prompt_mask = attention_mask[representatives, :prompt_length]
-        response_ids = responses[order]
-        response_mask = attention_mask[order, prompt_length:]
-        prefix_grouper = PrefixGrouper.from_ungrouped_masks(
-            prefix_mask=prompt_mask,
-            suffix_mask=response_mask,
-            group_sizes=[len(indices) for indices in groups],
-            device=input_ids.device,
-            padding_mode="right",
-        )
-        grouped_input_ids = prefix_grouper.concat_input(prompt_ids, prompt_mask, response_ids, response_mask)
-        grouped_position_ids = prefix_grouper.concat_input(
-            position_ids[representatives, :prompt_length],
-            prompt_mask,
-            position_ids[order, prompt_length:],
-            response_mask,
-        )
-
-        autocast_context = (
-            torch.autocast(device_type=self.device_name, dtype=self.param_dtype)
-            if self.param_dtype != torch.float32
-            else nullcontext()
-        )
-        with autocast_context:
-            output = self.actor_module(
-                input_ids=grouped_input_ids,
-                attention_mask=prefix_grouper.padding_mask,
-                position_ids=grouped_position_ids,
-                use_cache=False,
-                prefix_grouper=prefix_grouper,
+    sequence_lengths = input_ids.offsets().diff().tolist()
+    rows = []
+    for row, (sequence_length, prompt_length, response_length) in enumerate(
+        zip(sequence_lengths, prompt_lengths.tolist(), response_lengths.tolist(), strict=True)
+    ):
+        if prompt_length <= 0:
+            raise ValueError("PrefixGrouper requires every sample to contain at least one prompt token.")
+        if sequence_length != prompt_length + response_length:
+            raise ValueError(
+                "Nested input length does not match prompt + response length: "
+                f"{sequence_length} != {prompt_length} + {response_length}."
             )
-            _, _, suffix_logits, _ = prefix_grouper.split_output(output.logits, include_prefix_last=1)
-            suffix_logits = suffix_logits[:, :-1]
-            target_ids = prefix_grouper.convert_padding(response_ids, response_mask, padding_mode="right")
-            suffix_logits = suffix_logits / temperature
-            compact_log_probs = logprobs_from_logits(suffix_logits, target_ids)
-            compact_entropy = self.compute_entropy_from_logits(suffix_logits) if calculate_entropy else None
-
-        compact_length = compact_log_probs.shape[-1]
-        log_probs = compact_log_probs.new_zeros((input_ids.shape[0], response_length))
-        log_probs[:, :compact_length] = compact_log_probs[inverse_order]
-        entropy = None
-        if compact_entropy is not None:
-            entropy = compact_entropy.new_zeros((input_ids.shape[0], response_length))
-            entropy[:, :compact_length] = compact_entropy[inverse_order]
-
-        return entropy, log_probs
+        full_row = values.new_zeros(sequence_length)
+        full_row[prompt_length - 1 : prompt_length + response_length - 1] = values[row, :response_length]
+        rows.append(full_row)
+    return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
 
 
-class _PrefixGrouperWorkerMixin:
-    def _build_model_optimizer(self, *args: Any, **kwargs: Any) -> Any:
-        override_model_config = dict(kwargs.get("override_model_config", {}))
-        override_model_config["attn_implementation"] = PREFIX_GROUPER_ATTENTION
-        kwargs["override_model_config"] = override_model_config
-        return super()._build_model_optimizer(*args, **kwargs)
+def forward_with_prefix_grouper(
+    micro_batch: TensorDict | dict[str, Any],
+    model: torch.nn.Module,
+    *,
+    temperature: float,
+    calculate_entropy: bool,
+    entropy_fn: Any,
+) -> dict[str, torch.Tensor] | None:
+    """Run a shared-prefix forward and return VERL-compatible model outputs.
 
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def init_model(self) -> None:
-        import verl
-        import verl.workers.actor
+    ``None`` means that the batch has no repeated prompt and should use VERL's
+    standard forward path.
+    """
+    if "multi_modal_inputs" in micro_batch:
+        return None
 
-        if Version(verl.__version__) < Version("0.6.0"):
-            raise RuntimeError(f"PrefixGrouper requires VERL >= 0.6.0, found {verl.__version__}.")
+    prompts = micro_batch["prompts"]
+    responses = micro_batch["responses"]
+    response_mask = micro_batch["response_mask"].bool()
+    input_ids = micro_batch["input_ids"]
 
-        register_prefix_grouper_attention()
-        original_actor_cls = verl.workers.actor.DataParallelPPOActor
-        verl.workers.actor.DataParallelPPOActor = PrefixGrouperDataParallelPPOActor
-        try:
-            super().init_model()
-        finally:
-            verl.workers.actor.DataParallelPPOActor = original_actor_cls
+    if prompts.is_nested or responses.is_nested:
+        raise ValueError("PrefixGrouper requires the padded prompts and responses retained by VERL 0.9.")
+
+    if "attention_mask" in micro_batch and not micro_batch["attention_mask"].is_nested:
+        prompt_mask = micro_batch["attention_mask"][:, : prompts.shape[1]].bool()
+    else:
+        pad_token_id = int(tu.get_non_tensor_data(micro_batch, "pad_token_id", 0))
+        prompt_mask = prompts.ne(pad_token_id)
+    grouped: OrderedDict[tuple[int, ...], list[int]] = OrderedDict()
+    for row, prompt in enumerate(prompts):
+        key = tuple(prompt[prompt_mask[row]].detach().cpu().tolist())
+        grouped.setdefault(key, []).append(row)
+    groups = list(grouped.values())
+    if all(len(group) == 1 for group in groups):
+        return None
+
+    order, inverse_order = _group_order(groups, prompts.device)
+    representatives = torch.tensor([group[0] for group in groups], dtype=torch.long, device=prompts.device)
+    prefix_ids = prompts.index_select(0, representatives)
+    prefix_mask = prompt_mask.index_select(0, representatives)
+    ordered_responses = responses.index_select(0, order)
+    ordered_response_mask = response_mask.index_select(0, order)
+
+    prefix_grouper = PrefixGrouper.from_ungrouped_masks(
+        prefix_mask=prefix_mask,
+        suffix_mask=ordered_response_mask,
+        group_sizes=[len(group) for group in groups],
+        padding_mode="right",
+        device=prompts.device,
+    )
+    concat_input_ids = prefix_grouper.concat_input(
+        prefix_ids,
+        prefix_mask,
+        ordered_responses,
+        ordered_response_mask,
+    )
+    position_ids = build_position_ids_for_prefix_grouper(prefix_grouper)
+
+    log_probs, entropy, suffix_mask = pg_forward(
+        model=model,
+        prefix_grouper=prefix_grouper,
+        concat_input_ids=concat_input_ids,
+        attention_mask=prefix_grouper.padding_mask,
+        position_ids=position_ids,
+        completion_ids=ordered_responses,
+        completion_mask=ordered_response_mask,
+        temperature=temperature,
+        padding_mode="right",
+        include_prefix_last=1,
+        calculate_entropy=calculate_entropy,
+        entropy_fn=entropy_fn,
+    )
+
+    log_probs = log_probs.masked_fill(~suffix_mask.bool(), 0).index_select(0, inverse_order)
+    if entropy is not None:
+        entropy = entropy.masked_fill(~suffix_mask.bool(), 0).index_select(0, inverse_order)
+
+    prompt_lengths = prompt_mask.sum(dim=-1)
+    response_lengths = response_mask.sum(dim=-1)
+    output = {
+        "log_probs": _response_values_to_nested(
+            log_probs,
+            input_ids=input_ids,
+            prompt_lengths=prompt_lengths,
+            response_lengths=response_lengths,
+        )
+    }
+    if entropy is not None:
+        output["entropy"] = _response_values_to_nested(
+            entropy,
+            input_ids=input_ids,
+            prompt_lengths=prompt_lengths,
+            response_lengths=response_lengths,
+        )
+    return output
 
 
-class PrefixGrouperActorRolloutRefWorker(_PrefixGrouperWorkerMixin, ActorRolloutRefWorker):
-    """Synchronous FSDP worker with PrefixGrouper-enabled actor forwards."""
+def _prefix_grouper_forward_step(
+    engine: FSDPEngineWithLMHead,
+    micro_batch: TensorDict,
+    loss_function: Any,
+    forward_only: bool,
+):
+    """FSDP engine hook matching VERL 0.9's ``forward_step`` contract."""
+    unsupported = (
+        tu.get_non_tensor_data(micro_batch, "use_remove_padding", False)
+        or tu.get_non_tensor_data(micro_batch, "use_fused_kernels", False)
+        or tu.get_non_tensor_data(micro_batch, "distillation_use_topk", False)
+        or tu.get_non_tensor_data(micro_batch, "calculate_sum_pi_squared", False)
+    )
+    if unsupported or "multi_modal_inputs" in micro_batch:
+        return FSDPEngineWithLMHead.forward_step(engine, micro_batch, loss_function, forward_only)
+
+    micro_batch = micro_batch.to(get_device_id())
+    temperature = _as_scalar(micro_batch["temperature"])
+    calculate_entropy = bool(tu.get_non_tensor_data(micro_batch, "calculate_entropy", False))
+    autocast_dtype = getattr(engine, "_autocast_dtype", torch.bfloat16)
+    autocast_ctx = (
+        nullcontext()
+        if autocast_dtype == torch.float32
+        else torch.autocast(device_type=get_device_name(), dtype=autocast_dtype)
+    )
+
+    with autocast_ctx:
+        model_output = forward_with_prefix_grouper(
+            micro_batch,
+            engine.module,
+            temperature=temperature,
+            calculate_entropy=calculate_entropy,
+            entropy_fn=engine.compute_entropy_from_logits,
+        )
+        if model_output is None:
+            return FSDPEngineWithLMHead.forward_step(engine, micro_batch, loss_function, forward_only)
+
+        if loss_function is not None:
+            loss, metrics = loss_function(
+                model_output=model_output,
+                data=micro_batch,
+                dp_group=engine.get_data_parallel_group(),
+            )
+        else:
+            if not forward_only:
+                raise AssertionError("forward_only must be true when loss_function is None")
+            loss = torch.tensor(1.0, device=get_device_name())
+            metrics = {}
+
+        detached_output = {
+            key: value.detach() if torch.is_tensor(value) and value.grad_fn is not None else value
+            for key, value in model_output.items()
+        }
+        metadata = {
+            "model_output": detached_output,
+            "loss": loss.detach().item(),
+            "metrics": metrics,
+        }
+        return loss, metadata
 
 
-class PrefixGrouperAsyncActorRolloutRefWorker(_PrefixGrouperWorkerMixin, AsyncActorRolloutRefWorker):
-    """Asynchronous FSDP worker with PrefixGrouper-enabled actor forwards."""
+class PrefixGrouperTrainingWorker(TrainingWorker):
+    """VERL 0.9 training worker with PrefixGrouper wired into its FSDP engine."""
+
+    def __init__(self, config: Any):
+        _check_verl_version()
+        if config.model_type != "language_model":
+            raise ValueError("PrefixGrouper is only supported for VERL language-model workers.")
+        if config.model_config.get("use_remove_padding", False):
+            raise ValueError("PrefixGrouper requires actor_rollout_ref.model.use_remove_padding=false.")
+        if config.model_config.get("use_fused_kernels", False):
+            raise ValueError("PrefixGrouper does not support VERL fused kernels.")
+        if config.engine_config.ulysses_sequence_parallel_size != 1:
+            raise ValueError("PrefixGrouper does not support Ulysses sequence parallelism.")
+        if config.engine_config.strategy not in {"fsdp", "fsdp2"}:
+            raise ValueError("PrefixGrouper requires VERL's FSDP or FSDP2 engine.")
+
+        apply_prefix_grouper_patch()
+        super().__init__(config=config)
+        if not isinstance(self.engine, FSDPEngineWithLMHead):
+            raise TypeError(f"Expected FSDPEngineWithLMHead, found {type(self.engine).__name__}.")
+        self.engine.forward_step = MethodType(_prefix_grouper_forward_step, self.engine)
+
+
+class PrefixGrouperActorRolloutRefWorker(ActorRolloutRefWorker):
+    """VERL 0.9 actor/rollout/reference worker using PrefixGrouper for actor and ref forwards."""
+
+    actor_worker_cls = PrefixGrouperTrainingWorker
+    ref_worker_cls = PrefixGrouperTrainingWorker
+
+
+def reorder_by_prompt(batch: Any) -> None:
+    """Place equal prompts contiguously before VERL partitions the batch."""
+    responses = batch.batch["responses"]
+    response_length = responses.shape[-1]
+    prompts = batch.batch.get("prompts", batch.batch["input_ids"][:, :-response_length])
+    attention_mask = batch.batch["attention_mask"][:, :-response_length]
+    grouped: OrderedDict[tuple[int, ...], list[int]] = OrderedDict()
+    for row, prompt in enumerate(prompts):
+        key = tuple(prompt[attention_mask[row].bool()].detach().cpu().tolist())
+        grouped.setdefault(key, []).append(row)
+    groups = list(grouped.values())
+    groups.sort(key=len, reverse=True)
+    order = torch.tensor([row for group in groups for row in group], dtype=torch.int64)
+    batch.reorder(order)

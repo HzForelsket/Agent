@@ -21,6 +21,9 @@ data:
   filter_overlong_prompts: false
 
 actor_rollout_ref:
+  actor:
+    # VERL 0.9 uses this flag to keep equal-UID samples on the same data-parallel rank.
+    use_prefix_grouper: ${agentlightning.prefix_grouper.enabled}
   rollout:
     mode: async
     agent:

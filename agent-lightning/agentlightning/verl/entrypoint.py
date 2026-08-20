@@ -6,13 +6,12 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Type
+from typing import TYPE_CHECKING, Any, Type, cast
 
 import hydra
 import ray
-from ray.actor import ActorClass
-from verl.trainer.main_ppo import create_rl_sampler
 from verl.trainer.ppo.reward import load_reward_manager
+from verl.trainer.ppo.utils import create_rl_sampler, need_critic, need_reference_policy
 
 from agentlightning.adapter import TraceAdapter
 from agentlightning.llm_proxy import LLMProxy
@@ -25,11 +24,7 @@ if TYPE_CHECKING:
     from .daemon import AgentModeDaemon
     from .trainer import AgentLightningTrainer
 
-__all__ = [
-    "main",
-    "run_ppo",
-    "TaskRunner",
-]
+__all__ = ["main", "run_ppo", "TaskRunner"]
 
 
 @hydra.main(config_path="pkg://agentlightning/verl", config_name="config", version_base=None)
@@ -60,19 +55,12 @@ def run_ppo(
     daemon_cls: Type[AgentModeDaemon],
 ) -> None:
     if not ray.is_initialized():
-        # this is for local ray cluster
-        try:
-            # verl >= 0.6.0
-            num_cpus = config.ray_kwargs.ray_init.num_cpus
-        except AttributeError:
-            # verl < 0.6.0
-            num_cpus = config.ray_init.num_cpus
-        ray.init(
-            runtime_env={
-                "env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN"}
-            },
-            num_cpus=num_cpus,
+        from omegaconf import OmegaConf
+
+        ray_init_kwargs = cast(
+            dict[str, Any], OmegaConf.to_container(config.ray_kwargs.get("ray_init", {}), resolve=True)
         )
+        ray.init(**ray_init_kwargs)
 
     runner = TaskRunner.remote()
     ray.get(
@@ -89,8 +77,10 @@ def run_ppo(
     )
 
 
-@ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
+@ray.remote(num_cpus=1)
 class TaskRunner:
+    """Build Agent Lightning on VERL 0.9's unified model-engine workers."""
+
     def run(
         self,
         config: Any,
@@ -102,124 +92,66 @@ class TaskRunner:
         trainer_cls: Type[AgentLightningTrainer],
         daemon_cls: Type[AgentModeDaemon],
     ):
-        # print initial config
         from pprint import pprint
 
         from omegaconf import OmegaConf
-        from verl.utils.fs import copy_to_local
+        from verl.single_controller.ray import RayWorkerGroup, ResourcePoolManager
+        from verl.trainer.ppo.utils import Role
+        from verl.utils.config import omega_conf_to_dataclass
+        from verl.workers.config import HFModelConfig
+        from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
 
-        pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
+        pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
-        # download the checkpoint from hdfs
-        local_path = copy_to_local(config.actor_rollout_ref.model.path)
+        model_config: HFModelConfig = omega_conf_to_dataclass(config.actor_rollout_ref.model)
+        tokenizer = model_config.tokenizer
+        processor = model_config.processor
 
-        # instantiate tokenizer
-        from verl.utils.tokenizer import hf_processor, hf_tokenizer
+        if config.actor_rollout_ref.rollout.name == "vllm":
+            from .async_server import install_vllm_server_patch
 
-        trust_remote_code = config.data.get("trust_remote_code", False)
-        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        processor = hf_processor(local_path, use_fast=True)  # used for multimodal LLM, could be none
+            install_vllm_server_patch()
 
-        # define worker classes
-        if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
-            assert config.critic.strategy in ["fsdp", "fsdp2"]
-            from verl.single_controller.ray import RayWorkerGroup
-            from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
-
-            if config.agentlightning.prefix_grouper.enabled:
-                from .prefix_grouper import (
-                    PrefixGrouperActorRolloutRefWorker,
-                    PrefixGrouperAsyncActorRolloutRefWorker,
-                )
-
-                if config.actor_rollout_ref.model.get("use_remove_padding", False):
-                    raise ValueError("PrefixGrouper requires actor_rollout_ref.model.use_remove_padding=false.")
-                actor_rollout_cls = (
-                    PrefixGrouperAsyncActorRolloutRefWorker
-                    if config.actor_rollout_ref.rollout.mode == "async"
-                    else PrefixGrouperActorRolloutRefWorker
-                )
-                ref_worker_cls = PrefixGrouperActorRolloutRefWorker
-            else:
-                actor_rollout_cls = (
-                    AsyncActorRolloutRefWorker
-                    if config.actor_rollout_ref.rollout.mode == "async"
-                    else ActorRolloutRefWorker
-                )
-                ref_worker_cls = ActorRolloutRefWorker
-            ray_worker_group_cls = RayWorkerGroup
-
-        elif config.actor_rollout_ref.actor.strategy == "megatron":
-            if config.agentlightning.prefix_grouper.enabled:
+        strategy = config.actor_rollout_ref.actor.strategy
+        if config.agentlightning.prefix_grouper.enabled:
+            if strategy not in {"fsdp", "fsdp2"}:
                 raise ValueError("PrefixGrouper requires the FSDP or FSDP2 actor strategy.")
-            assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
-            # FIXME: This import is outdated
-            from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup  # type: ignore
-            from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
+            if config.actor_rollout_ref.model.get("use_remove_padding", False):
+                raise ValueError("PrefixGrouper requires actor_rollout_ref.model.use_remove_padding=false.")
+            from .prefix_grouper import PrefixGrouperActorRolloutRefWorker
 
-            actor_rollout_cls = ActorRolloutRefWorker
-            ref_worker_cls = ActorRolloutRefWorker
-            ray_worker_group_cls = NVMegatronRayWorkerGroup
-
+            actor_rollout_cls = PrefixGrouperActorRolloutRefWorker
         else:
-            raise NotImplementedError
+            actor_rollout_cls = ActorRolloutRefWorker
 
-        from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+        lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
+        if lora_rank <= 0:
+            lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
+        ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+        actor_role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
 
-        try:
-            # verl >= 0.6.0
-            from verl.trainer.ppo.utils import Role
-        except ImportError:
-            # Fallback for verl <= 0.5.0
-            from verl.trainer.ppo.ray_trainer import Role  # type: ignore
+        role_worker_mapping: dict[Any, Any] = {actor_role: ray.remote(actor_rollout_cls)}
+        mapping: dict[Any, str] = {actor_role: "global_pool"}
+        if need_critic(config):
+            role_worker_mapping[Role.Critic] = ray.remote(TrainingWorker)
+            mapping[Role.Critic] = "global_pool"
+        if config.reward.reward_model.enable:
+            mapping[Role.RewardModel] = "global_pool"
 
-        role_worker_mapping: dict[Role, ActorClass[Any]] = {
-            Role.ActorRollout: ray.remote(actor_rollout_cls),
-            Role.Critic: ray.remote(CriticWorker),
-        }
-
-        global_pool_id = "global_pool"
         resource_pool_spec = {
-            global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+            "global_pool": [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
         }
-        mapping = {
-            Role.ActorRollout: global_pool_id,
-            Role.Critic: global_pool_id,
-        }
-
-        # we should adopt a multi-source reward function here
-        # - for rule-based rm, we directly call a reward score
-        # - for model-based rm, we call a model
-        # - for code related prompt, we send to a sandbox if there are test cases
-        # - finally, we combine all the rewards together
-        # - The reward type depends on the tag of the data
-        if config.reward_model.enable:
-            if config.reward_model.strategy in ["fsdp", "fsdp2"]:
-                from verl.workers.fsdp_workers import RewardModelWorker
-            elif config.reward_model.strategy == "megatron":
-                from verl.workers.megatron_workers import RewardModelWorker
-            else:
-                raise NotImplementedError
-            role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
-            mapping[Role.RewardModel] = global_pool_id
-
-        # use reference model
-        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
-            role_worker_mapping[Role.RefPolicy] = ray.remote(ref_worker_cls)
-            mapping[Role.RefPolicy] = global_pool_id
-
-        reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
+        resource_pool_manager = ResourcePoolManager(
+            resource_pool_spec=resource_pool_spec, mapping=cast(dict[int, str], mapping)
         )
-        val_reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
-        )
-        resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+
+        reward_kwargs = config.reward.reward_model.get("reward_kwargs", {})
+        reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **reward_kwargs)
+        val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **reward_kwargs)
 
         from verl.utils.dataset.rl_dataset import collate_fn
 
-        # Use our special dataset
         if train_dataset is None:
             train_dataset = AgentDataset(
                 data_files=config.data.train_files,
@@ -247,9 +179,7 @@ class TaskRunner:
             processor=processor,
             role_worker_mapping=role_worker_mapping,
             resource_pool_manager=resource_pool_manager,
-            ray_worker_group_cls=ray_worker_group_cls,
-            reward_fn=reward_fn,
-            val_reward_fn=val_reward_fn,
+            ray_worker_group_cls=RayWorkerGroup,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
             collate_fn=collate_fn,
@@ -258,6 +188,8 @@ class TaskRunner:
             llm_proxy=llm_proxy,
             adapter=adapter,
             daemon_cls=daemon_cls,
+            reward_fn=reward_fn,
+            val_reward_fn=val_reward_fn,
         )
         trainer.init_workers()
         trainer.fit()

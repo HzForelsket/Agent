@@ -1,0 +1,416 @@
+{
+  "created_at": "2026-08-20T07:20:57.571183+00:00",
+  "stack": {
+    "torch": "2.11.0",
+    "vllm": "0.22.1+cu129",
+    "verl": "0.9.0",
+    "transformers": "5.10.4",
+    "prefix_grouper": "0.0.1.post1"
+  },
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "dtype": "bfloat16",
+  "weights": "random",
+  "batch_size": 8,
+  "response_length": 64,
+  "models": [
+    {
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "label": "Qwen2.5-0.5B-Instruct",
+      "model_type": "qwen2",
+      "parameters": 494032768,
+      "cases": [
+        {
+          "prompt_length": 256,
+          "group_size": 4,
+          "correctness": {
+            "passed": true,
+            "max_response_log_prob_error": 0.03515434265136719,
+            "mean_response_log_prob_error": 0.009388545528054237,
+            "max_logit_error": 0.0706787109375,
+            "mean_logit_error": 0.009544615633785725,
+            "top1_agreement": 0.94140625,
+            "max_tolerance": 0.2,
+            "mean_tolerance": 0.05
+          },
+          "measurements": [
+            {
+              "mode": "forward",
+              "baseline_ms": 25.481216430664062,
+              "prefix_grouper_ms": 42.73356628417969,
+              "speedup": 0.5962810653623687,
+              "baseline_response_tokens_per_second": 20093.232259660093,
+              "prefix_grouper_response_tokens_per_second": 11981.213938363637,
+              "baseline_peak_mib": 1705.7509765625,
+              "prefix_grouper_peak_mib": 1705.8876953125,
+              "peak_memory_saved_ratio": -8.015164691599352e-05,
+              "baseline_incremental_mib": 746.375,
+              "prefix_grouper_incremental_mib": 746.51171875,
+              "baseline_samples_ms": [
+                26.762239456176758,
+                25.481216430664062,
+                24.217599868774414
+              ],
+              "prefix_grouper_samples_ms": [
+                43.13087844848633,
+                42.673152923583984,
+                42.73356628417969
+              ]
+            },
+            {
+              "mode": "forward-backward",
+              "baseline_ms": 75.615234375,
+              "prefix_grouper_ms": 104.49203491210938,
+              "speedup": 0.7236459165390137,
+              "baseline_response_tokens_per_second": 6771.122304016531,
+              "prefix_grouper_response_tokens_per_second": 4899.8950056878,
+              "baseline_peak_mib": 6114.03515625,
+              "prefix_grouper_peak_mib": 3545.791015625,
+              "peak_memory_saved_ratio": 0.42005714311270237,
+              "baseline_incremental_mib": 4193.3369140625,
+              "prefix_grouper_incremental_mib": 1585.4677734375,
+              "baseline_samples_ms": [
+                74.4796142578125,
+                75.615234375,
+                75.86406707763672
+              ],
+              "prefix_grouper_samples_ms": [
+                107.8814697265625,
+                99.525634765625,
+                104.49203491210938
+              ]
+            }
+          ]
+        },
+        {
+          "prompt_length": 512,
+          "group_size": 8,
+          "correctness": {
+            "passed": true,
+            "max_response_log_prob_error": 0.03905773162841797,
+            "mean_response_log_prob_error": 0.010601479560136795,
+            "max_logit_error": 0.078125,
+            "mean_logit_error": 0.010316641069948673,
+            "top1_agreement": 0.9296875,
+            "max_tolerance": 0.2,
+            "mean_tolerance": 0.05
+          },
+          "measurements": [
+            {
+              "mode": "forward",
+              "baseline_ms": 41.957374572753906,
+              "prefix_grouper_ms": 43.500545501708984,
+              "speedup": 0.9645252510938178,
+              "baseline_response_tokens_per_second": 12202.86076556564,
+              "prefix_grouper_response_tokens_per_second": 11769.967343970096,
+              "baseline_peak_mib": 2311.3974609375,
+              "prefix_grouper_peak_mib": 1714.8408203125,
+              "peak_memory_saved_ratio": 0.2580934913647597,
+              "baseline_incremental_mib": 1343.875,
+              "prefix_grouper_incremental_mib": 747.318359375,
+              "baseline_samples_ms": [
+                41.260032653808594,
+                41.957374572753906,
+                42.11199951171875
+              ],
+              "prefix_grouper_samples_ms": [
+                43.500545501708984,
+                43.6049919128418,
+                43.37868881225586
+              ]
+            },
+            {
+              "mode": "forward-backward",
+              "baseline_ms": 130.96652221679688,
+              "prefix_grouper_ms": 106.8564453125,
+              "speedup": 1.225630534815072,
+              "baseline_response_tokens_per_second": 3909.3960145971896,
+              "prefix_grouper_response_tokens_per_second": 4791.475128174665,
+              "baseline_peak_mib": 10022.814453125,
+              "prefix_grouper_peak_mib": 3711.4375,
+              "peak_memory_saved_ratio": 0.6297010667654517,
+              "baseline_incremental_mib": 8104.3447265625,
+              "prefix_grouper_incremental_mib": 1787.1552734375,
+              "baseline_samples_ms": [
+                129.98963928222656,
+                130.96652221679688,
+                131.29933166503906
+              ],
+              "prefix_grouper_samples_ms": [
+                99.72838592529297,
+                106.8564453125,
+                108.50611114501953
+              ]
+            }
+          ]
+        }
+      ],
+      "elapsed_seconds": 28.950936281122267
+    },
+    {
+      "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "label": "SmolLM2-135M-Instruct",
+      "model_type": "llama",
+      "parameters": 134515008,
+      "cases": [
+        {
+          "prompt_length": 256,
+          "group_size": 4,
+          "correctness": {
+            "passed": true,
+            "max_response_log_prob_error": 0.1172943115234375,
+            "mean_response_log_prob_error": 0.029460754245519638,
+            "max_logit_error": 0.25244140625,
+            "mean_logit_error": 0.029698193073272705,
+            "top1_agreement": 0.927734375,
+            "max_tolerance": 0.2,
+            "mean_tolerance": 0.05
+          },
+          "measurements": [
+            {
+              "mode": "forward",
+              "baseline_ms": 17.80735969543457,
+              "prefix_grouper_ms": 48.58060836791992,
+              "speedup": 0.3665528344267013,
+              "baseline_response_tokens_per_second": 28752.15690348895,
+              "prefix_grouper_response_tokens_per_second": 10539.184608855123,
+              "baseline_peak_mib": 518.79931640625,
+              "prefix_grouper_peak_mib": 517.48681640625,
+              "peak_memory_saved_ratio": 0.002529879971877702,
+              "baseline_incremental_mib": 242.8125,
+              "prefix_grouper_incremental_mib": 241.5,
+              "baseline_samples_ms": [
+                17.80633544921875,
+                17.80735969543457,
+                17.82579231262207
+              ],
+              "prefix_grouper_samples_ms": [
+                51.05766296386719,
+                48.58060836791992,
+                48.553985595703125
+              ]
+            },
+            {
+              "mode": "forward-backward",
+              "baseline_ms": 63.6497917175293,
+              "prefix_grouper_ms": 124.31871795654297,
+              "speedup": 0.5119888039689954,
+              "baseline_response_tokens_per_second": 8044.016895957792,
+              "prefix_grouper_response_tokens_per_second": 4118.44658966782,
+              "baseline_peak_mib": 2635.12451171875,
+              "prefix_grouper_peak_mib": 1542.24755859375,
+              "peak_memory_saved_ratio": 0.41473446444933837,
+              "baseline_incremental_mib": 2076.61083984375,
+              "prefix_grouper_incremental_mib": 991.54638671875,
+              "baseline_samples_ms": [
+                60.474369049072266,
+                63.6497917175293,
+                66.32857513427734
+              ],
+              "prefix_grouper_samples_ms": [
+                129.85446166992188,
+                124.31871795654297,
+                123.9214096069336
+              ]
+            }
+          ]
+        },
+        {
+          "prompt_length": 512,
+          "group_size": 8,
+          "correctness": {
+            "passed": true,
+            "max_response_log_prob_error": 0.10946273803710938,
+            "mean_response_log_prob_error": 0.030400117859244347,
+            "max_logit_error": 0.25,
+            "mean_logit_error": 0.03033893182873726,
+            "top1_agreement": 0.916015625,
+            "max_tolerance": 0.2,
+            "mean_tolerance": 0.05
+          },
+          "measurements": [
+            {
+              "mode": "forward",
+              "baseline_ms": 19.996671676635742,
+              "prefix_grouper_ms": 49.19807815551758,
+              "speedup": 0.4064522929823654,
+              "baseline_response_tokens_per_second": 25604.260962999386,
+              "prefix_grouper_response_tokens_per_second": 10406.910578529967,
+              "baseline_peak_mib": 713.07080078125,
+              "prefix_grouper_peak_mib": 517.50830078125,
+              "peak_memory_saved_ratio": 0.27425397279728614,
+              "baseline_incremental_mib": 437.0625,
+              "prefix_grouper_incremental_mib": 241.5,
+              "baseline_samples_ms": [
+                19.883007049560547,
+                19.996671676635742,
+                20.142080307006836
+              ],
+              "prefix_grouper_samples_ms": [
+                49.19807815551758,
+                49.13868713378906,
+                49.21241760253906
+              ]
+            },
+            {
+              "mode": "forward-backward",
+              "baseline_ms": 65.35372924804688,
+              "prefix_grouper_ms": 119.45471954345703,
+              "speedup": 0.5471004368669713,
+              "baseline_response_tokens_per_second": 7834.288966995733,
+              "prefix_grouper_response_tokens_per_second": 4286.142916385459,
+              "baseline_peak_mib": 4511.04443359375,
+              "prefix_grouper_peak_mib": 1710.33154296875,
+              "peak_memory_saved_ratio": 0.6208568618318387,
+              "baseline_incremental_mib": 3952.94677734375,
+              "prefix_grouper_incremental_mib": 1164.42138671875,
+              "baseline_samples_ms": [
+                65.29535675048828,
+                65.35372924804688,
+                70.85363006591797
+              ],
+              "prefix_grouper_samples_ms": [
+                117.76614379882812,
+                119.45471954345703,
+                130.1370849609375
+              ]
+            }
+          ]
+        }
+      ],
+      "elapsed_seconds": 11.145278524141759
+    },
+    {
+      "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+      "label": "TinyLlama-1.1B-Chat-v1.0",
+      "model_type": "llama",
+      "parameters": 1100048384,
+      "cases": [
+        {
+          "prompt_length": 256,
+          "group_size": 4,
+          "correctness": {
+            "passed": true,
+            "max_response_log_prob_error": 0.07037067413330078,
+            "mean_response_log_prob_error": 0.018453003838658333,
+            "max_logit_error": 0.125,
+            "mean_logit_error": 0.01862756349146366,
+            "top1_agreement": 0.935546875,
+            "max_tolerance": 0.2,
+            "mean_tolerance": 0.05
+          },
+          "measurements": [
+            {
+              "mode": "forward",
+              "baseline_ms": 44.65971374511719,
+              "prefix_grouper_ms": 36.94489669799805,
+              "speedup": 1.2088195593070148,
+              "baseline_response_tokens_per_second": 11464.471154519633,
+              "prefix_grouper_response_tokens_per_second": 13858.476968694407,
+              "baseline_peak_mib": 2284.5107421875,
+              "prefix_grouper_peak_mib": 2277.2490234375,
+              "peak_memory_saved_ratio": 0.0031786756857385967,
+              "baseline_incremental_mib": 166.25,
+              "prefix_grouper_incremental_mib": 158.98828125,
+              "baseline_samples_ms": [
+                44.90547180175781,
+                44.614654541015625,
+                44.65971374511719
+              ],
+              "prefix_grouper_samples_ms": [
+                37.06163024902344,
+                36.88550567626953,
+                36.94489669799805
+              ]
+            },
+            {
+              "mode": "forward-backward",
+              "baseline_ms": 133.50912475585938,
+              "prefix_grouper_ms": 96.11673736572266,
+              "speedup": 1.389030968122225,
+              "baseline_response_tokens_per_second": 3834.9438732091576,
+              "prefix_grouper_response_tokens_per_second": 5326.855800898112,
+              "baseline_peak_mib": 7336.34765625,
+              "prefix_grouper_peak_mib": 4851.333984375,
+              "peak_memory_saved_ratio": 0.3387262692980424,
+              "baseline_incremental_mib": 3093.9111328125,
+              "prefix_grouper_incremental_mib": 632.8974609375,
+              "baseline_samples_ms": [
+                133.4958038330078,
+                134.04978942871094,
+                133.50912475585938
+              ],
+              "prefix_grouper_samples_ms": [
+                96.11673736572266,
+                97.30764770507812,
+                96.09932708740234
+              ]
+            }
+          ]
+        },
+        {
+          "prompt_length": 512,
+          "group_size": 8,
+          "correctness": {
+            "passed": true,
+            "max_response_log_prob_error": 0.078125,
+            "mean_response_log_prob_error": 0.020297178998589516,
+            "max_logit_error": 0.1416015625,
+            "mean_logit_error": 0.02037910372018814,
+            "top1_agreement": 0.92578125,
+            "max_tolerance": 0.2,
+            "mean_tolerance": 0.05
+          },
+          "measurements": [
+            {
+              "mode": "forward",
+              "baseline_ms": 75.62137603759766,
+              "prefix_grouper_ms": 37.46918487548828,
+              "speedup": 2.018228479986708,
+              "baseline_response_tokens_per_second": 6770.572380823147,
+              "prefix_grouper_response_tokens_per_second": 13664.562004788684,
+              "baseline_peak_mib": 2418.2822265625,
+              "prefix_grouper_peak_mib": 2277.2705078125,
+              "peak_memory_saved_ratio": 0.058310695584296246,
+              "baseline_incremental_mib": 300.0,
+              "prefix_grouper_incremental_mib": 158.98828125,
+              "baseline_samples_ms": [
+                75.1114273071289,
+                76.14566040039062,
+                75.62137603759766
+              ],
+              "prefix_grouper_samples_ms": [
+                38.16038513183594,
+                37.407745361328125,
+                37.46918487548828
+              ]
+            },
+            {
+              "mode": "forward-backward",
+              "baseline_ms": 232.27392578125,
+              "prefix_grouper_ms": 97.0414047241211,
+              "speedup": 2.393554858790238,
+              "baseline_response_tokens_per_second": 2204.293909778704,
+              "prefix_grouper_response_tokens_per_second": 5276.098397952546,
+              "baseline_peak_mib": 11370.970703125,
+              "prefix_grouper_peak_mib": 5233.48046875,
+              "peak_memory_saved_ratio": 0.5397507736686261,
+              "baseline_incremental_mib": 7152.5126953125,
+              "prefix_grouper_incremental_mib": 1015.0224609375,
+              "baseline_samples_ms": [
+                232.27392578125,
+                233.10438537597656,
+                231.76806640625
+              ],
+              "prefix_grouper_samples_ms": [
+                97.0414047241211,
+                101.42515563964844,
+                97.0403823852539
+              ]
+            }
+          ]
+        }
+      ],
+      "elapsed_seconds": 42.51256919791922
+    }
+  ]
+}
