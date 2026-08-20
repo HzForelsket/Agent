@@ -19,20 +19,27 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
 import torch
 import torch.nn.functional as F
+from packaging.version import Version
 from prefix_grouper import PrefixGrouper
 from transformers import AutoConfig, AutoModelForCausalLM
 from verl.trainer.ppo.prefix_grouper_utils import build_position_ids_for_prefix_grouper
 
+from agentlightning.verl.accelerator import AcceleratorRuntime, select_accelerator
 from agentlightning.verl.prefix_grouper import apply_prefix_grouper_patch
+from prefix_grouper_stack import NPU_CANN_VERSION, REQUIRED_STACKS
 
-REQUIRED_STACK = {"torch": "2.11.0", "vllm": "0.22.1", "verl": "0.9.0"}
 DEFAULT_MODELS = ["Qwen/Qwen2.5-0.5B-Instruct", "HuggingFaceTB/SmolLM2-135M-Instruct"]
+DIST_NAMES = {
+    "torch_npu": "torch-npu",
+    "triton_ascend": "triton-ascend",
+    "vllm_ascend": "vllm-ascend",
+}
 
 
 @dataclass(frozen=True)
@@ -58,7 +65,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--response-length", type=int, default=64)
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
-    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--device", default="auto", help="auto、gpu/cuda、npu，或带编号的设备（如 npu:1）")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--backward", action=argparse.BooleanOptionalAction, default=True)
@@ -78,21 +85,38 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def installed_stack() -> dict[str, str]:
-    return {
+def _distribution_version(name: str) -> str:
+    try:
+        return version(DIST_NAMES.get(name, name))
+    except PackageNotFoundError:
+        return "未安装"
+
+
+def installed_stack(backend: str) -> dict[str, str]:
+    stack = {
         "torch": torch.__version__.split("+")[0],
-        "vllm": version("vllm"),
-        "verl": version("verl"),
-        "transformers": version("transformers"),
-        "prefix_grouper": version("prefix_grouper"),
+        "vllm": _distribution_version("vllm"),
+        "verl": _distribution_version("verl"),
+        "transformers": _distribution_version("transformers"),
+        "prefix_grouper": _distribution_version("prefix_grouper"),
     }
+    if backend == "npu":
+        stack.update(
+            {
+                "torch_npu": _distribution_version("torch_npu"),
+                "triton_ascend": _distribution_version("triton_ascend"),
+                "vllm_ascend": _distribution_version("vllm_ascend"),
+            }
+        )
+    return stack
 
 
-def check_stack(stack: dict[str, str]) -> None:
+def check_stack(stack: dict[str, str], backend: str) -> None:
+    required = REQUIRED_STACKS[backend]
     mismatches = [
         f"{name}={stack[name]}（需要 {wanted}）"
-        for name, wanted in REQUIRED_STACK.items()
-        if stack[name].split("+")[0] != wanted
+        for name, wanted in required.items()
+        if stack.get(name) == "未安装" or Version(stack[name]).public != Version(wanted).public
     ]
     if mismatches:
         raise RuntimeError("测试环境版本不符合要求：" + "，".join(mismatches))
@@ -185,29 +209,34 @@ def response_logits(model: torch.nn.Module, batch: dict[str, Any], grouped: bool
     return output.logits[:, prompt_length - 1 : prompt_length + response_length - 1]
 
 
-def timed(function: Callable[[], torch.Tensor], warmup: int, repeats: int) -> tuple[float, list[float]]:
+def timed(
+    function: Callable[[], torch.Tensor],
+    warmup: int,
+    repeats: int,
+    accelerator: AcceleratorRuntime,
+) -> tuple[float, list[float]]:
     for _ in range(warmup):
         function()
-    torch.cuda.synchronize()
+    accelerator.synchronize()
     samples = []
     for _ in range(repeats):
-        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+        start, end = accelerator.event(), accelerator.event()
         start.record()
         function()
         end.record()
-        torch.cuda.synchronize()
+        accelerator.synchronize()
         samples.append(start.elapsed_time(end))
     return statistics.median(samples), samples
 
 
-def peak_memory(function: Callable[[], torch.Tensor], device: torch.device) -> tuple[float, float]:
+def peak_memory(function: Callable[[], torch.Tensor], accelerator: AcceleratorRuntime) -> tuple[float, float]:
     gc.collect()
-    torch.cuda.empty_cache()
-    baseline = torch.cuda.memory_allocated(device)
-    torch.cuda.reset_peak_memory_stats(device)
+    accelerator.empty_cache()
+    baseline = accelerator.memory_allocated()
+    accelerator.reset_peak_memory_stats()
     function()
-    torch.cuda.synchronize()
-    peak = torch.cuda.max_memory_allocated(device)
+    accelerator.synchronize()
+    peak = accelerator.max_memory_allocated()
     return peak / 2**20, (peak - baseline) / 2**20
 
 
@@ -218,7 +247,7 @@ def benchmark_mode(
     mode: str,
     warmup: int,
     repeats: int,
-    device: torch.device,
+    accelerator: AcceleratorRuntime,
 ) -> dict[str, Any]:
     def step(grouped: bool) -> torch.Tensor:
         model.zero_grad(set_to_none=True)
@@ -231,10 +260,10 @@ def benchmark_mode(
 
     context = torch.inference_mode() if mode == "forward" else torch.enable_grad()
     with context:
-        baseline_ms, baseline_samples = timed(lambda: step(False), warmup, repeats)
-        grouped_ms, grouped_samples = timed(lambda: step(True), warmup, repeats)
-        baseline_peak, baseline_incremental = peak_memory(lambda: step(False), device)
-        grouped_peak, grouped_incremental = peak_memory(lambda: step(True), device)
+        baseline_ms, baseline_samples = timed(lambda: step(False), warmup, repeats, accelerator)
+        grouped_ms, grouped_samples = timed(lambda: step(True), warmup, repeats, accelerator)
+        baseline_peak, baseline_incremental = peak_memory(lambda: step(False), accelerator)
+        grouped_peak, grouped_incremental = peak_memory(lambda: step(True), accelerator)
     tokens = batch["responses"].numel()
     return {
         "mode": mode,
@@ -282,7 +311,7 @@ def markdown(results: dict[str, Any]) -> str:
     lines = [
         "# PrefixGrouper 性能对比",
         "",
-        f"- GPU：{results['gpu']}",
+        f"- 加速器：{results['accelerator']['backend']} / {results['accelerator']['name']}",
         f"- 软件栈：torch {results['stack']['torch']} / vLLM {results['stack']['vllm']} / VERL {results['stack']['verl']}",
         f"- 精度：{results['dtype']}，权重：{results['weights']}",
         "",
@@ -311,22 +340,27 @@ def write_report(results: dict[str, Any], json_path: Path, markdown_path: Path) 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    stack = installed_stack()
-    check_stack(stack)
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA 不可用")
-    device = torch.device(args.device)
+    accelerator = select_accelerator(args.device)
+    stack = installed_stack(accelerator.backend)
+    check_stack(stack, accelerator.backend)
+    device = accelerator.device
     dtype = getattr(torch, args.dtype)
-    torch.cuda.set_device(device)
+    accelerator.set_device()
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-    torch.backends.cuda.matmul.allow_tf32 = True
+    accelerator.manual_seed_all(args.seed)
+    if accelerator.backend == "gpu":
+        torch.backends.cuda.matmul.allow_tf32 = True
     apply_prefix_grouper_patch()
 
     results: dict[str, Any] = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "stack": stack,
-        "gpu": torch.cuda.get_device_name(device),
+        "accelerator": {
+            "backend": accelerator.display_backend,
+            "device": str(device),
+            "name": accelerator.device_name(),
+        },
+        "required_cann": NPU_CANN_VERSION if accelerator.backend == "npu" else None,
         "dtype": args.dtype,
         "weights": args.weights,
         "batch_size": args.batch_size,
@@ -368,20 +402,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     mode=mode,
                     warmup=args.warmup,
                     repeats=args.repeats,
-                    device=device,
+                    accelerator=accelerator,
                 )
                 for mode in modes
             ]
             model_result["cases"].append({**asdict(case), "correctness": check, "measurements": measurements})
             del batch
             gc.collect()
-            torch.cuda.empty_cache()
+            accelerator.empty_cache()
         model_result["elapsed_seconds"] = time.monotonic() - started
         results["models"].append(model_result)
         write_report(results, args.output_json, args.output_markdown)
         del model, config
         gc.collect()
-        torch.cuda.empty_cache()
+        accelerator.empty_cache()
 
     print("\n" + markdown(results))
     print(f"JSON: {args.output_json.resolve()}")

@@ -24,7 +24,15 @@ if TYPE_CHECKING:
     from .daemon import AgentModeDaemon
     from .trainer import AgentLightningTrainer
 
-__all__ = ["main", "run_ppo", "TaskRunner"]
+__all__ = ["configure_accelerator", "main", "run_ppo", "TaskRunner"]
+
+
+def configure_accelerator(config: Any) -> str:
+    """Auto-select CUDA or Ascend NPU before Ray resources are created."""
+    from verl.utils.device import auto_set_device
+
+    auto_set_device(config)
+    return str(config.trainer.device)
 
 
 @hydra.main(config_path="pkg://agentlightning/verl", config_name="config", version_base=None)
@@ -54,6 +62,7 @@ def run_ppo(
     trainer_cls: Type[AgentLightningTrainer],
     daemon_cls: Type[AgentModeDaemon],
 ) -> None:
+    configure_accelerator(config)
     if not ray.is_initialized():
         from omegaconf import OmegaConf
 

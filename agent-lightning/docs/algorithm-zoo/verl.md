@@ -71,12 +71,14 @@ The optimization applies to the actor update and the old/reference-policy log-pr
 
 PrefixGrouper currently requires FSDP/FSDP2, `use_remove_padding=False`, fused kernels disabled, Ulysses sequence parallel size 1, and text-only batches. Unsupported multimodal, distillation-top-k, and sum-pi-squared batches fall back to the standard VERL forward.
 
-To compare the standard and shared-prefix paths on a CUDA device, run the benchmark script with one or more Hugging Face model IDs:
+Agent Lightning calls VERL's device auto-configuration before creating Ray resources. If `torch-npu` and a usable Ascend device are present it selects `trainer.device=npu`; otherwise it selects CUDA. `VERL_PLATFORM=huawei` or `VERL_PLATFORM=nvidia` remains available as an explicit override.
+
+Install the platform-specific stack and compare the standard and shared-prefix paths with one or more Hugging Face model IDs:
 
 ```bash
-pip install -r scripts/requirements_prefix_grouper.txt
+conda run -n agent --no-capture-output python scripts/prefix_grouper_stack.py --backend auto
 
-python scripts/benchmark_prefix_grouper.py \
+conda run -n agent --no-capture-output python scripts/benchmark_prefix_grouper.py \
     --models Qwen/Qwen2.5-0.5B-Instruct HuggingFaceTB/SmolLM2-135M-Instruct TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --case 1024:4 \
     --case 1536:8 \
@@ -86,9 +88,20 @@ python scripts/benchmark_prefix_grouper.py \
     --output-markdown prefix-grouper-results.md
 ```
 
-Each case uses `PROMPT_LENGTH:GROUP_SIZE`. The script requires and records `torch==2.11.0`, `vllm==0.22.1`, and `verl==0.9.0`. The default `--weights random` mode downloads only model configurations and instantiates the complete architectures, which is sufficient for dense-kernel timing and memory comparisons. Use `--weights pretrained` when learned weights are specifically required. The script checks response log-probability equivalence before reporting median latency, response-token throughput, speedup, peak memory, and memory reduction.
+Use `--backend gpu` or `--backend npu` to override installation detection, and `--dry-run` to inspect the commands without changing the environment. The runtime benchmark accepts `--device auto` (the default), `gpu`/`cuda`, `npu`, or an indexed device such as `npu:1`.
 
-The benchmark requirements select vLLM's official CUDA 12.9 build. For a manual pip installation, add `--extra-index-url https://wheels.vllm.ai/0.22.1/cu129` when installing vLLM 0.22.1; the generic PyPI wheel targets a newer CUDA runtime.
+The two supported dependency matrices are intentionally separate because the accelerator plugins require different PyTorch versions:
+
+| Backend | PyTorch | vLLM | Accelerator plugin | VERL | CANN |
+|---|---:|---:|---:|---:|---:|
+| NVIDIA GPU | 2.11.0 | 0.22.1 | CUDA 12.9 wheel | 0.9.0 | N/A |
+| Ascend NPU | 2.10.0 | 0.22.1 | vLLM-Ascend 0.22.1rc1 / torch-npu 2.10.0 | 0.9.0 | 9.0.0 |
+
+The NPU installer first installs the CPU PyTorch wheel required by torch-npu, builds the source-only `arctic-inference==0.1.1` package without its obsolete isolated Torch 2.7 build dependency, and builds upstream vLLM with `VLLM_TARGET_DEVICE=empty`. The Ascend plugin then supplies the device kernels. This avoids installing vLLM 0.22.1's CUDA wheel, whose metadata requires PyTorch 2.11. The exact package pins live in `scripts/requirements_prefix_grouper_gpu.txt` and `scripts/requirements_prefix_grouper_npu.txt`; the matrices checked by the benchmark live in `scripts/prefix_grouper_stack.py`.
+
+Each case uses `PROMPT_LENGTH:GROUP_SIZE`. The default `--weights random` mode downloads only model configurations and instantiates the complete architectures, which is sufficient for dense-kernel timing and memory comparisons. Use `--weights pretrained` when learned weights are specifically required. The script checks response log-probability equivalence before reporting median latency, response-token throughput, speedup, peak accelerator memory, and memory reduction.
+
+The GPU requirements select vLLM's CUDA 12.9 build. The NPU requirements follow the vLLM-Ascend 0.22.1rc1 release matrix and require a host with the matching Ascend driver, CANN, NNAL, and device permissions; installing the Python packages alone cannot provide those system components.
 
 ## Tutorials Using VERL
 
