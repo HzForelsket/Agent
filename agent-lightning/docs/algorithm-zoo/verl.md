@@ -71,6 +71,22 @@ The optimization applies to the actor update and the old/reference-policy log-pr
 
 PrefixGrouper currently requires FSDP/FSDP2, `use_remove_padding=False`, fused kernels disabled, Ulysses sequence parallel size 1, and text-only batches. Unsupported multimodal batches fall back to the standard VERL forward.
 
+To compare the standard and shared-prefix paths on a CUDA device, run the benchmark script with one or more Hugging Face model IDs:
+
+```bash
+python tests/benchmark/prefix_grouper_benchmark.py \
+    --models Qwen/Qwen2.5-0.5B-Instruct HuggingFaceTB/SmolLM2-360M-Instruct \
+    --case 1024:4 \
+    --case 1536:8 \
+    --batch-size 8 \
+    --response-length 64 \
+    --modes forward forward-backward \
+    --output-json prefix-grouper-results.json \
+    --output-markdown prefix-grouper-results.md
+```
+
+Each case uses `PROMPT_LENGTH:GROUP_SIZE`. The default `--weights random` mode downloads only model configurations and instantiates the complete architectures, which is sufficient for dense-kernel timing and memory comparisons. Use `--weights pretrained` when learned weights are specifically required. The script checks output equivalence before reporting median latency, speedup, peak memory, and memory reduction.
+
 ## Tutorials Using VERL
 
 - [Train SQL Agent with RL](../how-to/train-sql-agent.md) - A practical example of training a SQL agent using VERL.
