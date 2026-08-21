@@ -9,12 +9,26 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import ssl
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generator, Sequence
 
 logger = logging.getLogger(__name__)
+
+NPU_MODEL_PROXY_ENV = "AGENTLIGHTNING_NPU_MODEL_PROXY"
+NPU_MODEL_PROXY_USERNAME_ENV = "AGENTLIGHTNING_NPU_MODEL_PROXY_USERNAME"
+NPU_MODEL_PROXY_PASSWORD_ENV = "AGENTLIGHTNING_NPU_MODEL_PROXY_PASSWORD"
+
+_STANDARD_PROXY_ENV_VARS = (
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+)
 
 CONFIG_ONLY_PATTERNS = (
     "*.json",
@@ -31,6 +45,9 @@ _MODEL_PATH_FIELDS = (
 __all__ = [
     "CONFIG_ONLY_PATTERNS",
     "ModelMaterialization",
+    "NPU_MODEL_PROXY_ENV",
+    "NPU_MODEL_PROXY_PASSWORD_ENV",
+    "NPU_MODEL_PROXY_USERNAME_ENV",
     "materialize_model_for_npu",
     "materialize_npu_model_config",
 ]
@@ -63,6 +80,32 @@ def _model_directory(download_root: Path, model_ref: str) -> Path:
     return local_dir
 
 
+def _model_proxy() -> tuple[str | None, tuple[str, str] | None]:
+    proxy_url = os.environ.get(NPU_MODEL_PROXY_ENV)
+    if not proxy_url:
+        proxy_url = next((os.environ[name] for name in _STANDARD_PROXY_ENV_VARS if os.environ.get(name)), None)
+
+    username = os.environ.get(NPU_MODEL_PROXY_USERNAME_ENV)
+    password = os.environ.get(NPU_MODEL_PROXY_PASSWORD_ENV)
+    if bool(username) != bool(password):
+        raise RuntimeError(f"{NPU_MODEL_PROXY_USERNAME_ENV} 和 {NPU_MODEL_PROXY_PASSWORD_ENV} 必须同时设置。")
+    if username and password and proxy_url is None:
+        raise RuntimeError(f"已设置代理账号密码，但没有设置 {NPU_MODEL_PROXY_ENV} 或 HTTPS_PROXY。")
+    return proxy_url, (username, password) if username and password else None
+
+
+def _is_proxy_authentication_error(error: BaseException) -> bool:
+    current: BaseException | None = error
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        message = str(current)
+        if "407" in message and "Proxy Authentication Required" in message:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 @contextmanager
 def _insecure_huggingface_client() -> Generator[None, None, None]:
     """Temporarily use an httpx client without CA verification and without Xet."""
@@ -74,10 +117,25 @@ def _insecure_huggingface_client() -> Generator[None, None, None]:
     previous_factory = hub_http._GLOBAL_CLIENT_FACTORY  # pyright: ignore[reportPrivateUsage]
     previous_disable_xet = hub_constants.HF_HUB_DISABLE_XET
     previous_disable_xet_env = os.environ.get("HF_HUB_DISABLE_XET")
+    proxy_url, proxy_auth = _model_proxy()
 
     def insecure_client_factory() -> httpx.Client:
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        proxy = (
+            httpx.Proxy(
+                proxy_url,
+                ssl_context=ssl_context if proxy_url.startswith("https://") else None,
+                auth=proxy_auth,
+            )
+            if proxy_url
+            else None
+        )
         return httpx.Client(
-            verify=False,
+            verify=ssl_context,
+            trust_env=False,
+            proxy=proxy,
             event_hooks={"request": [hub_http.hf_request_event_hook]},
             follow_redirects=True,
             timeout=None,
@@ -116,9 +174,11 @@ def _download_snapshot(
         shutil.copytree(cached_path, local_dir, dirs_exist_ok=True)
         return str(local_dir)
 
+    proxy_url, _ = _model_proxy()
     logger.warning(
-        "NPU 主机没有可用 CA 证书：下载 %s 时仅在当前进程内关闭 TLS 证书校验；不会修改系统证书。",
+        "NPU 主机没有可用 CA 证书：下载 %s 时仅在当前进程内关闭 TLS 证书校验%s；不会修改系统证书。",
         model_ref,
+        "并使用已配置的代理" if proxy_url else "",
     )
     with _insecure_huggingface_client():
         return snapshot_download(
@@ -167,8 +227,14 @@ def materialize_model_for_npu(
         ).resolve()
     except Exception as exc:
         mode = "仅本地缓存" if local_files_only else "已关闭当前下载客户端的 TLS 证书校验"
+        proxy_hint = (
+            f"；代理返回 407，请通过 {NPU_MODEL_PROXY_USERNAME_ENV} 和 " f"{NPU_MODEL_PROXY_PASSWORD_ENV} 提供有效凭据"
+            if _is_proxy_authentication_error(exc)
+            else ""
+        )
         raise RuntimeError(
-            f"无法把 NPU 模型 {model_ref!r} 下载到 {local_dir}（{mode}）。" "请检查网络、HF_TOKEN、仓库权限和磁盘空间。"
+            f"无法把 NPU 模型 {model_ref!r} 下载到 {local_dir}（{mode}{proxy_hint}）。"
+            "请检查网络、HF_TOKEN、仓库权限和磁盘空间。"
         ) from exc
     return ModelMaterialization(
         model_ref=model_ref,

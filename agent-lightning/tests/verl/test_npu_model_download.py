@@ -12,6 +12,7 @@ from typing import Any
 
 import huggingface_hub.constants as hub_constants
 import huggingface_hub.utils._http as hub_http
+import httpx
 import pytest
 from omegaconf import OmegaConf
 
@@ -104,7 +105,13 @@ def test_local_files_only_copies_global_hub_cache_into_command_directory(
     ]
 
 
-def test_insecure_client_disables_verification_only_inside_download_scope() -> None:
+def test_insecure_client_disables_verification_only_inside_download_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (*model_download._STANDARD_PROXY_ENV_VARS, model_download.NPU_MODEL_PROXY_ENV):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv(model_download.NPU_MODEL_PROXY_USERNAME_ENV, raising=False)
+    monkeypatch.delenv(model_download.NPU_MODEL_PROXY_PASSWORD_ENV, raising=False)
     previous_factory = hub_http._GLOBAL_CLIENT_FACTORY
     previous_xet = hub_constants.HF_HUB_DISABLE_XET
 
@@ -118,6 +125,72 @@ def test_insecure_client_disables_verification_only_inside_download_scope() -> N
 
     assert hub_http._GLOBAL_CLIENT_FACTORY is previous_factory
     assert hub_constants.HF_HUB_DISABLE_XET is previous_xet
+
+
+def test_download_client_uses_system_proxy_with_separate_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://system-proxy.invalid:8080")
+    monkeypatch.delenv(model_download.NPU_MODEL_PROXY_ENV, raising=False)
+    monkeypatch.setenv(model_download.NPU_MODEL_PROXY_USERNAME_ENV, "user")
+    monkeypatch.setenv(model_download.NPU_MODEL_PROXY_PASSWORD_ENV, "password")
+    captured: dict[str, Any] = {}
+
+    class FakeClient:
+        def close(self) -> None:
+            pass
+
+    def fake_client(**kwargs: Any) -> FakeClient:
+        captured.update(kwargs)
+        return FakeClient()
+
+    def fake_proxy(
+        url: str,
+        *,
+        ssl_context: ssl.SSLContext | None,
+        auth: tuple[str, str] | None,
+    ) -> str:
+        captured["proxy_url"] = url
+        captured["proxy_ssl_context"] = ssl_context
+        captured["proxy_auth"] = auth
+        return "configured-proxy"
+
+    monkeypatch.setattr(httpx, "Client", fake_client)
+    monkeypatch.setattr(httpx, "Proxy", fake_proxy)
+    with model_download._insecure_huggingface_client():
+        hub_http.get_session()
+
+    client_ssl_context = captured["verify"]
+    assert isinstance(client_ssl_context, ssl.SSLContext)
+    assert client_ssl_context.verify_mode == ssl.CERT_NONE
+    assert client_ssl_context.check_hostname is False
+    assert captured["trust_env"] is False
+    assert captured["proxy"] == "configured-proxy"
+    assert captured["proxy_url"] == "http://system-proxy.invalid:8080"
+    assert captured["proxy_ssl_context"] is None
+    assert captured["proxy_auth"] == ("user", "password")
+
+
+def test_proxy_credentials_must_be_complete(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(model_download.NPU_MODEL_PROXY_ENV, "http://proxy.invalid:8080")
+    monkeypatch.setenv(model_download.NPU_MODEL_PROXY_USERNAME_ENV, "user")
+    monkeypatch.delenv(model_download.NPU_MODEL_PROXY_PASSWORD_ENV, raising=False)
+    with pytest.raises(RuntimeError, match="必须同时设置"):
+        model_download._model_proxy()
+
+
+def test_407_error_explains_required_proxy_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def rejected_proxy(*_args: object, **_kwargs: object) -> str:
+        raise RuntimeError("407 Proxy Authentication Required")
+
+    monkeypatch.setattr(model_download, "_download_snapshot", rejected_proxy)
+    with pytest.raises(RuntimeError) as caught:
+        model_download.materialize_model_for_npu("org/model", tmp_path)
+
+    message = str(caught.value)
+    assert "代理返回 407" in message
+    assert model_download.NPU_MODEL_PROXY_USERNAME_ENV in message
+    assert model_download.NPU_MODEL_PROXY_PASSWORD_ENV in message
 
 
 def test_verl_model_config_reuses_download_and_rewrites_all_remote_paths(

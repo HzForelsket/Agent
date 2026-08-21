@@ -77,6 +77,16 @@ When NPU is selected, a Hugging Face model ID is automatically downloaded before
 
 The Ascend server does not need a system CA bundle for this download. Agent Lightning pins `huggingface-hub==1.5.0` and `httpx==0.28.1`, temporarily uses an HTTP client with certificate verification disabled, disables Xet for the transfer, and restores the previous Hub client immediately afterward. It neither installs nor updates SSL certificates. This mode encrypts traffic but cannot authenticate the remote server, so use it only on a trusted network. Authentication for gated/private repositories still uses `HF_TOKEN`.
 
+The download client uses `AGENTLIGHTNING_NPU_MODEL_PROXY` when present; otherwise it selects `HTTPS_PROXY`, `HTTP_PROXY`, or `ALL_PROXY` in that order. It disables further environment inheritance so one deterministic proxy is used for the Hub request and every redirected model-file request. Proxy credentials can be supplied separately without writing them to the VERL configuration or logs:
+
+```bash
+export AGENTLIGHTNING_NPU_MODEL_PROXY='http://proxy.example.com:8080'
+export AGENTLIGHTNING_NPU_MODEL_PROXY_USERNAME='USER'
+export AGENTLIGHTNING_NPU_MODEL_PROXY_PASSWORD='PASSWORD'
+```
+
+If `HTTPS_PROXY` already contains the correct proxy address, the first line can be omitted. Credentials embedded and percent-encoded in the proxy URL are also accepted. The proxy URL and credentials are read only by the model download client and are never printed. A 407 response means the supplied proxy credentials are missing, expired, or rejected; Agent Lightning cannot synthesize proxy credentials.
+
 Automatic NPU download is enabled by default. Set `agentlightning.npu_model_download.enabled=false` to require an existing local path, or set `agentlightning.npu_model_download.local_files_only=true` to materialize only from the local Hugging Face cache. On multi-node runs, launch from a shared filesystem path visible at the same absolute location on every node.
 
 Install the platform-specific stack and compare the standard and shared-prefix paths with one or more Hugging Face model IDs:
