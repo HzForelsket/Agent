@@ -60,11 +60,12 @@ class Case:
 
 @dataclass(frozen=True)
 class DistributedContext:
-    """Small collective wrapper used by the multi-device PPA runner."""
+    """Host-side control collectives for the multi-device PPA runner."""
 
     rank: int = 0
     local_rank: int = 0
     world_size: int = 1
+    host_group: dist.ProcessGroup | None = None
 
     @property
     def enabled(self) -> bool:
@@ -76,24 +77,40 @@ class DistributedContext:
 
     def barrier(self) -> None:
         if self.enabled:
-            dist.barrier()
+            dist.barrier(group=self._host_group())
 
-    def max_value(self, value: float, device: torch.device) -> float:
+    def _host_group(self) -> dist.ProcessGroup:
+        if self.host_group is None:
+            raise RuntimeError("多卡 PPA 缺少 Gloo 主机通信组。")
+        return self.host_group
+
+    def max_value(self, value: float) -> float:
         if not self.enabled:
             return float(value)
-        # HCCL 9.0 does not implement Double collectives. FP32 is sufficient for
-        # latency/PPA statistics and keeps the GPU and NPU aggregation paths identical.
-        tensor = torch.tensor(float(value), dtype=torch.float32, device=device)
-        dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+        tensor = torch.tensor(float(value), dtype=torch.float64)
+        dist.all_reduce(tensor, op=dist.ReduceOp.MAX, group=self._host_group())
         return float(tensor.item())
 
-    def numeric_rows(self, values: Sequence[float], device: torch.device) -> list[list[float]]:
-        row = torch.tensor([float(value) for value in values], dtype=torch.float32, device=device)
+    def numeric_rows(self, values: Sequence[float]) -> list[list[float]]:
+        row = torch.tensor([float(value) for value in values], dtype=torch.float64)
         if not self.enabled:
             return [row.cpu().tolist()]
         rows = [torch.empty_like(row) for _ in range(self.world_size)]
-        dist.all_gather(rows, row)
-        return [item.cpu().tolist() for item in rows]
+        dist.all_gather(rows, row, group=self._host_group())
+        return [item.tolist() for item in rows]
+
+    def broadcast_bool(self, value: bool) -> bool:
+        if not self.enabled:
+            return value
+        tensor = torch.tensor(int(value), dtype=torch.uint8)
+        dist.broadcast(tensor, src=0, group=self._host_group())
+        return bool(tensor.item())
+
+    def close(self) -> None:
+        if not self.enabled:
+            return
+        dist.destroy_process_group(self._host_group())
+        dist.destroy_process_group()
 
 
 @dataclass(frozen=True)
@@ -286,7 +303,13 @@ def initialize_distributed(accelerator: AcceleratorRuntime) -> tuple[Accelerator
     accelerator = select_accelerator(device_spec)
     accelerator.set_device()
     dist.init_process_group(backend="hccl" if accelerator.backend == "npu" else "nccl")
-    return accelerator, DistributedContext(rank=rank, local_rank=local_rank, world_size=world_size)
+    host_group = dist.new_group(backend="gloo")
+    return accelerator, DistributedContext(
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+        host_group=host_group,
+    )
 
 
 def _distribution_version(name: str) -> str:
@@ -479,8 +502,8 @@ def timed(
         accelerator.synchronize()
         local_elapsed = float(start.elapsed_time(end))
         local_samples.append(local_elapsed)
-        samples.append(distributed.max_value(local_elapsed, accelerator.device))
-    per_rank_samples = distributed.numeric_rows(local_samples, accelerator.device)
+        samples.append(distributed.max_value(local_elapsed))
+    per_rank_samples = distributed.numeric_rows(local_samples)
     return statistics.median(samples), samples, per_rank_samples
 
 
@@ -548,13 +571,10 @@ def workload_power(
     try:
         while True:
             if distributed.enabled:
-                should_continue = torch.tensor(
-                    int(distributed.is_main and time.monotonic() - started < duration),
-                    dtype=torch.int8,
-                    device=accelerator.device,
+                should_continue = distributed.broadcast_bool(
+                    distributed.is_main and time.monotonic() - started < duration
                 )
-                dist.broadcast(should_continue, src=0)
-                if not bool(should_continue.item()):
+                if not should_continue:
                     break
             elif time.monotonic() - started >= duration:
                 break
@@ -591,7 +611,6 @@ def workload_power(
 def aggregate_device_power(
     measurement: dict[str, Any],
     distributed: DistributedContext,
-    accelerator: AcceleratorRuntime,
 ) -> dict[str, Any]:
     """Aggregate per-rank whole-device power into job-level power."""
     if not distributed.enabled:
@@ -607,7 +626,7 @@ def aggregate_device_power(
             float(measurement.get("workload_iterations", 0)),
         ]
     )
-    rows = distributed.numeric_rows(values, accelerator.device)
+    rows = distributed.numeric_rows(values)
     per_rank = []
     for rank, row in enumerate(rows):
         rank_available = bool(row[0])
@@ -690,7 +709,7 @@ def peak_memory(
     function()
     accelerator.synchronize()
     peak = accelerator.max_memory_allocated()
-    rows = distributed.numeric_rows([peak / 2**20, (peak - baseline) / 2**20], accelerator.device)
+    rows = distributed.numeric_rows([peak / 2**20, (peak - baseline) / 2**20])
     peaks = [row[0] for row in rows]
     incremental = [row[1] for row in rows]
     return {
@@ -747,7 +766,6 @@ def benchmark_mode(
                 distributed=distributed,
             ),
             distributed,
-            accelerator,
         )
         grouped_power = aggregate_device_power(
             workload_power(
@@ -759,7 +777,6 @@ def benchmark_mode(
                 distributed=distributed,
             ),
             distributed,
-            accelerator,
         )
         baseline_memory = peak_memory(lambda: step(False), accelerator, distributed)
         grouped_memory = peak_memory(lambda: step(True), accelerator, distributed)
@@ -838,7 +855,7 @@ def correctness(
         logit_difference.mean().item(),
         (baseline_logits.argmax(dim=-1) == grouped_logits.argmax(dim=-1)).float().mean().item(),
     ]
-    rows = distributed.numeric_rows(local_values, baseline_logits.device)
+    rows = distributed.numeric_rows(local_values)
     return {
         "passed": bool(
             max(row[0] for row in rows) <= max_tolerance
@@ -871,7 +888,8 @@ def markdown(results: dict[str, Any]) -> str:
         "",
         f"- 加速器：{results['accelerator']['backend']} / {results['accelerator']['name']}",
         f"- 并行：{results['accelerator']['parallelism']}，world size={results['accelerator']['world_size']}，"
-        f"每 rank/global batch={results['batch_size_per_rank']}/{results['global_batch_size']}",
+        f"每 rank/global batch={results['batch_size_per_rank']}/{results['global_batch_size']}，"
+        f"统计通信={results['accelerator']['statistics_backend']}",
         f"- 软件栈：torch {results['stack']['torch']} / vLLM {results['stack']['vllm']} / VERL {results['stack']['verl']}",
         f"- 精度：{results['dtype']}，权重：{results['weights']}",
         f"- NPU 模型下载目录：{results['model_download_root'] or '不适用（GPU）'}",
@@ -1049,6 +1067,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "name": accelerator.device_name(),
             "world_size": distributed.world_size,
             "parallelism": "distributed-data-parallel" if distributed.enabled else "single-device",
+            "statistics_backend": "gloo-cpu" if distributed.enabled else "local-cpu",
         },
         "required_cann": NPU_CANN_VERSION if accelerator.backend == "npu" else None,
         "dtype": args.dtype,
@@ -1108,7 +1127,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         idle_measurement = aggregate_device_power(
             idle_power(power_probe, args.power_idle_samples, args.power_interval),
             distributed,
-            accelerator,
         )
         idle_watts = float(idle_measurement["watts"]["mean"]) if idle_measurement.get("available") else None
         model_result = {
@@ -1178,8 +1196,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"JSON: {args.output_json.resolve()}")
         print(f"Markdown: {args.output_markdown.resolve()}")
     distributed.barrier()
-    if distributed.enabled:
-        dist.destroy_process_group()
+    distributed.close()
     return 0
 
 

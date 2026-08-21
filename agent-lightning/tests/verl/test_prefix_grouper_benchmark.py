@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Sequence
+from typing import Any
 
 import pytest
 import torch
@@ -65,7 +65,7 @@ def test_multirank_power_aggregation_sums_whole_device_measurements() -> None:
     for base in (100.0, 200.0):
         rank_rows.append([1.0, 5.0, *(base + index for index in range(len(fields))), 2.0, 7.0])
 
-    def numeric_rows(_values: Sequence[float], _device: torch.device) -> list[list[float]]:
+    def numeric_rows(_values: list[float]) -> list[list[float]]:
         return rank_rows
 
     distributed = SimpleNamespace(
@@ -84,7 +84,6 @@ def test_multirank_power_aggregation_sums_whole_device_measurements() -> None:
     result = _BENCHMARK_MODULE.aggregate_device_power(
         measurement,
         distributed,
-        SimpleNamespace(device=torch.device("cpu")),
     )
 
     assert result["available"] is True
@@ -92,27 +91,6 @@ def test_multirank_power_aggregation_sums_whole_device_measurements() -> None:
     assert result["watts"]["p95"] == 310.0
     assert result["watts"]["count"] == 5
     assert len(result["per_rank"]) == 2
-
-
-def test_distributed_statistics_use_hccl_supported_float32(monkeypatch: pytest.MonkeyPatch) -> None:
-    context = _BENCHMARK_MODULE.DistributedContext(rank=0, local_rank=0, world_size=2)
-    collective_dtypes: list[torch.dtype] = []
-
-    def fake_all_reduce(tensor: torch.Tensor, *, op: Any) -> None:
-        del op
-        collective_dtypes.append(tensor.dtype)
-
-    def fake_all_gather(outputs: list[torch.Tensor], tensor: torch.Tensor) -> None:
-        collective_dtypes.append(tensor.dtype)
-        for output in outputs:
-            output.copy_(tensor)
-
-    monkeypatch.setattr(_BENCHMARK_MODULE.dist, "all_reduce", fake_all_reduce)
-    monkeypatch.setattr(_BENCHMARK_MODULE.dist, "all_gather", fake_all_gather)
-
-    assert context.max_value(1.25, torch.device("cpu")) == pytest.approx(1.25)
-    assert context.numeric_rows([2.5, 3.5], torch.device("cpu")) == [[2.5, 3.5], [2.5, 3.5]]
-    assert collective_dtypes == [torch.float32, torch.float32]
 
 
 def test_workload_metrics_report_dense_tokens_and_causal_pairs() -> None:
