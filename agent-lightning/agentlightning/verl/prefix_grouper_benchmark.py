@@ -15,6 +15,7 @@ import statistics
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Sequence
 
@@ -613,6 +614,7 @@ class DistributedBenchmarkTaskRunner:
     """Mirror Agent Lightning's TaskRunner and let VERL own the worker group."""
 
     def run(self, model_path: str, settings: dict[str, Any]) -> list[dict[str, Any]]:
+        from ray.util.placement_group import remove_placement_group
         from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 
         model_config = HFModelConfig(
@@ -659,19 +661,25 @@ class DistributedBenchmarkTaskRunner:
             profiler_config=None,
         )
         role = 0
+        pool_name = f"benchmark_pool_{uuid.uuid4().hex}_"
         pool_manager = ResourcePoolManager(
-            resource_pool_spec={"benchmark_pool": [int(settings["n_devices_per_node"])] * int(settings["nnodes"])},
-            mapping={role: "benchmark_pool"},
+            resource_pool_spec={pool_name: [int(settings["n_devices_per_node"])] * int(settings["nnodes"])},
+            mapping={role: pool_name},
             max_colocate_count=1,
         )
         pool_manager.create_resource_pool()
-        worker_group = RayWorkerGroup(
-            resource_pool=pool_manager.get_resource_pool(role),
-            ray_cls_with_init=RayClassWithInitArgs(
-                ray.remote(DistributedPrefixGrouperBenchmarkWorker),
-                config=worker_config,
-            ),
-            device_name=str(settings["device_name"]),
-        )
-        worker_group.reset()
-        return worker_group.run_benchmark(settings)
+        resource_pool = pool_manager.get_resource_pool(role)
+        try:
+            worker_group = RayWorkerGroup(
+                resource_pool=resource_pool,
+                ray_cls_with_init=RayClassWithInitArgs(
+                    ray.remote(DistributedPrefixGrouperBenchmarkWorker),
+                    config=worker_config,
+                ),
+                device_name=str(settings["device_name"]),
+            )
+            worker_group.reset()
+            return worker_group.run_benchmark(settings)
+        finally:
+            for placement_group in resource_pool.pgs or []:
+                remove_placement_group(placement_group)
