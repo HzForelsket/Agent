@@ -256,3 +256,13 @@ def test_npu_tnd_pack_and_unpack_preserve_gradients() -> None:
     expected_grad = valid_mask[:, None, :, None].expand_as(tensor)
     assert tensor.grad is not None
     torch.testing.assert_close(tensor.grad, expected_grad.to(tensor.dtype))
+
+
+def test_npu_causal_mask_created_during_inference_can_be_saved_for_backward() -> None:
+    with torch.inference_mode():
+        mask = prefix_grouper_module._npu_compressed_causal_mask(torch.device("cpu"))
+
+    assert not mask.is_inference()
+    value = torch.randn((2, 2), requires_grad=True)
+    (value * mask[:2, :2]).sum().backward()
+    assert value.grad is not None

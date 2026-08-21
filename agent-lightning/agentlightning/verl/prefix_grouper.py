@@ -59,8 +59,14 @@ def _npu_compressed_causal_mask(device: torch.device) -> torch.Tensor:
     """Return the reusable 2048x2048 compressed causal mask required by NPU FA."""
     mask = _NPU_CAUSAL_MASKS.get(device)
     if mask is None:
-        mask = torch.ones((_NPU_COMPRESSED_MASK_SIZE, _NPU_COMPRESSED_MASK_SIZE), dtype=torch.bool).triu_(1)
-        mask = mask.to(device=device)
+        # The reference/old-policy pass can call this function under
+        # ``torch.inference_mode()`` before the actor update.  An inference
+        # tensor cannot later be saved by the fused training operator for its
+        # backward pass, so the process-wide cache must always hold a normal
+        # tensor regardless of the caller's mode.
+        with torch.inference_mode(False):
+            mask = torch.ones((_NPU_COMPRESSED_MASK_SIZE, _NPU_COMPRESSED_MASK_SIZE), dtype=torch.bool).triu_(1)
+            mask = mask.to(device=device)
         _NPU_CAUSAL_MASKS[device] = mask
     return mask
 
