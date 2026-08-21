@@ -1,25 +1,27 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-# pyright: reportUnknownVariableType=false
-
-"""Materialize Hugging Face models for Ascend hosts without CA certificates."""
+"""Materialize model Git repositories on Ascend hosts without CA certificates."""
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
-import ssl
-from contextlib import contextmanager
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Generator, Sequence
+from typing import Any, Sequence
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
 
+NPU_MODEL_BASE_URL_ENV = "AGENTLIGHTNING_NPU_MODEL_BASE_URL"
 NPU_MODEL_PROXY_ENV = "AGENTLIGHTNING_NPU_MODEL_PROXY"
 NPU_MODEL_PROXY_USERNAME_ENV = "AGENTLIGHTNING_NPU_MODEL_PROXY_USERNAME"
 NPU_MODEL_PROXY_PASSWORD_ENV = "AGENTLIGHTNING_NPU_MODEL_PROXY_PASSWORD"
+
+DEFAULT_MODEL_BASE_URL = "https://www.modelscope.cn"
 
 _STANDARD_PROXY_ENV_VARS = (
     "HTTPS_PROXY",
@@ -29,22 +31,13 @@ _STANDARD_PROXY_ENV_VARS = (
     "ALL_PROXY",
     "all_proxy",
 )
-
-CONFIG_ONLY_PATTERNS = (
-    "*.json",
-    "*.py",
-)
-
-_MODEL_PATH_FIELDS = (
-    "path",
-    "hf_config_path",
-    "tokenizer_path",
-    "lora_adapter_path",
-)
+_MODEL_PATH_FIELDS = ("path", "hf_config_path", "tokenizer_path", "lora_adapter_path")
+_LFS_HEADER = b"version https://git-lfs.github.com/spec/v1\n"
 
 __all__ = [
-    "CONFIG_ONLY_PATTERNS",
+    "DEFAULT_MODEL_BASE_URL",
     "ModelMaterialization",
+    "NPU_MODEL_BASE_URL_ENV",
     "NPU_MODEL_PROXY_ENV",
     "NPU_MODEL_PROXY_PASSWORD_ENV",
     "NPU_MODEL_PROXY_USERNAME_ENV",
@@ -55,7 +48,7 @@ __all__ = [
 
 @dataclass(frozen=True)
 class ModelMaterialization:
-    """Resolved local model path and the security mode used to obtain it."""
+    """Resolved local model path and the transport used to obtain it."""
 
     model_ref: str
     local_path: str
@@ -64,15 +57,21 @@ class ModelMaterialization:
     tls_verification: bool | None
 
 
+@dataclass(frozen=True)
+class LfsPointer:
+    sha256: str
+    size: int
+
+
 def _looks_like_missing_local_path(model_ref: str) -> bool:
     expanded = Path(model_ref).expanduser()
     return expanded.is_absolute() or model_ref.startswith(("./", "../", "~/"))
 
 
 def _model_directory(download_root: Path, model_ref: str) -> Path:
-    directory_name = model_ref.replace("/", "--").replace("\\", "--")
+    directory_name = model_ref.removesuffix(".git").replace("/", "--").replace("\\", "--")
     if not directory_name or directory_name in {".", ".."}:
-        raise ValueError(f"无效的 Hugging Face 模型 ID：{model_ref!r}")
+        raise ValueError(f"无效的模型仓库 ID：{model_ref!r}")
     resolved_root = download_root.resolve()
     local_dir = (resolved_root / directory_name).resolve()
     if not local_dir.is_relative_to(resolved_root):
@@ -94,99 +93,201 @@ def _model_proxy() -> tuple[str | None, tuple[str, str] | None]:
     return proxy_url, (username, password) if username and password else None
 
 
-def _is_proxy_authentication_error(error: BaseException) -> bool:
-    current: BaseException | None = error
-    visited: set[int] = set()
-    while current is not None and id(current) not in visited:
-        visited.add(id(current))
-        message = str(current)
-        if "407" in message and "Proxy Authentication Required" in message:
-            return True
-        current = current.__cause__ or current.__context__
-    return False
+def _authenticated_proxy_url(proxy_url: str, auth: tuple[str, str] | None) -> str:
+    if auth is None:
+        return proxy_url
+    parsed = urlsplit(proxy_url)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+        raise ValueError("模型下载代理必须是 http:// 或 https:// URL。")
+    username, password = auth
+    hostname = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    netloc = f"{quote(username, safe='')}:{quote(password, safe='')}@{hostname}{port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
-@contextmanager
-def _insecure_huggingface_client() -> Generator[None, None, None]:
-    """Temporarily use an httpx client without CA verification and without Xet."""
-    import httpx
-    import huggingface_hub.constants as hub_constants
-    import huggingface_hub.utils._http as hub_http
-    from huggingface_hub import set_client_factory
-
-    previous_factory = hub_http._GLOBAL_CLIENT_FACTORY  # pyright: ignore[reportPrivateUsage]
-    previous_disable_xet = hub_constants.HF_HUB_DISABLE_XET
-    previous_disable_xet_env = os.environ.get("HF_HUB_DISABLE_XET")
+def _download_environment() -> tuple[dict[str, str], tuple[str, ...]]:
+    environment = os.environ.copy()
     proxy_url, proxy_auth = _model_proxy()
+    for name in _STANDARD_PROXY_ENV_VARS:
+        environment.pop(name, None)
 
-    def insecure_client_factory() -> httpx.Client:
-        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        proxy = (
-            httpx.Proxy(
-                proxy_url,
-                ssl_context=ssl_context if proxy_url.startswith("https://") else None,
-                auth=proxy_auth,
+    secrets: list[str] = []
+    if proxy_url:
+        authenticated_proxy = _authenticated_proxy_url(proxy_url, proxy_auth)
+        environment["https_proxy"] = authenticated_proxy
+        environment["http_proxy"] = authenticated_proxy
+        secrets.extend(value for value in (authenticated_proxy, proxy_url) if value)
+
+    environment["GIT_LFS_SKIP_SMUDGE"] = "1"
+    return environment, tuple(secrets)
+
+
+def _redact(text: str, secrets: Sequence[str]) -> str:
+    redacted = text
+    for secret in secrets:
+        if secret:
+            redacted = redacted.replace(secret, "<redacted>")
+    return redacted
+
+
+def _run_download_command(
+    command: Sequence[str],
+    *,
+    environment: dict[str, str],
+    secrets: Sequence[str],
+    cwd: Path | None = None,
+) -> str:
+    completed = subprocess.run(list(command), cwd=cwd, env=environment, capture_output=True, text=True, check=False)
+    if completed.returncode:
+        details = _redact((completed.stderr or completed.stdout).strip(), secrets)
+        if "407" in details and "Proxy Authentication Required" in details:
+            details = (
+                f"代理返回 407；请通过 {NPU_MODEL_PROXY_USERNAME_ENV} 和 "
+                f"{NPU_MODEL_PROXY_PASSWORD_ENV} 提供有效凭据"
             )
-            if proxy_url
-            else None
+        raise RuntimeError(details or f"下载命令退出码为 {completed.returncode}")
+    return completed.stdout.strip()
+
+
+def _parse_lfs_pointer(path: Path) -> LfsPointer | None:
+    if not path.is_file() or path.stat().st_size > 1024:
+        return None
+    content = path.read_bytes()
+    if not content.startswith(_LFS_HEADER):
+        return None
+    values: dict[str, str] = {}
+    for line in content.decode("ascii").splitlines()[1:]:
+        key, _, value = line.partition(" ")
+        values[key] = value
+    oid = values.get("oid", "")
+    size = values.get("size", "")
+    if not oid.startswith("sha256:") or not size.isdigit():
+        raise ValueError(f"无效的 Git LFS 指针：{path}")
+    return LfsPointer(sha256=oid.removeprefix("sha256:"), size=int(size))
+
+
+def _lfs_files(local_dir: Path) -> list[tuple[Path, LfsPointer]]:
+    pointers: list[tuple[Path, LfsPointer]] = []
+    for path in local_dir.rglob("*"):
+        if ".git" in path.relative_to(local_dir).parts:
+            continue
+        pointer = _parse_lfs_pointer(path)
+        if pointer is not None:
+            pointers.append((path, pointer))
+    return pointers
+
+
+def _verify_file(path: Path, pointer: LfsPointer) -> None:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            size += len(chunk)
+            digest.update(chunk)
+    if size != pointer.size or digest.hexdigest() != pointer.sha256:
+        raise RuntimeError(
+            f"下载文件完整性校验失败：{path.name}，实际 size={size} sha256={digest.hexdigest()}，"
+            f"期望 size={pointer.size} sha256={pointer.sha256}"
         )
-        return httpx.Client(
-            verify=ssl_context,
-            trust_env=False,
-            proxy=proxy,
-            event_hooks={"request": [hub_http.hf_request_event_hook]},
-            follow_redirects=True,
-            timeout=None,
+
+
+def _clone_repository(model_ref: str, local_dir: Path, environment: dict[str, str], secrets: Sequence[str]) -> None:
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("自动下载模型需要 git，但当前 PATH 中未找到 git。")
+    base_url = os.environ.get(NPU_MODEL_BASE_URL_ENV, DEFAULT_MODEL_BASE_URL).rstrip("/")
+    repository_url = f"{base_url}/{quote(model_ref.removesuffix('.git'), safe='/')}.git"
+    _run_download_command(
+        (
+            git,
+            "-c",
+            "http.sslVerify=false",
+            "-c",
+            "filter.lfs.smudge=",
+            "-c",
+            "filter.lfs.process=",
+            "-c",
+            "filter.lfs.required=false",
+            "clone",
+            "--depth",
+            "1",
+            "--no-tags",
+            repository_url,
+            str(local_dir),
+        ),
+        environment=environment,
+        secrets=secrets,
+    )
+
+
+def _git_revision(local_dir: Path, environment: dict[str, str], secrets: Sequence[str]) -> str:
+    git = shutil.which("git")
+    assert git is not None
+    return _run_download_command(
+        (git, "symbolic-ref", "--short", "HEAD"), cwd=local_dir, environment=environment, secrets=secrets
+    )
+
+
+def _download_lfs_files(
+    model_ref: str,
+    local_dir: Path,
+    revision: str,
+    environment: dict[str, str],
+    secrets: Sequence[str],
+) -> None:
+    wget = shutil.which("wget")
+    if wget is None:
+        raise RuntimeError("下载模型权重需要 wget，但当前 PATH 中未找到 wget。")
+    base_url = os.environ.get(NPU_MODEL_BASE_URL_ENV, DEFAULT_MODEL_BASE_URL).rstrip("/")
+    repo_path = quote(model_ref.removesuffix(".git"), safe="/")
+    pointers = _lfs_files(local_dir)
+    for path, pointer in pointers:
+        relative_path = path.relative_to(local_dir).as_posix()
+        query = urlencode({"Revision": revision, "FilePath": relative_path})
+        file_url = f"{base_url}/api/v1/models/{repo_path}/repo?{query}"
+        partial_path = path.with_name(f"{path.name}.partial")
+        logger.info("wget 从 ModelScope 下载模型文件：%s", relative_path)
+        _run_download_command(
+            (
+                wget,
+                "--no-check-certificate",
+                "--continue",
+                "--output-document",
+                str(partial_path),
+                file_url,
+            ),
+            environment=environment,
+            secrets=secrets,
         )
-
-    os.environ["HF_HUB_DISABLE_XET"] = "1"
-    hub_constants.HF_HUB_DISABLE_XET = True
-    set_client_factory(insecure_client_factory)
-    try:
-        yield
-    finally:
-        set_client_factory(previous_factory)
-        hub_constants.HF_HUB_DISABLE_XET = previous_disable_xet
-        if previous_disable_xet_env is None:
-            os.environ.pop("HF_HUB_DISABLE_XET", None)
-        else:
-            os.environ["HF_HUB_DISABLE_XET"] = previous_disable_xet_env
+        _verify_file(partial_path, pointer)
+        os.replace(partial_path, path)
 
 
-def _download_snapshot(
+def _download_repository(
     model_ref: str,
     local_dir: Path,
     *,
     local_files_only: bool,
-    allow_patterns: Sequence[str] | None,
+    download_weights: bool,
 ) -> str:
-    from huggingface_hub import snapshot_download
-
-    patterns = list(allow_patterns) if allow_patterns is not None else None
     if local_files_only:
-        cached_path = snapshot_download(
-            repo_id=model_ref,
-            local_files_only=True,
-            allow_patterns=patterns,
-        )
-        shutil.copytree(cached_path, local_dir, dirs_exist_ok=True)
+        if not (local_dir / ".git").is_dir():
+            raise FileNotFoundError(f"本地 Git 模型目录不存在：{local_dir}")
+        if download_weights and _lfs_files(local_dir):
+            raise RuntimeError(f"本地模型 {local_dir} 仍包含未下载的 Git LFS 指针。")
         return str(local_dir)
 
-    proxy_url, _ = _model_proxy()
-    logger.warning(
-        "NPU 主机没有可用 CA 证书：下载 %s 时仅在当前进程内关闭 TLS 证书校验%s；不会修改系统证书。",
-        model_ref,
-        "并使用已配置的代理" if proxy_url else "",
-    )
-    with _insecure_huggingface_client():
-        return snapshot_download(
-            repo_id=model_ref,
-            local_dir=local_dir,
-            local_files_only=False,
-            allow_patterns=patterns,
-        )
+    environment, secrets = _download_environment()
+    if local_dir.exists() and not (local_dir / ".git").is_dir() and any(local_dir.iterdir()):
+        raise RuntimeError(f"模型目录已存在但不是 Git 仓库：{local_dir}")
+    if not (local_dir / ".git").is_dir():
+        _clone_repository(model_ref, local_dir, environment, secrets)
+
+    revision = _git_revision(local_dir, environment, secrets)
+    if download_weights:
+        _download_lfs_files(model_ref, local_dir, revision, environment, secrets)
+    return str(local_dir)
 
 
 def materialize_model_for_npu(
@@ -194,52 +295,42 @@ def materialize_model_for_npu(
     download_root: Path,
     *,
     local_files_only: bool = False,
-    allow_patterns: Sequence[str] | None = None,
+    download_weights: bool = True,
 ) -> ModelMaterialization:
-    """Resolve a local path or download a Hub repository beneath ``download_root``."""
+    """Resolve a local path or obtain a model repository with Git and wget."""
     expanded = Path(model_ref).expanduser()
     if expanded.exists():
         local_path = expanded.resolve()
         if not local_path.is_dir():
             raise ValueError(f"模型路径必须是目录：{local_path}")
-        return ModelMaterialization(
-            model_ref=model_ref,
-            local_path=str(local_path),
-            source="existing-local",
-            scope="local",
-            tls_verification=None,
-        )
+        if download_weights and _lfs_files(local_path):
+            raise RuntimeError(f"本地模型 {local_path} 仍包含未下载的 Git LFS 指针。")
+        return ModelMaterialization(model_ref, str(local_path), "existing-local", "local", None)
     if _looks_like_missing_local_path(model_ref):
         raise FileNotFoundError(f"本地模型目录不存在：{expanded}")
 
     root = download_root.expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     local_dir = _model_directory(root, model_ref)
-    scope = "config-only" if allow_patterns is not None else "full-snapshot"
+    scope = "git-metadata" if not download_weights else "full-repository"
     try:
         downloaded_path = Path(
-            _download_snapshot(
+            _download_repository(
                 model_ref,
                 local_dir,
                 local_files_only=local_files_only,
-                allow_patterns=allow_patterns,
+                download_weights=download_weights,
             )
         ).resolve()
     except Exception as exc:
-        mode = "仅本地缓存" if local_files_only else "已关闭当前下载客户端的 TLS 证书校验"
-        proxy_hint = (
-            f"；代理返回 407，请通过 {NPU_MODEL_PROXY_USERNAME_ENV} 和 " f"{NPU_MODEL_PROXY_PASSWORD_ENV} 提供有效凭据"
-            if _is_proxy_authentication_error(exc)
-            else ""
-        )
         raise RuntimeError(
-            f"无法把 NPU 模型 {model_ref!r} 下载到 {local_dir}（{mode}{proxy_hint}）。"
-            "请检查网络、HF_TOKEN、仓库权限和磁盘空间。"
+            f"无法用 Git/wget 把 NPU 模型 {model_ref!r} 下载到 {local_dir}。"
+            f"请检查代理凭据、{NPU_MODEL_BASE_URL_ENV}、仓库权限和磁盘空间：{exc}"
         ) from exc
     return ModelMaterialization(
         model_ref=model_ref,
         local_path=str(downloaded_path),
-        source="huggingface-snapshot",
+        source="git-wget",
         scope=scope,
         tls_verification=None if local_files_only else False,
     )
@@ -251,7 +342,7 @@ def materialize_npu_model_config(
     *,
     local_files_only: bool = False,
 ) -> list[ModelMaterialization]:
-    """Download all explicit VERL model references and rewrite them to local paths."""
+    """Download explicit VERL model repositories and rewrite them to local paths."""
     model_config = config.actor_rollout_ref.model
     original_main_path = str(model_config.path)
     materialized_by_ref: dict[str, ModelMaterialization] = {}
@@ -263,19 +354,12 @@ def materialize_npu_model_config(
         model_ref = str(value)
         result = materialized_by_ref.get(model_ref)
         if result is None:
-            result = materialize_model_for_npu(
-                model_ref,
-                download_root,
-                local_files_only=local_files_only,
-            )
+            result = materialize_model_for_npu(model_ref, download_root, local_files_only=local_files_only)
             materialized_by_ref[model_ref] = result
         model_config[field] = result.local_path
 
-    # VERL derives these paths from ``path`` only when they are null. Preserve that
-    # behavior after replacing the main repository ID with an absolute local path.
     main_result = materialized_by_ref[original_main_path]
     for field in ("hf_config_path", "tokenizer_path"):
         if model_config.get(field) is None:
             model_config[field] = main_result.local_path
-
     return list(materialized_by_ref.values())

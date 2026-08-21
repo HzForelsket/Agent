@@ -37,10 +37,10 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from verl.trainer.ppo.prefix_grouper_utils import build_position_ids_for_prefix_grouper
 
 from agentlightning.verl.accelerator import AcceleratorRuntime, select_accelerator
-from agentlightning.verl.model_download import CONFIG_ONLY_PATTERNS, materialize_model_for_npu
+from agentlightning.verl.model_download import materialize_model_for_npu
 from agentlightning.verl.prefix_grouper import apply_prefix_grouper_patch
 
-DEFAULT_MODELS = ["Qwen/Qwen2.5-0.5B-Instruct", "HuggingFaceTB/SmolLM2-135M-Instruct"]
+DEFAULT_MODELS = ["Qwen/Qwen2.5-0.5B-Instruct", "Qwen/Qwen2.5-1.5B-Instruct"]
 DIST_NAMES = {
     "torch_npu": "torch-npu",
     "triton_ascend": "triton-ascend",
@@ -210,8 +210,6 @@ def installed_stack(backend: str) -> dict[str, str]:
     if backend == "npu":
         stack.update(
             {
-                "huggingface_hub": _distribution_version("huggingface_hub"),
-                "httpx": _distribution_version("httpx"),
                 "torch_npu": _distribution_version("torch_npu"),
                 "triton_ascend": _distribution_version("triton_ascend"),
                 "vllm_ascend": _distribution_version("vllm_ascend"),
@@ -822,7 +820,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 model_ref,
                 model_download_root,
                 local_files_only=args.local_files_only,
-                allow_patterns=CONFIG_ONLY_PATTERNS if args.weights == "random" else None,
+                download_weights=args.weights == "pretrained",
             )
             resolved_model_ref = materialization.local_path
             print(f"NPU 模型已就绪：{model_ref} -> {resolved_model_ref}", flush=True)

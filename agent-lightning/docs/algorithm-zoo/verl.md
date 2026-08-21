@@ -73,11 +73,11 @@ PrefixGrouper currently requires FSDP/FSDP2, `use_remove_padding=False`, fused k
 
 Agent Lightning calls VERL's device auto-configuration before creating Ray resources. If `torch-npu` and a usable Ascend device are present it selects `trainer.device=npu`; otherwise it selects CUDA. `VERL_PLATFORM=huawei` or `VERL_PLATFORM=nvidia` remains available as an explicit override.
 
-When NPU is selected, a Hugging Face model ID is automatically downloaded before Ray starts. The snapshot is stored below the directory where the command was launched and the VERL configuration is rewritten to an absolute local path. For example, launching with `actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct` creates `./Qwen--Qwen2.5-0.5B-Instruct/`. Existing local model directories are used directly. Explicit `hf_config_path`, `tokenizer_path`, and `lora_adapter_path` repositories are materialized in the same way.
+When NPU is selected, a ModelScope model ID is automatically downloaded before Ray starts. The repository is stored below the directory where the command was launched and the VERL configuration is rewritten to an absolute local path. For example, launching with `actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct` creates `./Qwen--Qwen2.5-0.5B-Instruct/`. Existing local model directories are used directly. Explicit `hf_config_path`, `tokenizer_path`, and `lora_adapter_path` repositories are materialized in the same way.
 
-The Ascend server does not need a system CA bundle for this download. Agent Lightning pins `huggingface-hub==1.5.0` and `httpx==0.28.1`, temporarily uses an HTTP client with certificate verification disabled, disables Xet for the transfer, and restores the previous Hub client immediately afterward. It neither installs nor updates SSL certificates. This mode encrypts traffic but cannot authenticate the remote server, so use it only on a trusted network. Authentication for gated/private repositories still uses `HF_TOKEN`.
+The download path does not import or call `huggingface_hub`. It shallow-clones `https://www.modelscope.cn/<namespace>/<model>.git` with Git certificate verification disabled. Since Git LFS is not required on the host, LFS smudge is disabled; full-weight runs parse the checked-out LFS pointers and use `wget --no-check-certificate` against ModelScope's model-file API. Every downloaded large file must match the pointer's byte size and SHA-256 before replacing it. Agent Lightning neither installs nor updates SSL certificates. This mode encrypts traffic but cannot authenticate the remote server, so use it only on a trusted network.
 
-The download client uses `AGENTLIGHTNING_NPU_MODEL_PROXY` when present; otherwise it selects `HTTPS_PROXY`, `HTTP_PROXY`, or `ALL_PROXY` in that order. It disables further environment inheritance so one deterministic proxy is used for the Hub request and every redirected model-file request. Proxy credentials can be supplied separately without writing them to the VERL configuration or logs:
+The Git/wget subprocesses use `AGENTLIGHTNING_NPU_MODEL_PROXY` when present; otherwise they select `HTTPS_PROXY`, `HTTP_PROXY`, or `ALL_PROXY` in that order. One authenticated proxy URL is generated for both commands. Proxy credentials can be supplied separately without writing them to the VERL configuration or logs:
 
 ```bash
 export AGENTLIGHTNING_NPU_MODEL_PROXY='http://proxy.example.com:8080'
@@ -87,15 +87,17 @@ export AGENTLIGHTNING_NPU_MODEL_PROXY_PASSWORD='PASSWORD'
 
 If `HTTPS_PROXY` already contains the correct proxy address, the first line can be omitted. Credentials embedded and percent-encoded in the proxy URL are also accepted. The proxy URL and credentials are read only by the model download client and are never printed. A 407 response means the supplied proxy credentials are missing, expired, or rejected; Agent Lightning cannot synthesize proxy credentials.
 
-Automatic NPU download is enabled by default. Set `agentlightning.npu_model_download.enabled=false` to require an existing local path, or set `agentlightning.npu_model_download.local_files_only=true` to materialize only from the local Hugging Face cache. On multi-node runs, launch from a shared filesystem path visible at the same absolute location on every node.
+`AGENTLIGHTNING_NPU_MODEL_BASE_URL` defaults to `https://www.modelscope.cn`. It may point to an internal ModelScope-compatible mirror only if that mirror exposes both `/<namespace>/<model>.git` and `/api/v1/models/<namespace>/<model>/repo`.
 
-Install the platform-specific stack and compare the standard and shared-prefix paths with one or more Hugging Face model IDs:
+Automatic NPU download is enabled by default. Set `agentlightning.npu_model_download.enabled=false` to require an existing local path, or set `agentlightning.npu_model_download.local_files_only=true` to require an already cloned and fully materialized Git model repository below the current command directory. On multi-node runs, launch from a shared filesystem path visible at the same absolute location on every node.
+
+Install the platform-specific stack and compare the standard and shared-prefix paths with one or more ModelScope model IDs:
 
 ```bash
 conda run -n agent --no-capture-output python scripts/prefix_grouper_stack.py --backend auto
 
 conda run -n agent --no-capture-output python scripts/benchmark_prefix_grouper.py \
-    --models Qwen/Qwen2.5-0.5B-Instruct HuggingFaceTB/SmolLM2-135M-Instruct TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --models Qwen/Qwen2.5-0.5B-Instruct Qwen/Qwen2.5-1.5B-Instruct \
     --case 1024:4 \
     --case 1536:8 \
     --batch-size 8 \
@@ -121,7 +123,7 @@ The NPU installer first installs the CPU PyTorch wheel required by torch-npu, bu
 
 Each case uses `PROMPT_LENGTH:GROUP_SIZE`. The default `--weights random` mode downloads only model configurations and instantiates the complete architectures, which is sufficient for dense-kernel timing and memory comparisons. Use `--weights pretrained` when learned weights are specifically required. The script checks response log-probability equivalence before recording PPA results.
 
-On NPU the benchmark uses the same automatic materialization path: random-weight runs create a configuration-only snapshot in the command directory, while `--weights pretrained` creates a complete snapshot. The JSON report records the original model ID, resolved local path, snapshot scope, and whether TLS certificate verification was disabled.
+On NPU the benchmark uses the same automatic materialization path: random-weight runs keep the Git checkout with LFS pointers, while `--weights pretrained` resolves every LFS pointer through ModelScope and verifies the resulting file. The JSON report records the original model ID, resolved local path, download scope, and whether TLS certificate verification was disabled.
 
 The GPU requirements select vLLM's CUDA 12.9 build. The NPU requirements follow the vLLM-Ascend 0.22.1rc1 release matrix and require a host with the matching Ascend driver, CANN, NNAL, and device permissions; installing the Python packages alone cannot provide those system components.
 

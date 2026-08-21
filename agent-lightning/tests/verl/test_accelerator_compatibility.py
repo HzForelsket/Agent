@@ -129,8 +129,8 @@ def test_npu_prepares_model_before_workers_and_gpu_skips_download(
     expected = ModelMaterialization(
         model_ref="org/model",
         local_path=str(tmp_path / "org--model"),
-        source="huggingface-snapshot",
-        scope="full-snapshot",
+        source="git-wget",
+        scope="full-repository",
         tls_verification=None,
     )
 
