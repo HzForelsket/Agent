@@ -35,14 +35,13 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from packaging.version import Version
-from prefix_grouper import PrefixGrouper
 from prefix_grouper_stack import NPU_CANN_VERSION, REQUIRED_STACKS
 from transformers import AutoConfig, AutoModelForCausalLM
 from verl.trainer.ppo.prefix_grouper_utils import build_position_ids_for_prefix_grouper
 
 from agentlightning.verl.accelerator import AcceleratorRuntime, select_accelerator
 from agentlightning.verl.model_download import materialize_model_for_npu
-from agentlightning.verl.prefix_grouper import apply_prefix_grouper_patch
+from agentlightning.verl.prefix_grouper import apply_prefix_grouper_patch, build_prefix_grouper
 
 DEFAULT_MODELS = ["Qwen/Qwen2.5-0.5B-Instruct", "Qwen/Qwen2.5-1.5B-Instruct"]
 DIST_NAMES = {
@@ -411,11 +410,10 @@ def make_batch(
     )
     prefix_mask = torch.ones_like(representatives, dtype=torch.bool)
     response_mask = torch.ones_like(responses, dtype=torch.bool)
-    grouper = PrefixGrouper.from_ungrouped_masks(
+    grouper = build_prefix_grouper(
         prefix_mask=prefix_mask,
         suffix_mask=response_mask,
         group_sizes=[group_size] * group_count,
-        padding_mode="right",
         device=device,
     )
     grouped_ids = grouper.concat_input(representatives, prefix_mask, responses, response_mask)

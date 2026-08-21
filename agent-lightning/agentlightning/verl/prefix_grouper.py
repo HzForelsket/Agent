@@ -36,6 +36,7 @@ __all__ = [
     "PrefixGrouperActorRolloutRefWorker",
     "PrefixGrouperTrainingWorker",
     "apply_prefix_grouper_patch",
+    "build_prefix_grouper",
     "forward_with_prefix_grouper",
     "group_prompt_indices",
     "reorder_by_prompt",
@@ -232,8 +233,24 @@ def _sdpa_prefix_grouper_wrapper(original_fn):
     return wrapped
 
 
+def _batch_repeat_cat_without_device_scalar(
+    self: PrefixGrouper,
+    prefix: torch.Tensor,
+    suffix: torch.Tensor,
+    cat_dim: int,
+) -> torch.Tensor:
+    """Repeat prefixes without asking the accelerator to infer a data-dependent shape."""
+    repeated_prefix = torch.repeat_interleave(
+        prefix,
+        self.num_samples.to(prefix.device),
+        dim=0,
+        output_size=suffix.shape[0],
+    )
+    return torch.cat((repeated_prefix, suffix), dim=cat_dim)
+
+
 def apply_prefix_grouper_patch() -> None:
-    """Apply VERL's patch plus a causal-mask fix for its SDPA adapter."""
+    """Apply the VERL attention and accelerator-safe PrefixGrouper patches."""
     global _PATCHED
     if _PATCHED:
         return
@@ -242,7 +259,35 @@ def apply_prefix_grouper_patch() -> None:
     original_sdpa = ALL_ATTENTION_FUNCTIONS["sdpa"]
     _apply_verl_prefix_grouper_patch()
     ALL_ATTENTION_FUNCTIONS["sdpa"] = _sdpa_prefix_grouper_wrapper(original_sdpa)
+    PrefixGrouper.batch_repeat_cat = _batch_repeat_cat_without_device_scalar
     _PATCHED = True
+
+
+def build_prefix_grouper(
+    *,
+    prefix_mask: torch.Tensor,
+    suffix_mask: torch.Tensor,
+    group_sizes: list[int],
+    device: torch.device,
+) -> PrefixGrouper:
+    """Build shape metadata on CPU, then move only cached tensors to the accelerator."""
+    prefix_grouper = PrefixGrouper.from_ungrouped_masks(
+        prefix_mask=prefix_mask.detach().cpu(),
+        suffix_mask=suffix_mask.detach().cpu(),
+        group_sizes=group_sizes,
+        padding_mode="right",
+        device=torch.device("cpu"),
+    )
+    moved_tensors: dict[int, torch.Tensor] = {}
+    for name, value in vars(prefix_grouper.group_info).items():
+        if not torch.is_tensor(value):
+            continue
+        moved = moved_tensors.get(id(value))
+        if moved is None:
+            moved = value.to(device)
+            moved_tensors[id(value)] = moved
+        setattr(prefix_grouper.group_info, name, moved)
+    return prefix_grouper
 
 
 def _check_verl_version() -> None:
@@ -354,11 +399,10 @@ def forward_with_prefix_grouper(
     ordered_responses = responses.index_select(0, order)
     ordered_response_mask = response_mask.index_select(0, order)
 
-    prefix_grouper = PrefixGrouper.from_ungrouped_masks(
+    prefix_grouper = build_prefix_grouper(
         prefix_mask=prefix_mask,
         suffix_mask=ordered_response_mask,
         group_sizes=[len(group) for group in groups],
-        padding_mode="right",
         device=prompts.device,
     )
     concat_input_ids = prefix_grouper.concat_input(
