@@ -29,6 +29,8 @@ REQUIRED_STACKS: dict[Backend, dict[str, str]] = {
         "torch": "2.10.0",
         "torch_npu": "2.10.0",
         "transformers": "5.5.4",
+        "huggingface_hub": "1.5.0",
+        "httpx": "0.28.1",
         "triton_ascend": "3.2.1",
         "vllm": "0.22.1",
         "vllm_ascend": "0.22.1rc1",

@@ -67,11 +67,17 @@ algorithm = agl.VERL(
 )
 ```
 
-The optimization applies to the actor update and the old/reference-policy log-probability passes; rollout generation remains on the configured vLLM server. Rows are grouped only when their non-padding prompt token IDs match exactly. The integration targets VERL 0.9's `TrainingWorker`/FSDP model-engine stack and uses VERL's native attention patch.
+The optimization applies to the actor update and the old/reference-policy log-probability passes; rollout generation remains on the configured vLLM server. Rows are grouped only when their non-padding prompt token IDs match exactly. The integration targets VERL 0.9's `TrainingWorker`/FSDP model-engine stack and uses VERL's native attention patch. CUDA uses PyTorch SDPA. Ascend uses the torch-npu 2.10.0 fused training operator with packed TND tensors, cumulative sequence lengths, native GQA heads, and compressed left-up/right-down causal masks; it does not expand KV heads or materialize a per-layer `[B, 1, Q, K]` mask.
 
 PrefixGrouper currently requires FSDP/FSDP2, `use_remove_padding=False`, fused kernels disabled, Ulysses sequence parallel size 1, and text-only batches. Unsupported multimodal, distillation-top-k, and sum-pi-squared batches fall back to the standard VERL forward.
 
 Agent Lightning calls VERL's device auto-configuration before creating Ray resources. If `torch-npu` and a usable Ascend device are present it selects `trainer.device=npu`; otherwise it selects CUDA. `VERL_PLATFORM=huawei` or `VERL_PLATFORM=nvidia` remains available as an explicit override.
+
+When NPU is selected, a Hugging Face model ID is automatically downloaded before Ray starts. The snapshot is stored below the directory where the command was launched and the VERL configuration is rewritten to an absolute local path. For example, launching with `actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct` creates `./Qwen--Qwen2.5-0.5B-Instruct/`. Existing local model directories are used directly. Explicit `hf_config_path`, `tokenizer_path`, and `lora_adapter_path` repositories are materialized in the same way.
+
+The Ascend server does not need a system CA bundle for this download. Agent Lightning pins `huggingface-hub==1.5.0` and `httpx==0.28.1`, temporarily uses an HTTP client with certificate verification disabled, disables Xet for the transfer, and restores the previous Hub client immediately afterward. It neither installs nor updates SSL certificates. This mode encrypts traffic but cannot authenticate the remote server, so use it only on a trusted network. Authentication for gated/private repositories still uses `HF_TOKEN`.
+
+Automatic NPU download is enabled by default. Set `agentlightning.npu_model_download.enabled=false` to require an existing local path, or set `agentlightning.npu_model_download.local_files_only=true` to materialize only from the local Hugging Face cache. On multi-node runs, launch from a shared filesystem path visible at the same absolute location on every node.
 
 Install the platform-specific stack and compare the standard and shared-prefix paths with one or more Hugging Face model IDs:
 
@@ -84,11 +90,15 @@ conda run -n agent --no-capture-output python scripts/benchmark_prefix_grouper.p
     --case 1536:8 \
     --batch-size 8 \
     --response-length 64 \
+    --power-duration 2 \
+    --power-interval 0.1 \
     --output-json prefix-grouper-results.json \
     --output-markdown prefix-grouper-results.md
 ```
 
 Use `--backend gpu` or `--backend npu` to override installation detection, and `--dry-run` to inspect the commands without changing the environment. The runtime benchmark accepts `--device auto` (the default), `gpu`/`cuda`, `npu`, or an indexed device such as `npu:1`.
+
+On NPU, whole-device power sampling is enabled by default and uses `npu-smi info -t power -i DEVICE -c CHIP`. Use `--no-power` to disable it or `--power` to enable the corresponding `nvidia-smi` sampling on GPU. The JSON and Markdown reports include p50/p90/p95/p99 latency, variation, throughput, theoretical dense-token and causal-pair reduction, peak and incremental memory, idle/load power, estimated joules per step, tokens per joule, and detailed numerical agreement. Power is sampled in a separate sustained workload so it does not contaminate the latency samples. Runtime PPA is defined as Performance, Power, and Accuracy; physical chip Area is not measurable by this script and is not fabricated from a proxy.
 
 The two supported dependency matrices are intentionally separate because the accelerator plugins require different PyTorch versions:
 
@@ -99,7 +109,9 @@ The two supported dependency matrices are intentionally separate because the acc
 
 The NPU installer first installs the CPU PyTorch wheel required by torch-npu, builds the source-only `arctic-inference==0.1.1` package without its obsolete isolated Torch 2.7 build dependency, and builds upstream vLLM with `VLLM_TARGET_DEVICE=empty`. The Ascend plugin then supplies the device kernels. This avoids installing vLLM 0.22.1's CUDA wheel, whose metadata requires PyTorch 2.11. The exact package pins live in `scripts/requirements_prefix_grouper_gpu.txt` and `scripts/requirements_prefix_grouper_npu.txt`; the matrices checked by the benchmark live in `scripts/prefix_grouper_stack.py`.
 
-Each case uses `PROMPT_LENGTH:GROUP_SIZE`. The default `--weights random` mode downloads only model configurations and instantiates the complete architectures, which is sufficient for dense-kernel timing and memory comparisons. Use `--weights pretrained` when learned weights are specifically required. The script checks response log-probability equivalence before reporting median latency, response-token throughput, speedup, peak accelerator memory, and memory reduction.
+Each case uses `PROMPT_LENGTH:GROUP_SIZE`. The default `--weights random` mode downloads only model configurations and instantiates the complete architectures, which is sufficient for dense-kernel timing and memory comparisons. Use `--weights pretrained` when learned weights are specifically required. The script checks response log-probability equivalence before recording PPA results.
+
+On NPU the benchmark uses the same automatic materialization path: random-weight runs create a configuration-only snapshot in the command directory, while `--weights pretrained` creates a complete snapshot. The JSON report records the original model ID, resolved local path, snapshot scope, and whether TLS certificate verification was disabled.
 
 The GPU requirements select vLLM's CUDA 12.9 build. The NPU requirements follow the vLLM-Ascend 0.22.1rc1 release matrix and require a host with the matching Ascend driver, CANN, NNAL, and device permissions; installing the Python packages alone cannot provide those system components.
 

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Type, cast
 
 import hydra
@@ -22,9 +23,17 @@ from .dataset import AgentDataset, LoadedDataset
 
 if TYPE_CHECKING:
     from .daemon import AgentModeDaemon
+    from .model_download import ModelMaterialization
     from .trainer import AgentLightningTrainer
 
-__all__ = ["configure_accelerator", "main", "run_ppo", "TaskRunner"]
+__all__ = [
+    "configure_accelerator",
+    "invocation_directory",
+    "main",
+    "prepare_model_for_accelerator",
+    "run_ppo",
+    "TaskRunner",
+]
 
 
 def configure_accelerator(config: Any) -> str:
@@ -33,6 +42,37 @@ def configure_accelerator(config: Any) -> str:
 
     auto_set_device(config)
     return str(config.trainer.device)
+
+
+def invocation_directory() -> Path:
+    """Return the directory from which the user started the command."""
+    from hydra.core.hydra_config import HydraConfig
+
+    if HydraConfig.initialized():
+        return Path(str(HydraConfig.get().runtime.cwd)).resolve()
+    return Path.cwd().resolve()
+
+
+def prepare_model_for_accelerator(
+    config: Any,
+    backend: str,
+    download_root: Path | None = None,
+) -> list[ModelMaterialization]:
+    """Materialize remote model references before NPU Ray workers are created."""
+    download_config = config.agentlightning.get("npu_model_download", {})
+    if backend != "npu" or not download_config.get("enabled", True):
+        return []
+
+    from .model_download import materialize_npu_model_config
+
+    materializations = materialize_npu_model_config(
+        config,
+        download_root or invocation_directory(),
+        local_files_only=download_config.get("local_files_only", False),
+    )
+    for item in materializations:
+        print(f"NPU 模型已就绪：{item.model_ref} -> {item.local_path}", flush=True)
+    return materializations
 
 
 @hydra.main(config_path="pkg://agentlightning/verl", config_name="config", version_base=None)
@@ -62,7 +102,8 @@ def run_ppo(
     trainer_cls: Type[AgentLightningTrainer],
     daemon_cls: Type[AgentModeDaemon],
 ) -> None:
-    configure_accelerator(config)
+    backend = configure_accelerator(config)
+    prepare_model_for_accelerator(config, backend)
     if not ray.is_initialized():
         from omegaconf import OmegaConf
 

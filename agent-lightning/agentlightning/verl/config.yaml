@@ -8,6 +8,10 @@ defaults:
 
 agentlightning:
   port: 9999
+  npu_model_download:
+    # NPU workers load absolute local paths, avoiding HTTPS in Ray child processes.
+    enabled: true
+    local_files_only: false
   prefix_grouper:
     enabled: false
   trace_aggregator:

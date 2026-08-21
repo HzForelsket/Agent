@@ -13,7 +13,12 @@ from typing import Any
 import pytest
 
 from agentlightning.verl.accelerator import choose_backend, select_accelerator
-from agentlightning.verl.entrypoint import configure_accelerator
+from agentlightning.verl.entrypoint import (
+    configure_accelerator,
+    invocation_directory,
+    prepare_model_for_accelerator,
+)
+from agentlightning.verl.model_download import ModelMaterialization
 
 _STACK_SPEC = importlib.util.spec_from_file_location(
     "prefix_grouper_stack", Path(__file__).resolve().parents[2] / "scripts" / "prefix_grouper_stack.py"
@@ -102,6 +107,42 @@ def test_agentlightning_delegates_device_selection_to_verl(monkeypatch: pytest.M
 
     monkeypatch.setattr(verl.utils.device, "auto_set_device", fake_auto_set_device)
     assert configure_accelerator(config) == "npu"
+
+
+def test_invocation_directory_without_hydra_is_current_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert invocation_directory() == tmp_path.resolve()
+
+
+def test_npu_prepares_model_before_workers_and_gpu_skips_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agentlightning.verl import model_download
+
+    config = SimpleNamespace(
+        agentlightning={"npu_model_download": {"enabled": True, "local_files_only": True}},
+        actor_rollout_ref=SimpleNamespace(model=SimpleNamespace(path="org/model")),
+    )
+    calls: list[tuple[Any, Path, bool]] = []
+    expected = ModelMaterialization(
+        model_ref="org/model",
+        local_path=str(tmp_path / "org--model"),
+        source="huggingface-snapshot",
+        scope="full-snapshot",
+        tls_verification=None,
+    )
+
+    def fake_materialize(received: Any, root: Path, *, local_files_only: bool) -> list[ModelMaterialization]:
+        calls.append((received, root, local_files_only))
+        return [expected]
+
+    monkeypatch.setattr(model_download, "materialize_npu_model_config", fake_materialize)
+    assert prepare_model_for_accelerator(config, "npu", tmp_path) == [expected]
+    assert calls == [(config, tmp_path, True)]
+    assert prepare_model_for_accelerator(config, "cuda", tmp_path) == []
+    assert calls == [(config, tmp_path, True)]
 
 
 def test_current_host_runtime_selection(monkeypatch: pytest.MonkeyPatch) -> None:

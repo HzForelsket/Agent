@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from contextlib import nullcontext
+from functools import lru_cache
+from itertools import accumulate
 from types import MethodType
 from typing import Any, Iterable
 
@@ -38,6 +40,127 @@ __all__ = [
 ]
 
 _PATCHED = False
+_NPU_TORCH_VERSION = Version("2.10.0")
+_NPU_COMPRESSED_MASK_SIZE = 2048
+_NPU_CAUSAL_MASKS: dict[torch.device, torch.Tensor] = {}
+
+
+@lru_cache(maxsize=1)
+def _torch_npu_module() -> Any:
+    import torch_npu
+
+    current = Version(torch_npu.__version__)
+    if current.public != _NPU_TORCH_VERSION.public:
+        raise RuntimeError(f"The native PrefixGrouper NPU path requires torch-npu 2.10.0, found {current}.")
+    return torch_npu
+
+
+def _npu_compressed_causal_mask(device: torch.device) -> torch.Tensor:
+    """Return the reusable 2048x2048 compressed causal mask required by NPU FA."""
+    mask = _NPU_CAUSAL_MASKS.get(device)
+    if mask is None:
+        mask = torch.ones((_NPU_COMPRESSED_MASK_SIZE, _NPU_COMPRESSED_MASK_SIZE), dtype=torch.bool).triu_(1)
+        mask = mask.to(device=device)
+        _NPU_CAUSAL_MASKS[device] = mask
+    return mask
+
+
+def _pack_bnsd(tensor: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    """Pack a padded BNSD tensor into the TND layout used by NPU fused attention."""
+    if tensor.ndim != 4 or valid_mask.shape != (tensor.shape[0], tensor.shape[2]):
+        raise ValueError(
+            f"Cannot pack tensor {tuple(tensor.shape)} with mask {tuple(valid_mask.shape)} as BNSD -> TND."
+        )
+    return tensor.transpose(1, 2)[valid_mask]
+
+
+def _unpack_tnd(tensor: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    """Restore a packed TND attention output to padded BSND layout."""
+    if tensor.ndim != 3:
+        raise ValueError(f"Cannot unpack non-TND tensor with shape {tuple(tensor.shape)}.")
+    output = tensor.new_zeros((*valid_mask.shape, *tensor.shape[1:]))
+    output[valid_mask] = tensor
+    return output
+
+
+def _npu_attention_lengths(
+    prefix_grouper: PrefixGrouper,
+    *,
+    query_length: int,
+    key_length: int,
+) -> tuple[list[int], list[int], int]:
+    """Return per-sequence Q/KV lengths and the matching NPU causal sparse mode."""
+    group_info = list(prefix_grouper.group_info)
+    if query_length == key_length:
+        prefix_lengths = [int(info.prefix_len) for info in group_info]
+        return prefix_lengths, prefix_lengths, 2  # left-up causal
+
+    query_lengths = [int(suffix_length) for info in group_info for suffix_length in info.suffix_lens]
+    key_lengths = [int(info.prefix_len + suffix_length) for info in group_info for suffix_length in info.suffix_lens]
+    return query_lengths, key_lengths, 3  # right-down causal for suffix Q against prefix + suffix KV
+
+
+def _npu_tnd_attention(
+    prefix_grouper: PrefixGrouper,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    padding_mask: torch.Tensor,
+    *,
+    dropout: float,
+    scaling: float | None,
+) -> torch.Tensor:
+    """Run PrefixGrouper attention with torch-npu's packed fused training operator."""
+    if not 0.0 <= dropout < 1.0:
+        raise ValueError(f"Attention dropout must be in [0, 1), found {dropout}.")
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+        raise ValueError("Native NPU PrefixGrouper attention requires BNSD query, key, and value tensors.")
+    if key.shape != value.shape:
+        raise ValueError(f"Key and value shapes must match, found {tuple(key.shape)} and {tuple(value.shape)}.")
+
+    query_length, key_length = query.shape[2], key.shape[2]
+    if padding_mask.shape != (query.shape[0], key_length):
+        raise ValueError(
+            f"NPU attention mask must have shape {(query.shape[0], key_length)}, found {tuple(padding_mask.shape)}."
+        )
+    query_lengths, key_lengths, sparse_mode = _npu_attention_lengths(
+        prefix_grouper,
+        query_length=query_length,
+        key_length=key_length,
+    )
+    if len(query_lengths) != query.shape[0] or len(key_lengths) != key.shape[0]:
+        raise ValueError(
+            "PrefixGrouper sequence metadata does not match the NPU attention batch: "
+            f"Q={len(query_lengths)}/{query.shape[0]}, KV={len(key_lengths)}/{key.shape[0]}."
+        )
+    if max(query_lengths) > query_length or max(key_lengths) > key_length:
+        raise ValueError(
+            f"PrefixGrouper sequence lengths exceed padded shapes: Q={query_lengths}/{query_length}, "
+            f"KV={key_lengths}/{key_length}."
+        )
+
+    key_mask = padding_mask.bool()
+    query_mask = key_mask[:, -query_length:]
+    packed_query = _pack_bnsd(query, query_mask)
+    packed_key = _pack_bnsd(key, key_mask)
+    packed_value = _pack_bnsd(value, key_mask)
+    scale = float(scaling) if scaling is not None else query.shape[-1] ** -0.5
+    torch_npu = _torch_npu_module()
+    packed_output = torch_npu.npu_fusion_attention(
+        query=packed_query,
+        key=packed_key,
+        value=packed_value,
+        head_num=query.shape[1],
+        input_layout="TND",
+        atten_mask=_npu_compressed_causal_mask(query.device),
+        scale=scale,
+        keep_prob=1.0 - dropout,
+        actual_seq_qlen=list(accumulate(query_lengths)),
+        actual_seq_kvlen=list(accumulate(key_lengths)),
+        sparse_mode=sparse_mode,
+        softmax_layout="TND",
+    )[0]
+    return _unpack_tnd(packed_output, query_mask)
 
 
 def _repeat_kv(hidden_states: torch.Tensor, query_heads: int) -> torch.Tensor:
@@ -73,6 +196,16 @@ def _sdpa_prefix_grouper_wrapper(original_fn):
         scaling = kwargs.pop("scaling", None)
 
         def attention_forward(inner_query, inner_key, inner_value, padding_mask, *_args, **_kwargs):
+            if inner_query.device.type == "npu":
+                return _npu_tnd_attention(
+                    prefix_grouper,
+                    inner_query,
+                    inner_key,
+                    inner_value,
+                    padding_mask,
+                    dropout=dropout,
+                    scaling=scaling,
+                )
             inner_key = _repeat_kv(inner_key, inner_query.shape[1])
             inner_value = _repeat_kv(inner_value, inner_query.shape[1])
             causal_mask = _causal_sdpa_mask(padding_mask, inner_query.shape[2], inner_key.shape[2])
