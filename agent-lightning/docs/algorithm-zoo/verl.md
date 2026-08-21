@@ -100,17 +100,23 @@ conda run -n agent --no-capture-output python scripts/benchmark_prefix_grouper.p
     --models Qwen/Qwen2.5-0.5B-Instruct Qwen/Qwen2.5-1.5B-Instruct \
     --case 1024:4 \
     --case 1536:8 \
-    --batch-size 8 \
+    --batch-size-per-rank 8 \
     --response-length 64 \
-    --power-duration 2 \
+    --n-devices-per-node 8 \
+    --strategy fsdp \
+    --power-repeats 5 \
     --power-interval 0.1 \
     --output-json prefix-grouper-results.json \
     --output-markdown prefix-grouper-results.md
 ```
 
-Use `--backend gpu` or `--backend npu` to override installation detection, and `--dry-run` to inspect the commands without changing the environment. The runtime benchmark accepts `--device auto` (the default), `gpu`/`cuda`, `npu`, or an indexed device such as `npu:1`.
+Use `--backend gpu` or `--backend npu` to override installer detection, and `--dry-run` to inspect the installer commands without changing the environment. The runtime benchmark accepts `--device auto` (the default), `gpu`/`cuda`, or `npu`; individual device placement belongs to the VERL Ray resource pool.
 
-On NPU, whole-device power sampling is enabled by default and uses `npu-smi info -t power -i DEVICE -c CHIP`. Use `--no-power` to disable it or `--power` to enable the corresponding `nvidia-smi` sampling on GPU. The JSON and Markdown reports include p50/p90/p95/p99 latency, variation, throughput, theoretical dense-token and causal-pair reduction, peak and incremental memory, idle/load power, estimated joules per step, tokens per joule, and detailed numerical agreement. Power is sampled in a separate sustained workload so it does not contaminate the latency samples. Runtime PPA is defined as Performance, Power, and Accuracy; physical chip Area is not measurable by this script and is not fabricated from a proxy.
+The runtime benchmark itself now uses Agent Lightning's accelerator selection and VERL 0.9's distributed entrypoint. A Ray task runner creates a VERL `ResourcePoolManager` and `RayWorkerGroup`; VERL assigns devices and ranks, initializes HCCL/NCCL, and builds the model with its FSDP/FSDP2 engine. Do not wrap this command in `torchrun` and do not set per-process ranks manually. On one node, omitting `--n-devices-per-node` uses every visible accelerator. For an existing multi-node Ray cluster, pass `--ray-address auto --nnodes N --n-devices-per-node M`.
+
+`--batch-size-per-rank` is intentionally explicit. Equal-prompt rows must remain together on one data-parallel rank, so every case's group size must divide this local batch. The report records both local and global batch sizes; distributed latency uses the slowest rank for each sample, throughput uses global response tokens, power is summed across devices, and memory includes both the worst rank and the all-device sum.
+
+On NPU, whole-device power sampling is enabled by default and uses `npu-smi info -t power -i DEVICE -c CHIP`. Use `--no-power` to disable it or `--power` to enable the corresponding `nvidia-smi` sampling on GPU. Power runs use a fixed `--power-repeats` count on every rank so FSDP collectives cannot diverge. The JSON and Markdown reports include p50/p90/p95/p99 latency, variation, global throughput, theoretical dense-token and causal-pair reduction, per-rank and aggregate memory, idle/load power, estimated joules per step, tokens per joule, and per-rank numerical agreement.
 
 The two supported dependency matrices are intentionally separate because the accelerator plugins require different PyTorch versions:
 
@@ -121,9 +127,11 @@ The two supported dependency matrices are intentionally separate because the acc
 
 The NPU installer first installs the CPU PyTorch wheel required by torch-npu, builds the source-only `arctic-inference==0.1.1` package without its obsolete isolated Torch 2.7 build dependency, and builds upstream vLLM with `VLLM_TARGET_DEVICE=empty`. The Ascend plugin then supplies the device kernels. This avoids installing vLLM 0.22.1's CUDA wheel, whose metadata requires PyTorch 2.11. The exact package pins live in `scripts/requirements_prefix_grouper_gpu.txt` and `scripts/requirements_prefix_grouper_npu.txt`; the matrices checked by the benchmark live in `scripts/prefix_grouper_stack.py`.
 
-Each case uses `PROMPT_LENGTH:GROUP_SIZE`. The default `--weights random` mode downloads only model configurations and instantiates the complete architectures, which is sufficient for dense-kernel timing and memory comparisons. Use `--weights pretrained` when learned weights are specifically required. The script checks response log-probability equivalence before recording PPA results.
+Each case uses `PROMPT_LENGTH:GROUP_SIZE`. VERL's FSDP engine loads checkpoints through `from_pretrained`, so the distributed benchmark always uses pretrained weights; the former config-only random-weight path has been removed. The script checks response log-probability equivalence on every rank before recording PPA results. Backward runs enable the framework's gradient checkpointing by default; use `--no-gradient-checkpointing` only when intentionally measuring without activation recomputation.
 
-On NPU the benchmark uses the same automatic materialization path: random-weight runs keep the Git checkout with LFS pointers, while `--weights pretrained` resolves every LFS pointer through ModelScope and verifies the resulting file. The JSON report records the original model ID, resolved local path, download scope, and whether TLS certificate verification was disabled.
+On NPU the benchmark uses the same automatic materialization path and resolves every required LFS weight through ModelScope before Ray workers start. The JSON report records the original model ID, resolved local path, download scope, and whether TLS certificate verification was disabled.
+
+FSDP shards parameters, gradients, and optimizer state; it does not divide a rank's activation tensors or vocabulary logits. If backward still OOMs, first lower `--batch-size-per-rank` while keeping it divisible by the group size, shorten the prompt/response, or keep gradient checkpointing enabled. Ulysses sequence parallelism is not used because the current PrefixGrouper integration explicitly requires `ulysses_sequence_parallel_size=1`.
 
 The GPU requirements select vLLM's CUDA 12.9 build. The NPU requirements follow the vLLM-Ascend 0.22.1rc1 release matrix and require a host with the matching Ascend driver, CANN, NNAL, and device permissions; installing the Python packages alone cannot provide those system components.
 
