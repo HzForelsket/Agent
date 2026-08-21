@@ -15,6 +15,7 @@ import pytest
 from agentlightning.verl.accelerator import choose_backend, select_accelerator
 from agentlightning.verl.entrypoint import (
     configure_accelerator,
+    configure_npu_resources,
     invocation_directory,
     prepare_model_for_accelerator,
 )
@@ -107,6 +108,53 @@ def test_agentlightning_delegates_device_selection_to_verl(monkeypatch: pytest.M
 
     monkeypatch.setattr(verl.utils.device, "auto_set_device", fake_auto_set_device)
     assert configure_accelerator(config) == "npu"
+
+
+def test_npu_resources_use_all_uniform_devices_and_validate_rollout_topology(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = SimpleNamespace(
+        trainer=SimpleNamespace(n_gpus_per_node=1, nnodes=1),
+        actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(tensor_model_parallel_size=2)),
+    )
+    nodes = [
+        {"Alive": True, "Resources": {"CPU": 192.0, "NPU": 8.0}},
+        {"Alive": False, "Resources": {"NPU": 16.0}},
+        {"Alive": True, "Resources": {"CPU": 192.0, "NPU": 8.0}},
+        {"Alive": True, "Resources": {"CPU": 8.0}},
+    ]
+
+    topology = configure_npu_resources(config, nodes)
+
+    assert config.trainer.n_gpus_per_node == 8
+    assert config.trainer.nnodes == 2
+    assert topology.devices_per_node == 8
+    assert topology.nnodes == 2
+    assert topology.world_size == 16
+    assert topology.rollout_tensor_parallel_size == 2
+    assert topology.rollout_replicas == 8
+    assert "FSDP world_size=16, rollout TP=2, rollout replicas=8" in capsys.readouterr().out
+
+
+def test_npu_resources_reject_missing_heterogeneous_and_indivisible_topologies() -> None:
+    config = SimpleNamespace(
+        trainer=SimpleNamespace(n_gpus_per_node=1, nnodes=1),
+        actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(tensor_model_parallel_size=2)),
+    )
+    with pytest.raises(RuntimeError, match="Ray 没有发现 NPU"):
+        configure_npu_resources(config, [{"Alive": True, "Resources": {"CPU": 8.0}}])
+    with pytest.raises(RuntimeError, match="同构节点"):
+        configure_npu_resources(
+            config,
+            [
+                {"Alive": True, "Resources": {"NPU": 8.0}},
+                {"Alive": True, "Resources": {"NPU": 4.0}},
+            ],
+        )
+
+    config.actor_rollout_ref.rollout.tensor_model_parallel_size = 3
+    with pytest.raises(ValueError, match="不能被.*整除"):
+        configure_npu_resources(config, [{"Alive": True, "Resources": {"NPU": 8.0}}])
 
 
 def test_invocation_directory_without_hydra_is_current_directory(

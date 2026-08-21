@@ -6,8 +6,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Type, cast
+from typing import TYPE_CHECKING, Any, Mapping, Sequence, Type, cast
 
 import hydra
 import ray
@@ -27,7 +28,9 @@ if TYPE_CHECKING:
     from .trainer import AgentLightningTrainer
 
 __all__ = [
+    "NPUResourceTopology",
     "configure_accelerator",
+    "configure_npu_resources",
     "invocation_directory",
     "main",
     "prepare_model_for_accelerator",
@@ -36,12 +39,86 @@ __all__ = [
 ]
 
 
+@dataclass(frozen=True)
+class NPUResourceTopology:
+    """Resolved homogeneous NPU topology used by VERL and vLLM."""
+
+    nnodes: int
+    devices_per_node: int
+    world_size: int
+    rollout_tensor_parallel_size: int
+    rollout_replicas: int
+
+
 def configure_accelerator(config: Any) -> str:
     """Auto-select CUDA or Ascend NPU before Ray resources are created."""
     from verl.utils.device import auto_set_device
 
     auto_set_device(config)
     return str(config.trainer.device)
+
+
+def configure_npu_resources(config: Any, ray_nodes: Sequence[Mapping[str, Any]]) -> NPUResourceTopology:
+    """Use every NPU visible to Ray and validate VERL's rollout topology."""
+    devices_by_node: list[int] = []
+    for node in ray_nodes:
+        if not node.get("Alive", False):
+            continue
+        resources = node.get("Resources", {})
+        if not isinstance(resources, Mapping):
+            raise RuntimeError("Ray 节点的 Resources 字段无效，无法自动配置 NPU。")
+        raw_count = resources.get("NPU", 0)
+        try:
+            count = float(raw_count)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Ray 报告了无效的 NPU 数量：{raw_count!r}") from exc
+        if count <= 0:
+            continue
+        if not count.is_integer():
+            raise RuntimeError(f"Ray 报告了非整数 NPU 数量：{count}")
+        devices_by_node.append(int(count))
+
+    if not devices_by_node:
+        raise RuntimeError(
+            "已选择 NPU，但 Ray 没有发现 NPU 资源。请在启动 Ray 前检查 "
+            "ASCEND_RT_VISIBLE_DEVICES、torch-npu、CANN 和设备权限。"
+        )
+    unique_counts = set(devices_by_node)
+    if len(unique_counts) != 1:
+        raise RuntimeError(
+            "VERL 0.9 的 n_gpus_per_node 只支持同构节点，但 Ray 发现每节点 NPU 数量为 "
+            f"{devices_by_node}。请让所有训练节点暴露相同数量的 NPU。"
+        )
+
+    devices_per_node = devices_by_node[0]
+    nnodes = len(devices_by_node)
+    world_size = devices_per_node * nnodes
+    tensor_parallel_size = int(config.actor_rollout_ref.rollout.tensor_model_parallel_size)
+    if tensor_parallel_size <= 0:
+        raise ValueError(f"rollout tensor_model_parallel_size 必须为正整数，当前为 {tensor_parallel_size}。")
+    if devices_per_node % tensor_parallel_size:
+        raise ValueError(
+            f"每节点有 {devices_per_node} 张 NPU，不能被 rollout tensor_model_parallel_size="
+            f"{tensor_parallel_size} 整除。"
+        )
+
+    config.trainer.n_gpus_per_node = devices_per_node
+    config.trainer.nnodes = nnodes
+    topology = NPUResourceTopology(
+        nnodes=nnodes,
+        devices_per_node=devices_per_node,
+        world_size=world_size,
+        rollout_tensor_parallel_size=tensor_parallel_size,
+        rollout_replicas=world_size // tensor_parallel_size,
+    )
+    print(
+        "NPU 资源自动适配："
+        f"nodes={topology.nnodes}, devices_per_node={topology.devices_per_node}, "
+        f"FSDP world_size={topology.world_size}, rollout TP={topology.rollout_tensor_parallel_size}, "
+        f"rollout replicas={topology.rollout_replicas}",
+        flush=True,
+    )
+    return topology
 
 
 def invocation_directory() -> Path:
@@ -111,6 +188,8 @@ def run_ppo(
             dict[str, Any], OmegaConf.to_container(config.ray_kwargs.get("ray_init", {}), resolve=True)
         )
         ray.init(**ray_init_kwargs)
+    if backend == "npu":
+        configure_npu_resources(config, cast(list[dict[str, Any]], ray.nodes()))
 
     runner = TaskRunner.remote()
     ray.get(
