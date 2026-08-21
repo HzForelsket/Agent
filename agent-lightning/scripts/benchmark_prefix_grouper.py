@@ -81,12 +81,14 @@ class DistributedContext:
     def max_value(self, value: float, device: torch.device) -> float:
         if not self.enabled:
             return float(value)
-        tensor = torch.tensor(float(value), dtype=torch.float64, device=device)
+        # HCCL 9.0 does not implement Double collectives. FP32 is sufficient for
+        # latency/PPA statistics and keeps the GPU and NPU aggregation paths identical.
+        tensor = torch.tensor(float(value), dtype=torch.float32, device=device)
         dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
         return float(tensor.item())
 
     def numeric_rows(self, values: Sequence[float], device: torch.device) -> list[list[float]]:
-        row = torch.tensor([float(value) for value in values], dtype=torch.float64, device=device)
+        row = torch.tensor([float(value) for value in values], dtype=torch.float32, device=device)
         if not self.enabled:
             return [row.cpu().tolist()]
         rows = [torch.empty_like(row) for _ in range(self.world_size)]
