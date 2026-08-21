@@ -33,11 +33,14 @@ from typing import Any, Callable, Sequence
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel
 from packaging.version import Version
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.fsdp import FullyShardedDataParallel, MixedPrecision, ShardingStrategy
 from prefix_grouper_stack import NPU_CANN_VERSION, REQUIRED_STACKS
 from transformers import AutoConfig, AutoModelForCausalLM
 from verl.trainer.ppo.prefix_grouper_utils import build_position_ids_for_prefix_grouper
+from verl.utils.fsdp_utils import get_fsdp_wrap_policy, get_init_weight_context_manager, init_fn
+from verl.workers.engine.fsdp.utils import apply_npu_fsdp_patches
 
 from agentlightning.verl.accelerator import AcceleratorRuntime, select_accelerator
 from agentlightning.verl.model_download import materialize_model_for_npu
@@ -59,11 +62,12 @@ class Case:
 
 @dataclass(frozen=True)
 class DistributedContext:
-    """Host-side control collectives for the multi-device PPA runner."""
+    """FSDP model mesh and host-side control collectives for the PPA runner."""
 
     rank: int = 0
     local_rank: int = 0
     world_size: int = 1
+    model_mesh: DeviceMesh | None = None
     host_group: dist.ProcessGroup | None = None
 
     @property
@@ -302,11 +306,17 @@ def initialize_distributed(accelerator: AcceleratorRuntime) -> tuple[Accelerator
     accelerator = select_accelerator(device_spec)
     accelerator.set_device()
     dist.init_process_group(backend="hccl" if accelerator.backend == "npu" else "nccl")
+    model_mesh = init_device_mesh(
+        accelerator.device_type,
+        mesh_shape=(world_size,),
+        mesh_dim_names=("fsdp",),
+    )
     host_group = dist.new_group(backend="gloo")
     return accelerator, DistributedContext(
         rank=rank,
         local_rank=local_rank,
         world_size=world_size,
+        model_mesh=model_mesh,
         host_group=host_group,
     )
 
@@ -370,23 +380,46 @@ def load_model(
         "dtype": dtype,
         "trust_remote_code": args.trust_remote_code,
     }
-    if args.weights == "pretrained":
-        model = AutoModelForCausalLM.from_pretrained(
-            model_ref,
-            local_files_only=local_files_only,
-            **kwargs,
+    if distributed.enabled:
+        if distributed.model_mesh is None:
+            raise RuntimeError("多卡 benchmark 缺少 FSDP 设备网格。")
+        if device.type == "npu":
+            apply_npu_fsdp_patches()
+        init_context_factory = get_init_weight_context_manager(
+            use_meta_tensor=not bool(getattr(config, "tie_word_embeddings", False)),
+            mesh=distributed.model_mesh,
         )
     else:
-        model = AutoModelForCausalLM.from_config(**kwargs)
-    model.to(device=device, dtype=dtype).eval()
+        init_context_factory = nullcontext
+
+    with init_context_factory():
+        if args.weights == "pretrained":
+            model = AutoModelForCausalLM.from_pretrained(
+                model_ref,
+                local_files_only=local_files_only,
+                **kwargs,
+            )
+        else:
+            model = AutoModelForCausalLM.from_config(**kwargs)
+        model.to(dtype=dtype)
+
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
     if distributed.enabled:
-        model = DistributedDataParallel(
+        model = FullyShardedDataParallel(
             model,
-            device_ids=[int(device.index or 0)],
-            output_device=int(device.index or 0),
-            broadcast_buffers=False,
+            param_init_fn=init_fn,
+            auto_wrap_policy=get_fsdp_wrap_policy(model),
+            device_id=device,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            mixed_precision=MixedPrecision(param_dtype=dtype, reduce_dtype=torch.float32, buffer_dtype=torch.float32),
+            sync_module_states=True,
+            device_mesh=distributed.model_mesh,
+            use_orig_params=False,
+            limit_all_gathers=True,
         )
-    return model, config
+    else:
+        model.to(device=device)
+    return model.eval(), config, parameter_count
 
 
 def make_batch(
@@ -419,7 +452,6 @@ def make_batch(
     grouped_ids = grouper.concat_input(representatives, prefix_mask, responses, response_mask)
     return {
         "input_ids": torch.cat((prompts, responses), dim=-1),
-        "attention_mask": torch.ones((batch_size, prompt_length + response_length), dtype=torch.bool, device=device),
         "position_ids": torch.arange(prompt_length + response_length, device=device).expand(batch_size, -1),
         "responses": responses,
         "grouper": grouper,
@@ -462,7 +494,7 @@ def response_logits(model: torch.nn.Module, batch: dict[str, Any], grouped: bool
     if grouped:
         output = model(
             input_ids=batch["grouped_ids"],
-            attention_mask=batch["grouper"].padding_mask,
+            attention_mask=None,
             position_ids=batch["grouped_position_ids"],
             prefix_grouper=batch["grouper"],
             use_cache=False,
@@ -471,7 +503,10 @@ def response_logits(model: torch.nn.Module, batch: dict[str, Any], grouped: bool
         return suffix_logits[:, :-1]
     output = model(
         input_ids=batch["input_ids"],
-        attention_mask=batch["attention_mask"],
+        # Synthetic benchmark rows are fully valid, so no padding mask is
+        # required. ``None`` lets SDPA use its causal flag without reading a
+        # zero-dimensional mask reduction back from the accelerator.
+        attention_mask=None,
         position_ids=batch["position_ids"],
         use_cache=False,
     )
@@ -746,7 +781,7 @@ def benchmark_mode(
             return loss
         return logits
 
-    context = torch.inference_mode() if mode == "forward" else torch.enable_grad()
+    context = torch.no_grad() if mode == "forward" else torch.enable_grad()
     with context:
         baseline_ms, baseline_samples, baseline_rank_samples = timed(
             lambda: step(False), warmup, repeats, accelerator, distributed
@@ -832,11 +867,14 @@ def benchmark_mode(
 def correctness(
     model: torch.nn.Module,
     batch: dict[str, Any],
+    accelerator: AcceleratorRuntime,
     distributed: DistributedContext = DistributedContext(),
 ) -> dict[str, Any]:
-    with torch.inference_mode():
+    with torch.no_grad():
         baseline_logits = response_logits(model, batch, False)
+        accelerator.synchronize()
         grouped_logits = response_logits(model, batch, True)
+        accelerator.synchronize()
         response_ids = batch["responses"].unsqueeze(-1)
         baseline_log_probs = baseline_logits.float().log_softmax(-1).gather(-1, response_ids).squeeze(-1)
         grouped_log_probs = grouped_logits.float().log_softmax(-1).gather(-1, response_ids).squeeze(-1)
@@ -1064,7 +1102,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "device": str(device),
             "name": accelerator.device_name(),
             "world_size": distributed.world_size,
-            "parallelism": "distributed-data-parallel" if distributed.enabled else "single-device",
+            "parallelism": "fully-sharded-data-parallel" if distributed.enabled else "single-device",
             "statistics_backend": "gloo-cpu" if distributed.enabled else "local-cpu",
         },
         "required_cann": NPU_CANN_VERSION if accelerator.backend == "npu" else None,
@@ -1073,6 +1111,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "model_download_root": str(model_download_root) if model_download_root is not None else None,
         "batch_size_per_rank": args.batch_size,
         "global_batch_size": args.batch_size * distributed.world_size,
+        "rank_seed_stride": 1_000_003 if distributed.enabled else 0,
         "response_length": args.response_length,
         "ppa_definition": {
             "performance": "步延迟取所有 rank 最大值；response token 吞吐汇总所有 rank",
@@ -1114,7 +1153,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             resolved_model_ref = materialization.local_path
             if distributed.is_main:
                 print(f"NPU 模型已就绪：{model_ref} -> {resolved_model_ref}", flush=True)
-        model, config = load_model(
+        model, config, parameter_count = load_model(
             resolved_model_ref,
             args,
             device,
@@ -1133,7 +1172,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "model_materialization": asdict(materialization) if materialization is not None else None,
             "label": Path(model_ref).name,
             "model_type": config.model_type,
-            "parameters": sum(parameter.numel() for parameter in model.parameters()),
+            "parameters": parameter_count,
             "idle_power": idle_measurement,
             "cases": [],
         }
@@ -1148,9 +1187,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 response_length=args.response_length,
                 group_size=case.group_size,
                 device=device,
-                seed=args.seed,
+                seed=args.seed + distributed.rank * 1_000_003,
             )
-            check = correctness(model, batch, distributed)
+            check = correctness(model, batch, accelerator, distributed)
             if not check["passed"]:
                 raise RuntimeError(f"{model_ref} {case} 正确性检查失败：{check}")
             modes = ["forward", "forward-backward"] if args.backward else ["forward"]

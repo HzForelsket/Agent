@@ -417,7 +417,11 @@ def forward_with_prefix_grouper(
         model=model,
         prefix_grouper=prefix_grouper,
         concat_input_ids=concat_input_ids,
-        attention_mask=prefix_grouper.padding_mask,
+        # PrefixGrouper supplies its prefix/suffix padding masks inside the
+        # patched attention function. Passing the grouped padding mask through
+        # the model-level Transformers mask pipeline is redundant and forces a
+        # device scalar read in ``_ignore_causal_mask_sdpa`` on NPU.
+        attention_mask=None,
         position_ids=position_ids,
         completion_ids=ordered_responses,
         completion_mask=ordered_response_mask,
