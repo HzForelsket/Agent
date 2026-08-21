@@ -30,6 +30,8 @@ from verl.utils.device import get_device_id, get_device_name
 from verl.workers.engine.fsdp import FSDPEngineWithLMHead
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
 
+from .npu_fsdp_loader import NPUShardedLoadFSDPEngineWithLMHead as _NPUShardedLoadFSDPEngineWithLMHead
+
 __all__ = [
     "PrefixGrouperActorRolloutRefWorker",
     "PrefixGrouperTrainingWorker",

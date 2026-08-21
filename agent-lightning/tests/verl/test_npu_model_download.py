@@ -266,3 +266,67 @@ def test_verl_model_config_reuses_download_and_rewrites_all_remote_paths(
     assert config.actor_rollout_ref.model.lora_adapter_path == adapter_path
     assert calls == [("Qwen/main-model", True), ("Qwen/adapter", True)]
     assert [item.model_ref for item in results] == ["Qwen/main-model", "Qwen/adapter"]
+
+
+def test_verl_model_config_materializes_enabled_critic_and_reward_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "model": {
+                    "path": "Qwen/shared-model",
+                    "hf_config_path": None,
+                    "tokenizer_path": None,
+                    "lora_adapter_path": None,
+                }
+            },
+            "critic": {
+                "enable": True,
+                "model": {
+                    "path": "Qwen/shared-model",
+                    "hf_config_path": None,
+                    "tokenizer_path": None,
+                    "lora_adapter_path": None,
+                },
+            },
+            "reward": {
+                "reward_model": {
+                    "enable": True,
+                    "model_path": "Qwen/reward-model",
+                }
+            },
+            "algorithm": {"adv_estimator": "gae"},
+        }
+    )
+    calls: list[str] = []
+
+    def fake_materialize(
+        model_ref: str,
+        download_root: Path,
+        *,
+        local_files_only: bool = False,
+        download_weights: bool = True,
+    ) -> model_download.ModelMaterialization:
+        del local_files_only, download_weights
+        calls.append(model_ref)
+        return model_download.ModelMaterialization(
+            model_ref=model_ref,
+            local_path=str((download_root / model_ref.replace("/", "--")).resolve()),
+            source="git-wget",
+            scope="full-repository",
+            tls_verification=False,
+        )
+
+    monkeypatch.setattr(model_download, "materialize_model_for_npu", fake_materialize)
+    results = model_download.materialize_npu_model_config(config, tmp_path)
+
+    shared_path = str((tmp_path / "Qwen--shared-model").resolve())
+    reward_path = str((tmp_path / "Qwen--reward-model").resolve())
+    assert config.actor_rollout_ref.model.path == shared_path
+    assert config.critic.model.path == shared_path
+    assert config.critic.model.hf_config_path == shared_path
+    assert config.critic.model.tokenizer_path == shared_path
+    assert config.reward.reward_model.model_path == reward_path
+    assert calls == ["Qwen/shared-model", "Qwen/reward-model"]
+    assert [item.model_ref for item in results] == ["Qwen/shared-model", "Qwen/reward-model"]

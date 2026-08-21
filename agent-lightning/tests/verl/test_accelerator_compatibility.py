@@ -34,6 +34,35 @@ build_install_plan = _STACK_MODULE.build_install_plan
 detect_backend = _STACK_MODULE.detect_backend
 
 
+def _npu_config(
+    *,
+    tensor_parallel_size: int = 2,
+    data_parallel_size: int = 1,
+    pipeline_parallel_size: int = 1,
+    checkpoint_backend: str = "naive",
+    critic_enabled: bool = False,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        trainer=SimpleNamespace(n_gpus_per_node=1, nnodes=1),
+        actor_rollout_ref=SimpleNamespace(
+            actor=SimpleNamespace(strategy="fsdp", fsdp_config=SimpleNamespace(fsdp_size=2)),
+            rollout=SimpleNamespace(
+                tensor_model_parallel_size=tensor_parallel_size,
+                data_parallel_size=data_parallel_size,
+                pipeline_model_parallel_size=pipeline_parallel_size,
+                checkpoint_engine=SimpleNamespace(backend=checkpoint_backend),
+                disaggregation=SimpleNamespace(enabled=False),
+            ),
+        ),
+        critic=SimpleNamespace(
+            enable=critic_enabled,
+            strategy="fsdp",
+            fsdp=SimpleNamespace(fsdp_size=2),
+        ),
+        reward=SimpleNamespace(reward_model=SimpleNamespace(enable=False)),
+    )
+
+
 def test_auto_backend_prefers_npu(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("VERL_PLATFORM", raising=False)
     assert choose_backend("auto", npu_available=True, cuda_available=True) == "npu"
@@ -113,10 +142,7 @@ def test_agentlightning_delegates_device_selection_to_verl(monkeypatch: pytest.M
 def test_npu_resources_use_all_uniform_devices_and_validate_rollout_topology(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    config = SimpleNamespace(
-        trainer=SimpleNamespace(n_gpus_per_node=1, nnodes=1),
-        actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(tensor_model_parallel_size=2)),
-    )
+    config = _npu_config(data_parallel_size=2)
     nodes = [
         {"Alive": True, "Resources": {"CPU": 192.0, "NPU": 8.0}},
         {"Alive": False, "Resources": {"NPU": 16.0}},
@@ -132,15 +158,16 @@ def test_npu_resources_use_all_uniform_devices_and_validate_rollout_topology(
     assert topology.nnodes == 2
     assert topology.world_size == 16
     assert topology.rollout_tensor_parallel_size == 2
-    assert topology.rollout_replicas == 8
-    assert "FSDP world_size=16, rollout TP=2, rollout replicas=8" in capsys.readouterr().out
+    assert topology.rollout_data_parallel_size == 2
+    assert topology.rollout_pipeline_parallel_size == 1
+    assert topology.rollout_world_size == 4
+    assert topology.rollout_replicas == 4
+    assert config.actor_rollout_ref.actor.fsdp_config.fsdp_size == -1
+    assert "FSDP world_size=16, rollout TP=2, DP=2, PP=1, devices_per_replica=4" in capsys.readouterr().out
 
 
 def test_npu_resources_reject_missing_heterogeneous_and_indivisible_topologies() -> None:
-    config = SimpleNamespace(
-        trainer=SimpleNamespace(n_gpus_per_node=1, nnodes=1),
-        actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(tensor_model_parallel_size=2)),
-    )
+    config = _npu_config()
     with pytest.raises(RuntimeError, match="Ray 没有发现 NPU"):
         configure_npu_resources(config, [{"Alive": True, "Resources": {"CPU": 8.0}}])
     with pytest.raises(RuntimeError, match="同构节点"):
@@ -154,6 +181,58 @@ def test_npu_resources_reject_missing_heterogeneous_and_indivisible_topologies()
 
     config.actor_rollout_ref.rollout.tensor_model_parallel_size = 3
     with pytest.raises(ValueError, match="不能被.*整除"):
+        configure_npu_resources(config, [{"Alive": True, "Resources": {"NPU": 8.0}}])
+
+
+def test_npu_resources_reject_idle_rollout_ranks_and_cross_node_slices() -> None:
+    idle_config = _npu_config(tensor_parallel_size=2, data_parallel_size=3)
+    with pytest.raises(ValueError, match="部分 NPU rank 不参与 rollout"):
+        configure_npu_resources(idle_config, [{"Alive": True, "Resources": {"NPU": 8.0}}])
+
+    cross_node_config = _npu_config(tensor_parallel_size=2, data_parallel_size=3)
+    nodes = [{"Alive": True, "Resources": {"NPU": 8.0}} for _ in range(3)]
+    with pytest.raises(ValueError, match="错误切到两个节点"):
+        configure_npu_resources(cross_node_config, nodes)
+
+
+def test_npu_resources_include_disaggregated_and_reward_rollout_footprints() -> None:
+    config = _npu_config()
+    config.actor_rollout_ref.rollout.disaggregation = SimpleNamespace(
+        enabled=True,
+        prefill_replicas=1,
+        decode_replicas=1,
+        decode_tensor_model_parallel_size=2,
+    )
+    config.reward.reward_model = SimpleNamespace(
+        enable=True,
+        n_gpus_per_node=1,
+        nnodes=1,
+        rollout=SimpleNamespace(
+            tensor_model_parallel_size=4,
+            data_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            disaggregation=SimpleNamespace(enabled=False),
+        ),
+    )
+
+    topology = configure_npu_resources(config, [{"Alive": True, "Resources": {"NPU": 8.0}}])
+
+    assert topology.rollout_world_size == 4
+    assert topology.rollout_replicas == 2
+    assert topology.reward_rollout_world_size == 4
+    assert topology.reward_rollout_replicas == 2
+    assert config.reward.reward_model.n_gpus_per_node == 8
+    assert config.reward.reward_model.nnodes == 1
+
+
+def test_npu_resources_require_full_rank_fsdp_and_naive_weight_sync() -> None:
+    config = _npu_config(checkpoint_backend="hccl")
+    with pytest.raises(ValueError, match="全 rank 权重同步.*backend=naive"):
+        configure_npu_resources(config, [{"Alive": True, "Resources": {"NPU": 8.0}}])
+
+    config = _npu_config(critic_enabled=True)
+    config.critic.strategy = "fsdp2"
+    with pytest.raises(ValueError, match="critic.strategy=fsdp"):
         configure_npu_resources(config, [{"Alive": True, "Resources": {"NPU": 8.0}}])
 
 

@@ -30,6 +30,9 @@ actor_rollout_ref:
     use_prefix_grouper: ${agentlightning.prefix_grouper.enabled}
   rollout:
     mode: async
+    checkpoint_engine:
+      # Colocated sync executes on every actor/rollout rank; NPU preflight rejects single-sender backends.
+      backend: naive
     agent:
       custom_async_server:
         path: pkg://agentlightning.verl.async_server

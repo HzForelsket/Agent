@@ -47,7 +47,122 @@ class NPUResourceTopology:
     devices_per_node: int
     world_size: int
     rollout_tensor_parallel_size: int
+    rollout_data_parallel_size: int
+    rollout_pipeline_parallel_size: int
+    rollout_world_size: int
     rollout_replicas: int
+    reward_rollout_world_size: int | None
+    reward_rollout_replicas: int | None
+
+
+def _config_value(config: Any, name: str, default: Any = None) -> Any:
+    if config is None:
+        return default
+    if isinstance(config, Mapping):
+        return config.get(name, default)
+    getter = getattr(config, "get", None)
+    if callable(getter):
+        return getter(name, default)
+    return getattr(config, name, default)
+
+
+def _positive_parallel_size(config: Any, name: str, *, label: str, default: int = 1) -> int:
+    value = int(_config_value(config, name, default))
+    if value <= 0:
+        raise ValueError(f"{label}.{name} 必须为正整数，当前为 {value}。")
+    return value
+
+
+def _rollout_parallelism(rollout: Any, *, label: str) -> tuple[int, int, int, int]:
+    tensor_parallel_size = _positive_parallel_size(
+        rollout, "tensor_model_parallel_size", label=label, default=1
+    )
+    data_parallel_size = _positive_parallel_size(rollout, "data_parallel_size", label=label, default=1)
+    pipeline_parallel_size = _positive_parallel_size(
+        rollout, "pipeline_model_parallel_size", label=label, default=1
+    )
+
+    disaggregation = _config_value(rollout, "disaggregation")
+    if bool(_config_value(disaggregation, "enabled", False)):
+        prefill_replicas = _positive_parallel_size(
+            disaggregation, "prefill_replicas", label=f"{label}.disaggregation", default=1
+        )
+        decode_replicas = _positive_parallel_size(
+            disaggregation, "decode_replicas", label=f"{label}.disaggregation", default=1
+        )
+        raw_decode_tp = _config_value(disaggregation, "decode_tensor_model_parallel_size")
+        decode_parallel_size = (
+            tensor_parallel_size
+            if raw_decode_tp is None
+            else int(raw_decode_tp)
+        )
+        if decode_parallel_size <= 0:
+            raise ValueError(
+                f"{label}.disaggregation.decode_tensor_model_parallel_size 必须为正整数，"
+                f"当前为 {decode_parallel_size}。"
+            )
+        replica_world_size = (
+            tensor_parallel_size * prefill_replicas + decode_parallel_size * decode_replicas
+        ) * data_parallel_size * pipeline_parallel_size
+    else:
+        replica_world_size = tensor_parallel_size * data_parallel_size * pipeline_parallel_size
+    return tensor_parallel_size, data_parallel_size, pipeline_parallel_size, replica_world_size
+
+
+def _validate_rollout_layout(
+    *,
+    label: str,
+    replica_world_size: int,
+    devices_per_node: int,
+    world_size: int,
+) -> int:
+    if world_size % replica_world_size:
+        raise ValueError(
+            f"NPU world_size={world_size} 不能被 {label} 每副本占卡数 {replica_world_size} 整除；"
+            "该配置会让部分 NPU rank 不参与 rollout。"
+        )
+    if replica_world_size <= devices_per_node:
+        if devices_per_node % replica_world_size:
+            raise ValueError(
+                f"每节点有 {devices_per_node} 张 NPU，不能完整容纳整数个 {label} 副本"
+                f"（每副本 {replica_world_size} 张）；该配置会把单个副本错误切到两个节点。"
+            )
+    elif replica_world_size % devices_per_node:
+        raise ValueError(
+            f"{label} 每副本需要 {replica_world_size} 张 NPU，必须占用整数个完整节点；"
+            f"当前每节点有 {devices_per_node} 张。"
+        )
+    return world_size // replica_world_size
+
+
+def _configure_npu_fsdp(config: Any) -> None:
+    actor = config.actor_rollout_ref.actor
+    if str(actor.strategy) != "fsdp":
+        raise ValueError("Ascend 多卡路径要求 actor_rollout_ref.actor.strategy=fsdp。")
+    actor_fsdp = _config_value(actor, "fsdp_config")
+    if actor_fsdp is not None:
+        actor_fsdp.fsdp_size = -1
+
+    critic = _config_value(config, "critic")
+    critic_enabled = bool(_config_value(critic, "enable", False))
+    try:
+        critic_enabled = bool(need_critic(config))
+    except (AttributeError, KeyError, TypeError):
+        pass
+    if critic_enabled:
+        if str(_config_value(critic, "strategy")) != "fsdp":
+            raise ValueError("Ascend 多卡路径要求 critic.strategy=fsdp。")
+        critic_fsdp = _config_value(critic, "fsdp")
+        if critic_fsdp is not None:
+            critic_fsdp.fsdp_size = -1
+
+    checkpoint_engine = _config_value(config.actor_rollout_ref.rollout, "checkpoint_engine")
+    checkpoint_backend = str(_config_value(checkpoint_engine, "backend", "naive"))
+    if checkpoint_backend != "naive":
+        raise ValueError(
+            "Ascend 全 rank 权重同步要求 actor_rollout_ref.rollout.checkpoint_engine.backend=naive；"
+            f"当前 {checkpoint_backend} 后端会形成单发送端。"
+        )
 
 
 def configure_accelerator(config: Any) -> str:
@@ -93,31 +208,66 @@ def configure_npu_resources(config: Any, ray_nodes: Sequence[Mapping[str, Any]])
     devices_per_node = devices_by_node[0]
     nnodes = len(devices_by_node)
     world_size = devices_per_node * nnodes
-    tensor_parallel_size = int(config.actor_rollout_ref.rollout.tensor_model_parallel_size)
-    if tensor_parallel_size <= 0:
-        raise ValueError(f"rollout tensor_model_parallel_size 必须为正整数，当前为 {tensor_parallel_size}。")
-    if devices_per_node % tensor_parallel_size:
-        raise ValueError(
-            f"每节点有 {devices_per_node} 张 NPU，不能被 rollout tensor_model_parallel_size="
-            f"{tensor_parallel_size} 整除。"
+    rollout = config.actor_rollout_ref.rollout
+    tensor_parallel_size, data_parallel_size, pipeline_parallel_size, rollout_world_size = (
+        _rollout_parallelism(rollout, label="actor_rollout_ref.rollout")
+    )
+    rollout_replicas = _validate_rollout_layout(
+        label="actor_rollout_ref.rollout",
+        replica_world_size=rollout_world_size,
+        devices_per_node=devices_per_node,
+        world_size=world_size,
+    )
+
+    reward_rollout_world_size: int | None = None
+    reward_rollout_replicas: int | None = None
+    reward = _config_value(config, "reward")
+    reward_model = _config_value(reward, "reward_model")
+    if bool(_config_value(reward_model, "enable", False)):
+        reward_rollout = _config_value(reward_model, "rollout")
+        _, _, _, reward_rollout_world_size = _rollout_parallelism(
+            reward_rollout, label="reward.reward_model.rollout"
         )
+        reward_rollout_replicas = _validate_rollout_layout(
+            label="reward.reward_model.rollout",
+            replica_world_size=reward_rollout_world_size,
+            devices_per_node=devices_per_node,
+            world_size=world_size,
+        )
+        reward_model.n_gpus_per_node = devices_per_node
+        reward_model.nnodes = nnodes
 
     config.trainer.n_gpus_per_node = devices_per_node
     config.trainer.nnodes = nnodes
+    _configure_npu_fsdp(config)
     topology = NPUResourceTopology(
         nnodes=nnodes,
         devices_per_node=devices_per_node,
         world_size=world_size,
         rollout_tensor_parallel_size=tensor_parallel_size,
-        rollout_replicas=world_size // tensor_parallel_size,
+        rollout_data_parallel_size=data_parallel_size,
+        rollout_pipeline_parallel_size=pipeline_parallel_size,
+        rollout_world_size=rollout_world_size,
+        rollout_replicas=rollout_replicas,
+        reward_rollout_world_size=reward_rollout_world_size,
+        reward_rollout_replicas=reward_rollout_replicas,
     )
     print(
         "NPU 资源自动适配："
         f"nodes={topology.nnodes}, devices_per_node={topology.devices_per_node}, "
         f"FSDP world_size={topology.world_size}, rollout TP={topology.rollout_tensor_parallel_size}, "
+        f"DP={topology.rollout_data_parallel_size}, PP={topology.rollout_pipeline_parallel_size}, "
+        f"devices_per_replica={topology.rollout_world_size}, "
         f"rollout replicas={topology.rollout_replicas}",
         flush=True,
     )
+    if topology.reward_rollout_world_size is not None:
+        print(
+            "NPU reward model 资源自动适配："
+            f"devices_per_replica={topology.reward_rollout_world_size}, "
+            f"rollout replicas={topology.reward_rollout_replicas}",
+            flush=True,
+        )
     return topology
 
 
@@ -243,6 +393,20 @@ class TaskRunner:
             install_vllm_server_patch()
 
         strategy = config.actor_rollout_ref.actor.strategy
+        if str(config.trainer.device) == "npu":
+            if strategy != "fsdp":
+                raise ValueError("Ascend 多卡路径要求 actor_rollout_ref.actor.strategy=fsdp。")
+            from .npu_fsdp_loader import (
+                NPUShardedLoadActorRolloutRefWorker,
+                NPUShardedLoadTrainingWorker,
+            )
+
+            actor_rollout_cls = NPUShardedLoadActorRolloutRefWorker
+            critic_worker_cls = NPUShardedLoadTrainingWorker
+        else:
+            actor_rollout_cls = ActorRolloutRefWorker
+            critic_worker_cls = TrainingWorker
+
         if config.agentlightning.prefix_grouper.enabled:
             if strategy not in {"fsdp", "fsdp2"}:
                 raise ValueError("PrefixGrouper requires the FSDP or FSDP2 actor strategy.")
@@ -251,8 +415,6 @@ class TaskRunner:
             from .prefix_grouper import PrefixGrouperActorRolloutRefWorker
 
             actor_rollout_cls = PrefixGrouperActorRolloutRefWorker
-        else:
-            actor_rollout_cls = ActorRolloutRefWorker
 
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
         if lora_rank <= 0:
@@ -263,7 +425,7 @@ class TaskRunner:
         role_worker_mapping: dict[Any, Any] = {actor_role: ray.remote(actor_rollout_cls)}
         mapping: dict[Any, str] = {actor_role: "global_pool"}
         if need_critic(config):
-            role_worker_mapping[Role.Critic] = ray.remote(TrainingWorker)
+            role_worker_mapping[Role.Critic] = ray.remote(critic_worker_cls)
             mapping[Role.Critic] = "global_pool"
         if config.reward.reward_model.enable:
             mapping[Role.RewardModel] = "global_pool"

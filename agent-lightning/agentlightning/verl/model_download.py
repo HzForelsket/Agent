@@ -11,7 +11,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence, cast
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
@@ -342,24 +342,51 @@ def materialize_npu_model_config(
     *,
     local_files_only: bool = False,
 ) -> list[ModelMaterialization]:
-    """Download explicit VERL model repositories and rewrite them to local paths."""
-    model_config = config.actor_rollout_ref.model
-    original_main_path = str(model_config.path)
+    """Download all enabled VERL model repositories and rewrite them to local paths."""
     materialized_by_ref: dict[str, ModelMaterialization] = {}
 
-    for field in _MODEL_PATH_FIELDS:
-        value = model_config.get(field)
-        if value is None:
-            continue
-        model_ref = str(value)
+    def config_value(container: Any, name: str, default: Any = None) -> Any:
+        if container is None:
+            return default
+        if isinstance(container, Mapping):
+            return cast(Mapping[str, Any], container).get(name, default)
+        getter = getattr(container, "get", None)
+        return getter(name, default) if callable(getter) else getattr(container, name, default)
+
+    def materialize_ref(model_ref: str) -> ModelMaterialization:
         result = materialized_by_ref.get(model_ref)
         if result is None:
             result = materialize_model_for_npu(model_ref, download_root, local_files_only=local_files_only)
             materialized_by_ref[model_ref] = result
-        model_config[field] = result.local_path
+        return result
 
-    main_result = materialized_by_ref[original_main_path]
-    for field in ("hf_config_path", "tokenizer_path"):
-        if model_config.get(field) is None:
-            model_config[field] = main_result.local_path
+    def materialize_model_fields(model_config: Any) -> None:
+        original_main_path = str(config_value(model_config, "path"))
+        for field in _MODEL_PATH_FIELDS:
+            value = config_value(model_config, field)
+            if value is None:
+                continue
+            model_config[field] = materialize_ref(str(value)).local_path
+
+        main_result = materialized_by_ref[original_main_path]
+        for field in ("hf_config_path", "tokenizer_path"):
+            if config_value(model_config, field) is None:
+                model_config[field] = main_result.local_path
+
+    materialize_model_fields(config.actor_rollout_ref.model)
+
+    critic = config_value(config, "critic")
+    critic_enabled = config_value(critic, "enable")
+    if critic_enabled is None:
+        advantage_estimator = config_value(config_value(config, "algorithm"), "adv_estimator")
+        critic_enabled = str(advantage_estimator).lower().rsplit(".", 1)[-1] == "gae"
+    critic_model = config_value(critic, "model")
+    if bool(critic_enabled) and config_value(critic_model, "path") is not None:
+        materialize_model_fields(critic_model)
+
+    reward_model = config_value(config_value(config, "reward"), "reward_model")
+    reward_model_path = config_value(reward_model, "model_path")
+    if bool(config_value(reward_model, "enable", False)) and reward_model_path is not None:
+        reward_model.model_path = materialize_ref(str(reward_model_path)).local_path
+
     return list(materialized_by_ref.values())

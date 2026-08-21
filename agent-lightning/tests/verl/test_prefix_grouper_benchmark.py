@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -57,6 +59,37 @@ def test_energy_efficiency_uses_measured_power_and_idle_baseline() -> None:
     assert result["response_tokens_per_dynamic_joule"] == 30.0
 
 
+def test_multirank_power_aggregation_sums_whole_device_measurements() -> None:
+    fields = ("min", "max", "mean", "p50", "p90", "p95", "p99", "stdev")
+    rank_rows = []
+    for base in (100.0, 200.0):
+        rank_rows.append([1.0, 5.0, *(base + index for index in range(len(fields))), 2.0, 7.0])
+    distributed = SimpleNamespace(
+        enabled=True,
+        world_size=2,
+        numeric_rows=lambda _values, _device: rank_rows,
+    )
+    measurement = {
+        "enabled": True,
+        "available": True,
+        "watts": {"count": 5, **{field: 100.0 + index for index, field in enumerate(fields)}},
+        "measurement_duration_seconds": 2.0,
+        "workload_iterations": 7,
+    }
+
+    result = _BENCHMARK_MODULE.aggregate_device_power(
+        measurement,
+        distributed,
+        SimpleNamespace(device=torch.device("cpu")),
+    )
+
+    assert result["available"] is True
+    assert result["watts"]["mean"] == 304.0
+    assert result["watts"]["p95"] == 310.0
+    assert result["watts"]["count"] == 5
+    assert len(result["per_rank"]) == 2
+
+
 def test_workload_metrics_report_dense_tokens_and_causal_pairs() -> None:
     prefix_mask = torch.ones((2, 3), dtype=torch.bool)
     suffix_mask = torch.ones((4, 2), dtype=torch.bool)
@@ -78,3 +111,24 @@ def test_workload_metrics_report_dense_tokens_and_causal_pairs() -> None:
     assert metrics["baseline_causal_attention_pairs"] == 60
     assert metrics["prefix_grouper_causal_attention_pairs"] == 48
     assert metrics["causal_attention_pair_saved_ratio"] == pytest.approx(0.2)
+
+
+def test_multicard_launcher_uses_loopback_rendezvous(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], *, check: bool) -> subprocess.CompletedProcess[str]:
+        assert check is False
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(_BENCHMARK_MODULE.subprocess, "run", fake_run)
+    args = SimpleNamespace(device="auto", nproc_per_node=2)
+    accelerator = SimpleNamespace(module=SimpleNamespace(device_count=lambda: 4))
+
+    assert _BENCHMARK_MODULE.launch_distributed_if_needed(args, ["--nproc-per-node", "2"], accelerator) == 0
+    command = calls[0]
+    assert "--master-addr=127.0.0.1" in command
+    assert any(argument.startswith("--master-port=") for argument in command)
+    assert "--standalone" not in command
+    assert "--nproc-per-node=2" in command
