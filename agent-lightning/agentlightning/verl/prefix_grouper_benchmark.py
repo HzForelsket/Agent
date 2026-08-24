@@ -22,7 +22,6 @@ from typing import Any, Callable, Sequence
 import ray
 import torch
 import torch.nn.functional as F
-from prefix_grouper import PrefixGrouper
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.trainer.config import CheckpointConfig
 from verl.trainer.ppo.prefix_grouper_utils import build_position_ids_for_prefix_grouper
@@ -30,7 +29,7 @@ from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig, TrainingWorkerConfig
 
 from .accelerator import AcceleratorRuntime
-from .prefix_grouper import PrefixGrouperTrainingWorker
+from .prefix_grouper import PrefixGrouperTrainingWorker, build_prefix_grouper
 
 __all__ = [
     "Case",
@@ -158,17 +157,15 @@ def make_batch(
     )
     prefix_mask = torch.ones_like(representatives, dtype=torch.bool)
     response_mask = torch.ones_like(responses, dtype=torch.bool)
-    grouper = PrefixGrouper.from_ungrouped_masks(
+    grouper = build_prefix_grouper(
         prefix_mask=prefix_mask,
         suffix_mask=response_mask,
         group_sizes=[group_size] * group_count,
-        padding_mode="right",
         device=device,
     )
     grouped_ids = grouper.concat_input(representatives, prefix_mask, responses, response_mask)
     return {
         "input_ids": torch.cat((prompts, responses), dim=-1),
-        "attention_mask": torch.ones((batch_size, prompt_length + response_length), dtype=torch.bool, device=device),
         "position_ids": torch.arange(prompt_length + response_length, device=device).expand(batch_size, -1),
         "responses": responses,
         "grouper": grouper,
@@ -211,7 +208,7 @@ def _response_logits(model: torch.nn.Module, batch: dict[str, Any], grouped: boo
     if grouped:
         output = model(
             input_ids=batch["grouped_ids"],
-            attention_mask=batch["grouper"].padding_mask,
+            attention_mask=None,
             position_ids=batch["grouped_position_ids"],
             prefix_grouper=batch["grouper"],
             use_cache=False,
@@ -220,7 +217,7 @@ def _response_logits(model: torch.nn.Module, batch: dict[str, Any], grouped: boo
         return suffix_logits[:, :-1].contiguous()
     output = model(
         input_ids=batch["input_ids"],
-        attention_mask=batch["attention_mask"],
+        attention_mask=None,
         position_ids=batch["position_ids"],
         use_cache=False,
     )

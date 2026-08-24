@@ -27,6 +27,7 @@ from verl.models.transformers.monkey_patch import apply_prefix_grouper_patch as 
 from verl.trainer.ppo.prefix_grouper_utils import build_position_ids_for_prefix_grouper, pg_forward
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_id, get_device_name
+from verl.utils.npu_flash_attn_utils import pad_input as npu_pad_input
 from verl.workers.engine.fsdp import FSDPEngineWithLMHead
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
 
@@ -34,6 +35,7 @@ __all__ = [
     "PrefixGrouperActorRolloutRefWorker",
     "PrefixGrouperTrainingWorker",
     "apply_prefix_grouper_patch",
+    "build_prefix_grouper",
     "forward_with_prefix_grouper",
     "group_prompt_indices",
     "reorder_by_prompt",
@@ -43,6 +45,8 @@ _PATCHED = False
 _NPU_TORCH_VERSION = Version("2.10.0")
 _NPU_COMPRESSED_MASK_SIZE = 2048
 _NPU_CAUSAL_MASKS: dict[torch.device, torch.Tensor] = {}
+_PackingIndices = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+_PackingCacheKey = tuple[int, int, torch.Size, torch.Size, torch.device]
 
 
 @lru_cache(maxsize=1)
@@ -71,22 +75,73 @@ def _npu_compressed_causal_mask(device: torch.device) -> torch.Tensor:
     return mask
 
 
-def _pack_bnsd(tensor: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+def _packing_indices(valid_mask: torch.Tensor) -> _PackingIndices:
+    """Return flattened, batch, and sequence indices for valid BS tokens."""
+    flat_indices = torch.nonzero(valid_mask.flatten(), as_tuple=False).flatten()
+    batch_indices = torch.div(flat_indices, valid_mask.shape[1], rounding_mode="floor")
+    sequence_indices = torch.remainder(flat_indices, valid_mask.shape[1])
+    return flat_indices, batch_indices, sequence_indices
+
+
+def _packing_cache_key(query_mask: torch.Tensor, key_mask: torch.Tensor) -> _PackingCacheKey:
+    return (
+        query_mask.data_ptr(),
+        key_mask.data_ptr(),
+        query_mask.shape,
+        key_mask.shape,
+        query_mask.device,
+    )
+
+
+def _move_packing_indices(indices: _PackingIndices, device: torch.device) -> _PackingIndices:
+    return tuple(index.to(device) for index in indices)
+
+
+def _pack_bnsd(
+    tensor: torch.Tensor,
+    valid_mask: torch.Tensor,
+    indices: _PackingIndices | None = None,
+) -> torch.Tensor:
     """Pack a padded BNSD tensor into the TND layout used by NPU fused attention."""
     if tensor.ndim != 4 or valid_mask.shape != (tensor.shape[0], tensor.shape[2]):
         raise ValueError(
             f"Cannot pack tensor {tuple(tensor.shape)} with mask {tuple(valid_mask.shape)} as BNSD -> TND."
         )
-    return tensor.transpose(1, 2)[valid_mask]
+    _, batch_indices, sequence_indices = _packing_indices(valid_mask) if indices is None else indices
+    return tensor[batch_indices, :, sequence_indices]
 
 
-def _unpack_tnd(tensor: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+def _unpack_tnd(
+    tensor: torch.Tensor,
+    valid_mask: torch.Tensor,
+    indices: _PackingIndices | None = None,
+) -> torch.Tensor:
     """Restore a packed TND attention output to padded BSND layout."""
     if tensor.ndim != 3:
         raise ValueError(f"Cannot unpack non-TND tensor with shape {tuple(tensor.shape)}.")
-    output = tensor.new_zeros((*valid_mask.shape, *tensor.shape[1:]))
-    output[valid_mask] = tensor
-    return output
+    flat_indices, _, _ = _packing_indices(valid_mask) if indices is None else indices
+    return npu_pad_input(tensor, flat_indices, valid_mask.shape[0], valid_mask.shape[1])
+
+
+def _npu_packing_indices(
+    prefix_grouper: PrefixGrouper,
+    *,
+    query_mask: torch.Tensor,
+    key_mask: torch.Tensor,
+) -> tuple[_PackingIndices, _PackingIndices]:
+    """Cache the two variable-length token maps shared by every decoder layer."""
+    cache = getattr(prefix_grouper, "_agentlightning_npu_packing_indices", None)
+    if cache is None:
+        cache = {}
+        prefix_grouper._agentlightning_npu_packing_indices = cache
+    cache_key = _packing_cache_key(query_mask, key_mask)
+    indices = cache.get(cache_key)
+    if indices is None:
+        query_indices = _packing_indices(query_mask)
+        key_indices = query_indices if query_mask.data_ptr() == key_mask.data_ptr() else _packing_indices(key_mask)
+        indices = (query_indices, key_indices)
+        cache[cache_key] = indices
+    return indices
 
 
 def _npu_attention_lengths(
@@ -147,9 +202,14 @@ def _npu_tnd_attention(
 
     key_mask = padding_mask.bool()
     query_mask = key_mask[:, -query_length:]
-    packed_query = _pack_bnsd(query, query_mask)
-    packed_key = _pack_bnsd(key, key_mask)
-    packed_value = _pack_bnsd(value, key_mask)
+    query_indices, key_indices = _npu_packing_indices(
+        prefix_grouper,
+        query_mask=query_mask,
+        key_mask=key_mask,
+    )
+    packed_query = _pack_bnsd(query, query_mask, query_indices)
+    packed_key = _pack_bnsd(key, key_mask, key_indices)
+    packed_value = _pack_bnsd(value, key_mask, key_indices)
     scale = float(scaling) if scaling is not None else query.shape[-1] ** -0.5
     torch_npu = _torch_npu_module()
     packed_output = torch_npu.npu_fusion_attention(
@@ -166,7 +226,7 @@ def _npu_tnd_attention(
         sparse_mode=sparse_mode,
         softmax_layout="TND",
     )[0]
-    return _unpack_tnd(packed_output, query_mask)
+    return _unpack_tnd(packed_output, query_mask, query_indices)
 
 
 def _repeat_kv(hidden_states: torch.Tensor, query_heads: int) -> torch.Tensor:
@@ -230,8 +290,24 @@ def _sdpa_prefix_grouper_wrapper(original_fn):
     return wrapped
 
 
+def _batch_repeat_cat_without_device_scalar(
+    self: PrefixGrouper,
+    prefix: torch.Tensor,
+    suffix: torch.Tensor,
+    cat_dim: int,
+) -> torch.Tensor:
+    """Repeat prefixes without asking the accelerator to infer a data-dependent shape."""
+    repeated_prefix = torch.repeat_interleave(
+        prefix,
+        self.num_samples.to(prefix.device),
+        dim=0,
+        output_size=suffix.shape[0],
+    )
+    return torch.cat((repeated_prefix, suffix), dim=cat_dim)
+
+
 def apply_prefix_grouper_patch() -> None:
-    """Apply VERL's patch plus a causal-mask fix for its SDPA adapter."""
+    """Apply VERL's attention patch and accelerator-safe PrefixGrouper operations."""
     global _PATCHED
     if _PATCHED:
         return
@@ -240,7 +316,63 @@ def apply_prefix_grouper_patch() -> None:
     original_sdpa = ALL_ATTENTION_FUNCTIONS["sdpa"]
     _apply_verl_prefix_grouper_patch()
     ALL_ATTENTION_FUNCTIONS["sdpa"] = _sdpa_prefix_grouper_wrapper(original_sdpa)
+    PrefixGrouper.batch_repeat_cat = _batch_repeat_cat_without_device_scalar
     _PATCHED = True
+
+
+def build_prefix_grouper(
+    *,
+    prefix_mask: torch.Tensor,
+    suffix_mask: torch.Tensor,
+    group_sizes: list[int],
+    device: torch.device,
+) -> PrefixGrouper:
+    """Build shape metadata on CPU and move each cached tensor to the accelerator once."""
+    prefix_grouper = PrefixGrouper.from_ungrouped_masks(
+        prefix_mask=prefix_mask.detach().cpu(),
+        suffix_mask=suffix_mask.detach().cpu(),
+        group_sizes=group_sizes,
+        padding_mode="right",
+        device=torch.device("cpu"),
+    )
+    npu_packing_indices = None
+    if device.type == "npu":
+        prefix_key_mask = prefix_grouper.prefix_attn_mask
+        prefix_query_mask = prefix_key_mask[:, -prefix_grouper.prefix_x_shape[1] :]
+        suffix_key_mask = prefix_grouper.suffix_attn_mask
+        suffix_query_mask = suffix_key_mask[:, -prefix_grouper.suffix_x_shape[1] :]
+        npu_packing_indices = (
+            (_packing_indices(prefix_query_mask), _packing_indices(prefix_key_mask)),
+            (_packing_indices(suffix_query_mask), _packing_indices(suffix_key_mask)),
+        )
+
+    moved_tensors: dict[int, torch.Tensor] = {}
+    for name, value in vars(prefix_grouper.group_info).items():
+        if not torch.is_tensor(value):
+            continue
+        moved = moved_tensors.get(id(value))
+        if moved is None:
+            moved = value.to(device)
+            moved_tensors[id(value)] = moved
+        setattr(prefix_grouper.group_info, name, moved)
+
+    if npu_packing_indices is not None:
+        prefix_key_mask = prefix_grouper.prefix_attn_mask
+        prefix_query_mask = prefix_key_mask[:, -prefix_grouper.prefix_x_shape[1] :]
+        suffix_key_mask = prefix_grouper.suffix_attn_mask
+        suffix_query_mask = suffix_key_mask[:, -prefix_grouper.suffix_x_shape[1] :]
+        prefix_indices, suffix_indices = npu_packing_indices
+        prefix_grouper._agentlightning_npu_packing_indices = {
+            _packing_cache_key(prefix_query_mask, prefix_key_mask): (
+                _move_packing_indices(prefix_indices[0], device),
+                _move_packing_indices(prefix_indices[1], device),
+            ),
+            _packing_cache_key(suffix_query_mask, suffix_key_mask): (
+                _move_packing_indices(suffix_indices[0], device),
+                _move_packing_indices(suffix_indices[1], device),
+            ),
+        }
+    return prefix_grouper
 
 
 def _check_verl_version() -> None:
@@ -352,11 +484,10 @@ def forward_with_prefix_grouper(
     ordered_responses = responses.index_select(0, order)
     ordered_response_mask = response_mask.index_select(0, order)
 
-    prefix_grouper = PrefixGrouper.from_ungrouped_masks(
+    prefix_grouper = build_prefix_grouper(
         prefix_mask=prefix_mask,
         suffix_mask=ordered_response_mask,
         group_sizes=[len(group) for group in groups],
-        padding_mode="right",
         device=prompts.device,
     )
     concat_input_ids = prefix_grouper.concat_input(
@@ -371,7 +502,9 @@ def forward_with_prefix_grouper(
         model=model,
         prefix_grouper=prefix_grouper,
         concat_input_ids=concat_input_ids,
-        attention_mask=prefix_grouper.padding_mask,
+        # PrefixGrouper supplies the exact prefix/suffix masks inside the
+        # patched attention. Avoid a redundant device-scalar mask reduction.
+        attention_mask=None,
         position_ids=position_ids,
         completion_ids=ordered_responses,
         completion_mask=ordered_response_mask,
