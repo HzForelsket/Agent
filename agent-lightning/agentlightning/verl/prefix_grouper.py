@@ -15,7 +15,6 @@ from __future__ import annotations
 from collections import OrderedDict
 from contextlib import nullcontext
 from functools import lru_cache
-from itertools import accumulate
 from types import MethodType
 from typing import Any, Iterable
 
@@ -27,7 +26,6 @@ from verl.models.transformers.monkey_patch import apply_prefix_grouper_patch as 
 from verl.trainer.ppo.prefix_grouper_utils import build_position_ids_for_prefix_grouper, pg_forward
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_id, get_device_name
-from verl.utils.npu_flash_attn_utils import pad_input as npu_pad_input
 from verl.workers.engine.fsdp import FSDPEngineWithLMHead
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
 
@@ -43,10 +41,6 @@ __all__ = [
 
 _PATCHED = False
 _NPU_TORCH_VERSION = Version("2.10.0")
-_NPU_COMPRESSED_MASK_SIZE = 2048
-_NPU_CAUSAL_MASKS: dict[torch.device, torch.Tensor] = {}
-_PackingIndices = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-_PackingCacheKey = tuple[int, int, torch.Size, torch.Size, torch.device]
 
 
 @lru_cache(maxsize=1)
@@ -59,174 +53,55 @@ def _torch_npu_module() -> Any:
     return torch_npu
 
 
-def _npu_compressed_causal_mask(device: torch.device) -> torch.Tensor:
-    """Return the reusable 2048x2048 compressed causal mask required by NPU FA."""
-    mask = _NPU_CAUSAL_MASKS.get(device)
-    if mask is None:
-        # The reference/old-policy pass can call this function under
-        # ``torch.inference_mode()`` before the actor update.  An inference
-        # tensor cannot later be saved by the fused training operator for its
-        # backward pass, so the process-wide cache must always hold a normal
-        # tensor regardless of the caller's mode.
-        with torch.inference_mode(False):
-            mask = torch.ones((_NPU_COMPRESSED_MASK_SIZE, _NPU_COMPRESSED_MASK_SIZE), dtype=torch.bool).triu_(1)
-            mask = mask.to(device=device)
-        _NPU_CAUSAL_MASKS[device] = mask
-    return mask
-
-
-def _packing_indices(valid_mask: torch.Tensor) -> _PackingIndices:
-    """Return flattened, batch, and sequence indices for valid BS tokens."""
-    flat_indices = torch.nonzero(valid_mask.flatten(), as_tuple=False).flatten()
-    batch_indices = torch.div(flat_indices, valid_mask.shape[1], rounding_mode="floor")
-    sequence_indices = torch.remainder(flat_indices, valid_mask.shape[1])
-    return flat_indices, batch_indices, sequence_indices
-
-
-def _packing_cache_key(query_mask: torch.Tensor, key_mask: torch.Tensor) -> _PackingCacheKey:
-    return (
-        query_mask.data_ptr(),
-        key_mask.data_ptr(),
-        query_mask.shape,
-        key_mask.shape,
-        query_mask.device,
-    )
-
-
-def _move_packing_indices(indices: _PackingIndices, device: torch.device) -> _PackingIndices:
-    return tuple(index.to(device) for index in indices)
-
-
-def _pack_bnsd(
-    tensor: torch.Tensor,
-    valid_mask: torch.Tensor,
-    indices: _PackingIndices | None = None,
-) -> torch.Tensor:
-    """Pack a padded BNSD tensor into the TND layout used by NPU fused attention."""
-    if tensor.ndim != 4 or valid_mask.shape != (tensor.shape[0], tensor.shape[2]):
-        raise ValueError(
-            f"Cannot pack tensor {tuple(tensor.shape)} with mask {tuple(valid_mask.shape)} as BNSD -> TND."
-        )
-    _, batch_indices, sequence_indices = _packing_indices(valid_mask) if indices is None else indices
-    return tensor[batch_indices, :, sequence_indices]
-
-
-def _unpack_tnd(
-    tensor: torch.Tensor,
-    valid_mask: torch.Tensor,
-    indices: _PackingIndices | None = None,
-) -> torch.Tensor:
-    """Restore a packed TND attention output to padded BSND layout."""
-    if tensor.ndim != 3:
-        raise ValueError(f"Cannot unpack non-TND tensor with shape {tuple(tensor.shape)}.")
-    flat_indices, _, _ = _packing_indices(valid_mask) if indices is None else indices
-    return npu_pad_input(tensor, flat_indices, valid_mask.shape[0], valid_mask.shape[1])
-
-
-def _npu_packing_indices(
-    prefix_grouper: PrefixGrouper,
-    *,
-    query_mask: torch.Tensor,
-    key_mask: torch.Tensor,
-) -> tuple[_PackingIndices, _PackingIndices]:
-    """Cache the two variable-length token maps shared by every decoder layer."""
-    cache = getattr(prefix_grouper, "_agentlightning_npu_packing_indices", None)
-    if cache is None:
-        cache = {}
-        prefix_grouper._agentlightning_npu_packing_indices = cache
-    cache_key = _packing_cache_key(query_mask, key_mask)
-    indices = cache.get(cache_key)
-    if indices is None:
-        query_indices = _packing_indices(query_mask)
-        key_indices = query_indices if query_mask.data_ptr() == key_mask.data_ptr() else _packing_indices(key_mask)
-        indices = (query_indices, key_indices)
-        cache[cache_key] = indices
-    return indices
-
-
-def _npu_attention_lengths(
-    prefix_grouper: PrefixGrouper,
-    *,
-    query_length: int,
-    key_length: int,
-) -> tuple[list[int], list[int], int]:
-    """Return per-sequence Q/KV lengths and the matching NPU causal sparse mode."""
-    group_info = list(prefix_grouper.group_info)
-    if query_length == key_length:
-        prefix_lengths = [int(info.prefix_len) for info in group_info]
-        return prefix_lengths, prefix_lengths, 2  # left-up causal
-
-    query_lengths = [int(suffix_length) for info in group_info for suffix_length in info.suffix_lens]
-    key_lengths = [int(info.prefix_len + suffix_length) for info in group_info for suffix_length in info.suffix_lens]
-    return query_lengths, key_lengths, 3  # right-down causal for suffix Q against prefix + suffix KV
-
-
-def _npu_tnd_attention(
-    prefix_grouper: PrefixGrouper,
+def _npu_bnsd_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    padding_mask: torch.Tensor,
+    attention_mask: torch.Tensor,
     *,
     dropout: float,
     scaling: float | None,
 ) -> torch.Tensor:
-    """Run PrefixGrouper attention with torch-npu's packed fused training operator."""
+    """Run PrefixGrouper attention through torch-npu's native BNSD interface."""
     if not 0.0 <= dropout < 1.0:
         raise ValueError(f"Attention dropout must be in [0, 1), found {dropout}.")
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
         raise ValueError("Native NPU PrefixGrouper attention requires BNSD query, key, and value tensors.")
     if key.shape != value.shape:
         raise ValueError(f"Key and value shapes must match, found {tuple(key.shape)} and {tuple(value.shape)}.")
+    if query.shape[0] != key.shape[0] or query.shape[-1] != key.shape[-1]:
+        raise ValueError(
+            "Query and key batch/head-size dimensions must match: "
+            f"found {tuple(query.shape)} and {tuple(key.shape)}."
+        )
+    if query.shape[1] != key.shape[1]:
+        raise ValueError(f"Query and KV heads must match, found {query.shape[1]} and {key.shape[1]}.")
 
     query_length, key_length = query.shape[2], key.shape[2]
-    if padding_mask.shape != (query.shape[0], key_length):
+    expected_mask_shape = (query.shape[0], 1, query_length, key_length)
+    if attention_mask.shape != expected_mask_shape:
         raise ValueError(
-            f"NPU attention mask must have shape {(query.shape[0], key_length)}, found {tuple(padding_mask.shape)}."
-        )
-    query_lengths, key_lengths, sparse_mode = _npu_attention_lengths(
-        prefix_grouper,
-        query_length=query_length,
-        key_length=key_length,
-    )
-    if len(query_lengths) != query.shape[0] or len(key_lengths) != key.shape[0]:
-        raise ValueError(
-            "PrefixGrouper sequence metadata does not match the NPU attention batch: "
-            f"Q={len(query_lengths)}/{query.shape[0]}, KV={len(key_lengths)}/{key.shape[0]}."
-        )
-    if max(query_lengths) > query_length or max(key_lengths) > key_length:
-        raise ValueError(
-            f"PrefixGrouper sequence lengths exceed padded shapes: Q={query_lengths}/{query_length}, "
-            f"KV={key_lengths}/{key_length}."
+            f"NPU attention mask must have shape {expected_mask_shape}, found {tuple(attention_mask.shape)}."
         )
 
-    key_mask = padding_mask.bool()
-    query_mask = key_mask[:, -query_length:]
-    query_indices, key_indices = _npu_packing_indices(
-        prefix_grouper,
-        query_mask=query_mask,
-        key_mask=key_mask,
-    )
-    packed_query = _pack_bnsd(query, query_mask, query_indices)
-    packed_key = _pack_bnsd(key, key_mask, key_indices)
-    packed_value = _pack_bnsd(value, key_mask, key_indices)
+    # PyTorch SDPA uses True for allowed positions; Ascend fused attention uses
+    # True for masked positions.  Invert the shared B1SS mask only at the
+    # operator boundary.
+    attention_mask = ~attention_mask
     scale = float(scaling) if scaling is not None else query.shape[-1] ** -0.5
     torch_npu = _torch_npu_module()
-    packed_output = torch_npu.npu_fusion_attention(
-        query=packed_query,
-        key=packed_key,
-        value=packed_value,
+    output = torch_npu.npu_fusion_attention(
+        query=query,
+        key=key,
+        value=value,
         head_num=query.shape[1],
-        input_layout="TND",
-        atten_mask=_npu_compressed_causal_mask(query.device),
+        input_layout="BNSD",
+        atten_mask=attention_mask,
         scale=scale,
         keep_prob=1.0 - dropout,
-        actual_seq_qlen=list(accumulate(query_lengths)),
-        actual_seq_kvlen=list(accumulate(key_lengths)),
-        sparse_mode=sparse_mode,
-        softmax_layout="TND",
+        sparse_mode=0,
     )[0]
-    return _unpack_tnd(packed_output, query_mask, query_indices)
+    return output.transpose(1, 2).contiguous()
 
 
 def _repeat_kv(hidden_states: torch.Tensor, query_heads: int) -> torch.Tensor:
@@ -262,26 +137,26 @@ def _sdpa_prefix_grouper_wrapper(original_fn):
         scaling = kwargs.pop("scaling", None)
 
         def attention_forward(inner_query, inner_key, inner_value, padding_mask, *_args, **_kwargs):
-            if inner_query.device.type == "npu":
-                return _npu_tnd_attention(
-                    prefix_grouper,
-                    inner_query,
-                    inner_key,
-                    inner_value,
-                    padding_mask,
-                    dropout=dropout,
-                    scaling=scaling,
-                )
             inner_key = _repeat_kv(inner_key, inner_query.shape[1])
             inner_value = _repeat_kv(inner_value, inner_query.shape[1])
             causal_mask = _causal_sdpa_mask(padding_mask, inner_query.shape[2], inner_key.shape[2])
+            scale = float(scaling) if scaling is not None else inner_query.shape[-1] ** -0.5
+            if inner_query.device.type == "npu":
+                return _npu_bnsd_attention(
+                    inner_query,
+                    inner_key,
+                    inner_value,
+                    causal_mask,
+                    dropout=dropout,
+                    scaling=scale,
+                )
             output = torch.nn.functional.scaled_dot_product_attention(
                 inner_query,
                 inner_key,
                 inner_value,
                 attn_mask=causal_mask,
                 dropout_p=dropout,
-                scale=scaling,
+                scale=scale,
             )
             return output.transpose(1, 2).contiguous()
 
@@ -335,16 +210,6 @@ def build_prefix_grouper(
         padding_mode="right",
         device=torch.device("cpu"),
     )
-    npu_packing_indices = None
-    if device.type == "npu":
-        prefix_key_mask = prefix_grouper.prefix_attn_mask
-        prefix_query_mask = prefix_key_mask[:, -prefix_grouper.prefix_x_shape[1] :]
-        suffix_key_mask = prefix_grouper.suffix_attn_mask
-        suffix_query_mask = suffix_key_mask[:, -prefix_grouper.suffix_x_shape[1] :]
-        npu_packing_indices = (
-            (_packing_indices(prefix_query_mask), _packing_indices(prefix_key_mask)),
-            (_packing_indices(suffix_query_mask), _packing_indices(suffix_key_mask)),
-        )
 
     moved_tensors: dict[int, torch.Tensor] = {}
     for name, value in vars(prefix_grouper.group_info).items():
@@ -355,23 +220,6 @@ def build_prefix_grouper(
             moved = value.to(device)
             moved_tensors[id(value)] = moved
         setattr(prefix_grouper.group_info, name, moved)
-
-    if npu_packing_indices is not None:
-        prefix_key_mask = prefix_grouper.prefix_attn_mask
-        prefix_query_mask = prefix_key_mask[:, -prefix_grouper.prefix_x_shape[1] :]
-        suffix_key_mask = prefix_grouper.suffix_attn_mask
-        suffix_query_mask = suffix_key_mask[:, -prefix_grouper.suffix_x_shape[1] :]
-        prefix_indices, suffix_indices = npu_packing_indices
-        prefix_grouper._agentlightning_npu_packing_indices = {
-            _packing_cache_key(prefix_query_mask, prefix_key_mask): (
-                _move_packing_indices(prefix_indices[0], device),
-                _move_packing_indices(prefix_indices[1], device),
-            ),
-            _packing_cache_key(suffix_query_mask, suffix_key_mask): (
-                _move_packing_indices(suffix_indices[0], device),
-                _move_packing_indices(suffix_indices[1], device),
-            ),
-        }
     return prefix_grouper
 
 
