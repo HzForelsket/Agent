@@ -389,21 +389,18 @@ def _profile_comparison(
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     worker_name = f"{os.uname().nodename}_rank_{rank}"
-    accelerator.synchronize()
-    torch.distributed.barrier()
     with accelerator.profiler(
         str(output_dir),
         worker_name,
         record_shapes=bool(settings["profile_record_shapes"]),
         profile_memory=bool(settings["profile_memory"]),
-    ):
+    ) as profiler:
         with torch.profiler.record_function(f"prefix_grouper/{mode}/baseline"):
             step(False)
-            accelerator.synchronize()
+        profiler.step()
         with torch.profiler.record_function(f"prefix_grouper/{mode}/prefix_grouper"):
             step(True)
-            accelerator.synchronize()
-    torch.distributed.barrier()
+        profiler.step()
     return {
         "enabled": True,
         "output_dir": str(output_dir),

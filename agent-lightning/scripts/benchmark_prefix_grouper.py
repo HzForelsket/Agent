@@ -646,6 +646,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if owns_ray:
         ray_init_kwargs = {"address": args.ray_address} if args.ray_address else {}
         ray.init(**ray_init_kwargs)
+    profile_output_dirs: list[Path] = []
     try:
         for index, model_ref in enumerate(args.models, 1):
             print(f"[{index}/{len(args.models)}] {model_ref}，启动 {world_size} 个 VERL FSDP worker", flush=True)
@@ -663,18 +664,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"NPU 模型已就绪：{model_ref} -> {resolved_model_ref}", flush=True)
 
             runner = _DistributedBenchmarkTaskRunner.remote()
+            model_profile_output_dir = (
+                profile_root / f"{index:02d}_{Path(model_ref).name}" if profile_root is not None else None
+            )
             try:
                 model_settings = {
                     **settings,
-                    "profile_output_dir": (
-                        str(profile_root / f"{index:02d}_{Path(model_ref).name}")
-                        if profile_root is not None
-                        else None
-                    ),
+                    "profile_output_dir": str(model_profile_output_dir) if model_profile_output_dir is not None else None,
                 }
                 rank_results = ray.get(runner.run.remote(resolved_model_ref, model_settings))
             finally:
                 ray.kill(runner)
+            if model_profile_output_dir is not None and accelerator.backend == "npu":
+                profile_output_dirs.append(model_profile_output_dir)
             model_result = aggregate_model_result(
                 model_ref,
                 resolved_model_ref,
@@ -688,6 +690,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         if owns_ray:
             ray.shutdown()
+
+    for profile_output_dir in profile_output_dirs:
+        print(f"解析 NPU profile：{profile_output_dir}", flush=True)
+        accelerator.analyse_profiles(str(profile_output_dir))
 
     print("\n" + markdown(results))
     print(f"JSON: {args.output_json.resolve()}")

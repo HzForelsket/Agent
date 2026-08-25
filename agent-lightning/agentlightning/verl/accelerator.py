@@ -111,7 +111,12 @@ class AcceleratorRuntime:
             )
             return profiler.profile(
                 activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
-                on_trace_ready=profiler.tensorboard_trace_handler(output_dir, worker_name=worker_name),
+                schedule=profiler.schedule(wait=0, warmup=0, active=2, repeat=1, skip_first=0),
+                on_trace_ready=profiler.tensorboard_trace_handler(
+                    output_dir,
+                    worker_name=worker_name,
+                    analyse_flag=False,
+                ),
                 record_shapes=record_shapes,
                 profile_memory=profile_memory,
                 with_stack=False,
@@ -119,10 +124,22 @@ class AcceleratorRuntime:
             )
         return torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=0, warmup=0, active=2, repeat=1, skip_first=0),
             on_trace_ready=torch.profiler.tensorboard_trace_handler(output_dir, worker_name=worker_name),
             record_shapes=record_shapes,
             profile_memory=profile_memory,
             with_stack=False,
+        )
+
+    def analyse_profiles(self, output_dir: str) -> None:
+        """Parse completed NPU worker captures outside the distributed worker processes."""
+        if self.backend != "npu":
+            return
+        profiler: Any = importlib.import_module("torch_npu.profiler")
+        profiler_api: Any = importlib.import_module("torch_npu.profiler.profiler")
+        profiler_api.analyse(
+            output_dir,
+            export_type=[profiler.ExportType.Text, profiler.ExportType.Db],
         )
 
     def device_name(self) -> str:
