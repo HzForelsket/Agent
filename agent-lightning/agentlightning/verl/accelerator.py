@@ -92,6 +92,39 @@ class AcceleratorRuntime:
     def max_memory_allocated(self) -> int:
         return int(self.module.max_memory_allocated(self.device))
 
+    def profiler(
+        self,
+        output_dir: str,
+        worker_name: str,
+        *,
+        record_shapes: bool,
+        profile_memory: bool,
+    ) -> Any:
+        """Create the native profiler for a worker without changing the profiled workload."""
+        if self.backend == "npu":
+            profiler: Any = importlib.import_module("torch_npu.profiler")
+            experimental_config = profiler._ExperimentalConfig(
+                profiler_level=profiler.ProfilerLevel.Level1,
+                aic_metrics=profiler.AiCMetrics.PipeUtilization,
+                data_simplification=True,
+                export_type=[profiler.ExportType.Text, profiler.ExportType.Db],
+            )
+            return profiler.profile(
+                activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
+                on_trace_ready=profiler.tensorboard_trace_handler(output_dir, worker_name=worker_name),
+                record_shapes=record_shapes,
+                profile_memory=profile_memory,
+                with_stack=False,
+                experimental_config=experimental_config,
+            )
+        return torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(output_dir, worker_name=worker_name),
+            record_shapes=record_shapes,
+            profile_memory=profile_memory,
+            with_stack=False,
+        )
+
     def device_name(self) -> str:
         get_device_name = getattr(self.module, "get_device_name", None)
         if get_device_name is not None:

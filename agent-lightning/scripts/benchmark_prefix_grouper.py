@@ -115,6 +115,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--power-interval", type=float, default=0.1, help="功耗采样间隔（秒）")
     parser.add_argument("--power-idle-samples", type=int, default=3, help="每个模型加载后的空闲功耗采样数")
     parser.add_argument("--npu-chip-id", type=int, default=0, help="npu-smi 功耗查询使用的 chip id")
+    parser.add_argument(
+        "--profile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="在每个 Ray worker 内对 baseline 和 PrefixGrouper 各采集一个相同范围的 step",
+    )
+    parser.add_argument("--profile-dir", type=Path, default=Path("prefix_grouper_profiles"))
+    parser.add_argument(
+        "--profile-record-shapes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="在 profile 中记录算子输入 shape；默认开启",
+    )
+    parser.add_argument(
+        "--profile-memory",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="在 profile 中记录算子内存；会显著增大采集开销和输出体积",
+    )
     parser.add_argument("--seed", type=int, default=20260820)
     parser.add_argument("--output-json", type=Path, default=Path("prefix_grouper_results.json"))
     parser.add_argument("--output-markdown", type=Path, default=Path("prefix_grouper_results.md"))
@@ -386,12 +405,18 @@ def markdown(results: dict[str, Any]) -> str:
         f"- Batch：每 rank {results['batch_size_per_rank']}，全局 {results['global_batch_size']}",
         f"- NPU 模型下载目录：{results['model_download_root'] or '不适用（GPU）'}",
         "- PPA 口径：延迟取所有 rank 的慢端值，吞吐按全局 response token 计算；功耗为所有设备之和；显存同时报告最坏 rank 和设备总和。",
-        "",
-        "## 工作量",
-        "",
-        "| 模型 | Prompt | 共享组 | Dense token 前/后 | Dense token 减少 | Causal pair 前/后 | Attention pair 减少 |",
-        "|---|---:|---:|---:|---:|---:|---:|",
     ]
+    if results["profile"]["enabled"]:
+        lines.append(f"- Profile：{results['profile']['output_dir']}；{results['profile']['scope']}")
+    lines.extend(
+        [
+            "",
+            "## 工作量",
+            "",
+            "| 模型 | Prompt | 共享组 | Dense token 前/后 | Dense token 减少 | Causal pair 前/后 | Attention pair 减少 |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
     for model in results["models"]:
         for case in model["cases"]:
             work = case["workload"]
@@ -540,6 +565,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(f"请求 {n_devices_per_node} 个设备，但当前节点只发现 {accelerator.module.device_count()} 个。")
     world_size = args.nnodes * n_devices_per_node
     power_enabled = args.power if args.power is not None else accelerator.backend == "npu"
+    profile_root = args.profile_dir.resolve() if args.profile else None
     model_download_root = Path.cwd().resolve() if accelerator.backend == "npu" else None
     if args.local_files_only:
         os.environ["HF_HUB_OFFLINE"] = "1"
@@ -564,6 +590,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "power_interval": args.power_interval,
         "power_idle_samples": args.power_idle_samples,
         "npu_chip_id": args.npu_chip_id,
+        "profile_enabled": args.profile,
+        "profile_output_dir": None,
+        "profile_record_shapes": args.profile_record_shapes,
+        "profile_memory": args.profile_memory,
         "seed": args.seed,
     }
 
@@ -602,6 +632,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "interval_seconds": args.power_interval if power_enabled else None,
             "npu_chip_id": args.npu_chip_id if accelerator.backend == "npu" else None,
         },
+        "profile": {
+            "enabled": args.profile,
+            "output_dir": str(profile_root) if profile_root is not None else None,
+            "scope": "每个 case/mode 在正常计时后额外采集 baseline 与 PrefixGrouper 各一个 step",
+            "record_shapes": args.profile_record_shapes if args.profile else None,
+            "profile_memory": args.profile_memory if args.profile else None,
+            "npu_level": "Level1/PipeUtilization/Text+Db" if args.profile and accelerator.backend == "npu" else None,
+        },
         "models": [],
     }
     owns_ray = not ray.is_initialized()
@@ -626,7 +664,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             runner = _DistributedBenchmarkTaskRunner.remote()
             try:
-                rank_results = ray.get(runner.run.remote(resolved_model_ref, settings))
+                model_settings = {
+                    **settings,
+                    "profile_output_dir": (
+                        str(profile_root / f"{index:02d}_{Path(model_ref).name}")
+                        if profile_root is not None
+                        else None
+                    ),
+                }
+                rank_results = ray.get(runner.run.remote(resolved_model_ref, model_settings))
             finally:
                 ray.kill(runner)
             model_result = aggregate_model_result(

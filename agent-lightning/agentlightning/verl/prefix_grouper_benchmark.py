@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Callable, Sequence
 
 import ray
@@ -369,10 +370,55 @@ def _peak_memory(function: Callable[[], torch.Tensor], accelerator: AcceleratorR
     return peak / 2**20, (peak - baseline) / 2**20
 
 
+def _profile_comparison(
+    step: Callable[[bool], torch.Tensor],
+    *,
+    case: Case,
+    mode: str,
+    settings: dict[str, Any],
+    accelerator: AcceleratorRuntime,
+) -> dict[str, Any]:
+    if not settings["profile_enabled"]:
+        return {"enabled": False}
+
+    rank = torch.distributed.get_rank()
+    output_dir = (
+        Path(settings["profile_output_dir"])
+        / f"prompt_{case.prompt_length}_group_{case.group_size}"
+        / mode
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    worker_name = f"{os.uname().nodename}_rank_{rank}"
+    accelerator.synchronize()
+    torch.distributed.barrier()
+    with accelerator.profiler(
+        str(output_dir),
+        worker_name,
+        record_shapes=bool(settings["profile_record_shapes"]),
+        profile_memory=bool(settings["profile_memory"]),
+    ):
+        with torch.profiler.record_function(f"prefix_grouper/{mode}/baseline"):
+            step(False)
+            accelerator.synchronize()
+        with torch.profiler.record_function(f"prefix_grouper/{mode}/prefix_grouper"):
+            step(True)
+            accelerator.synchronize()
+    torch.distributed.barrier()
+    return {
+        "enabled": True,
+        "output_dir": str(output_dir),
+        "worker_name": worker_name,
+        "labels": [f"prefix_grouper/{mode}/baseline", f"prefix_grouper/{mode}/prefix_grouper"],
+        "record_shapes": bool(settings["profile_record_shapes"]),
+        "profile_memory": bool(settings["profile_memory"]),
+    }
+
+
 def _benchmark_mode(
     model: torch.nn.Module,
     batch: dict[str, Any],
     *,
+    case: Case,
     mode: str,
     settings: dict[str, Any],
     accelerator: AcceleratorRuntime,
@@ -412,11 +458,19 @@ def _benchmark_mode(
         )
         baseline_peak, baseline_incremental = _peak_memory(lambda: step(False), accelerator)
         grouped_peak, grouped_incremental = _peak_memory(lambda: step(True), accelerator)
+        profile = _profile_comparison(
+            step,
+            case=case,
+            mode=mode,
+            settings=settings,
+            accelerator=accelerator,
+        )
     tokens = batch["responses"].numel()
     baseline_ms = percentile(sorted(baseline_samples), 0.5)
     grouped_ms = percentile(sorted(grouped_samples), 0.5)
     return {
         "mode": mode,
+        "profile": profile,
         "performance": {
             "speedup": baseline_ms / grouped_ms,
             "baseline": {
@@ -572,6 +626,7 @@ class DistributedPrefixGrouperBenchmarkWorker(PrefixGrouperTrainingWorker):
                 _benchmark_mode(
                     model,
                     batch,
+                    case=case,
                     mode=mode,
                     settings=settings,
                     accelerator=accelerator,
