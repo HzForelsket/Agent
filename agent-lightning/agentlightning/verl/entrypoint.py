@@ -197,8 +197,8 @@ class TaskRunner:
         )
 
         reward_kwargs = config.reward.reward_model.get("reward_kwargs", {})
-        reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **reward_kwargs)
-        val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **reward_kwargs)
+        reward_fn = load_reward_manager(config, tokenizer, **reward_kwargs)
+        val_reward_fn = load_reward_manager(config, tokenizer, **reward_kwargs)
 
         from verl.utils.dataset.rl_dataset import collate_fn
 

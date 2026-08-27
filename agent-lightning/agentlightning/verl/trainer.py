@@ -248,6 +248,8 @@ class AgentLightningTrainer(RayPPOTrainer):
                 self.agent_mode_daemon.clear_data_and_server()
                 self.checkpoint_manager.sleep_replicas()
 
+            batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+
             if self.config.agentlightning.prefix_grouper.enabled:
                 from .prefix_grouper import reorder_by_prompt
 
