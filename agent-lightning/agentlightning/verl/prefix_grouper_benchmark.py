@@ -389,23 +389,28 @@ def _profile_comparison(
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     worker_name = f"{os.uname().nodename}_rank_{rank}"
-    with accelerator.profiler(
-        str(output_dir),
-        worker_name,
-        record_shapes=bool(settings["profile_record_shapes"]),
-        profile_memory=bool(settings["profile_memory"]),
-    ) as profiler:
-        with torch.profiler.record_function(f"prefix_grouper/{mode}/baseline"):
-            step(False)
-        profiler.step()
-        with torch.profiler.record_function(f"prefix_grouper/{mode}/prefix_grouper"):
-            step(True)
-        profiler.step()
+    output_dirs: dict[str, str] = {}
+    labels: dict[str, str] = {}
+    for path_name, grouped in (("baseline", False), ("prefix_grouper", True)):
+        capture_dir = output_dir / path_name
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        label = f"prefix_grouper/{mode}/{path_name}"
+        with accelerator.profiler(
+            str(capture_dir),
+            worker_name,
+            record_shapes=bool(settings["profile_record_shapes"]),
+            profile_memory=bool(settings["profile_memory"]),
+        ) as profiler:
+            with torch.profiler.record_function(label):
+                step(grouped)
+            profiler.step()
+        output_dirs[path_name] = str(capture_dir)
+        labels[path_name] = label
     return {
         "enabled": True,
-        "output_dir": str(output_dir),
+        "output_dirs": output_dirs,
         "worker_name": worker_name,
-        "labels": [f"prefix_grouper/{mode}/baseline", f"prefix_grouper/{mode}/prefix_grouper"],
+        "labels": labels,
         "record_shapes": bool(settings["profile_record_shapes"]),
         "profile_memory": bool(settings["profile_memory"]),
     }

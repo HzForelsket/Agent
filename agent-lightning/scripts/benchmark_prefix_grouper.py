@@ -119,7 +119,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--profile",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="在每个 Ray worker 内对 baseline 和 PrefixGrouper 各采集一个相同范围的 step",
+        help="在每个 Ray worker 内用独立目录对 baseline 和 PrefixGrouper 各采集一个相同范围的 step",
     )
     parser.add_argument("--profile-dir", type=Path, default=Path("prefix_grouper_profiles"))
     parser.add_argument(
@@ -635,7 +635,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "profile": {
             "enabled": args.profile,
             "output_dir": str(profile_root) if profile_root is not None else None,
-            "scope": "每个 case/mode 在正常计时后额外采集 baseline 与 PrefixGrouper 各一个 step",
+            "scope": "每个 case/mode 在独立目录中采集 baseline 与 PrefixGrouper 各一个 step",
             "record_shapes": args.profile_record_shapes if args.profile else None,
             "profile_memory": args.profile_memory if args.profile else None,
             "npu_level": "Level1/PipeUtilization/Text+Db" if args.profile and accelerator.backend == "npu" else None,

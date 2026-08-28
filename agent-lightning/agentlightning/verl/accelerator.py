@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal
 
@@ -111,7 +112,7 @@ class AcceleratorRuntime:
             )
             return profiler.profile(
                 activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
-                schedule=profiler.schedule(wait=0, warmup=0, active=2, repeat=1, skip_first=0),
+                schedule=profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=0),
                 on_trace_ready=profiler.tensorboard_trace_handler(
                     output_dir,
                     worker_name=worker_name,
@@ -124,7 +125,7 @@ class AcceleratorRuntime:
             )
         return torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-            schedule=torch.profiler.schedule(wait=0, warmup=0, active=2, repeat=1, skip_first=0),
+            schedule=torch.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=0),
             on_trace_ready=torch.profiler.tensorboard_trace_handler(output_dir, worker_name=worker_name),
             record_shapes=record_shapes,
             profile_memory=profile_memory,
@@ -137,10 +138,20 @@ class AcceleratorRuntime:
             return
         profiler: Any = importlib.import_module("torch_npu.profiler")
         profiler_api: Any = importlib.import_module("torch_npu.profiler.profiler")
-        profiler_api.analyse(
-            output_dir,
-            export_type=[profiler.ExportType.Text, profiler.ExportType.Db],
+        capture_parents = sorted(
+            {
+                capture.parent
+                for capture in Path(output_dir).rglob("*_ascend_pt")
+                if capture.is_dir()
+            }
         )
+        if not capture_parents:
+            raise RuntimeError(f"没有在 {output_dir} 下发现 torch-npu profile 原始数据。")
+        for capture_parent in capture_parents:
+            profiler_api.analyse(
+                str(capture_parent),
+                export_type=[profiler.ExportType.Text, profiler.ExportType.Db],
+            )
 
     def device_name(self) -> str:
         get_device_name = getattr(self.module, "get_device_name", None)
