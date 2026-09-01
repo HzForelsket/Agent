@@ -30,7 +30,12 @@ def _scatter_selected_rows(
     if output.device.type == "npu":
         import torch_npu
 
-        torch_npu.scatter_update_(output, output_indices, updates, axis=0)
+        # scatter_update_ reserves dim 0 as its batch dimension and rejects
+        # axis=0. ScatterNdUpdate expresses the required row-wise update with
+        # one coordinate per selected row.
+        torch_npu.npu_scatter_nd_update_(
+            output, output_indices.unsqueeze(-1), updates
+        )
     elif output.device.type == "cuda":
         output.index_copy_(0, output_indices, updates)
     else:
