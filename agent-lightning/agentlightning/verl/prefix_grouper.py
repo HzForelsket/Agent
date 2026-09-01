@@ -23,8 +23,10 @@ from packaging.version import Version
 from prefix_grouper import PrefixGrouper
 from tensordict import TensorDict
 from verl.models.transformers.monkey_patch import apply_prefix_grouper_patch as _apply_verl_prefix_grouper_patch
+from verl.trainer.ppo import prefix_grouper_utils as _verl_prefix_grouper_utils
 from verl.trainer.ppo.prefix_grouper_utils import build_position_ids_for_prefix_grouper, pg_forward
 from verl.utils import tensordict_utils as tu
+from verl.utils.torch_functional import logprobs_from_logits_v2
 from verl.utils.device import get_device_id, get_device_name
 from verl.workers.engine.fsdp import FSDPEngineWithLMHead
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
@@ -41,6 +43,18 @@ __all__ = [
 
 _PATCHED = False
 _NPU_TORCH_VERSION = Version("2.10.0")
+_VERL_LOGPROBS_FROM_LOGITS = _verl_prefix_grouper_utils.logprobs_from_logits
+
+
+def _device_safe_logprobs_from_logits(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    inplace_backward: bool = True,
+) -> torch.Tensor:
+    """Keep VERL's installed-torch-npu shortcut away from CPU tensors."""
+    if logits.device.type == "cpu":
+        return logprobs_from_logits_v2(logits, labels)
+    return _VERL_LOGPROBS_FROM_LOGITS(logits, labels, inplace_backward=inplace_backward)
 
 
 @lru_cache(maxsize=1)
@@ -192,6 +206,7 @@ def apply_prefix_grouper_patch() -> None:
     _apply_verl_prefix_grouper_patch()
     ALL_ATTENTION_FUNCTIONS["sdpa"] = _sdpa_prefix_grouper_wrapper(original_sdpa)
     PrefixGrouper.batch_repeat_cat = _batch_repeat_cat_without_device_scalar
+    _verl_prefix_grouper_utils.logprobs_from_logits = _device_safe_logprobs_from_logits
     _PATCHED = True
 
 

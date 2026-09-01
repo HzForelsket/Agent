@@ -91,6 +91,47 @@ If `HTTPS_PROXY` already contains the correct proxy address, the first line can 
 
 Automatic NPU download is enabled by default. Set `agentlightning.npu_model_download.enabled=false` to require an existing local path, or set `agentlightning.npu_model_download.local_files_only=true` to require an already cloned and fully materialized Git model repository below the current command directory. On multi-node runs, launch from a shared filesystem path visible at the same absolute location on every node.
 
+### Profile an end-to-end Agent Lightning training step on Ascend
+
+Agent Lightning uses VERL's `global_profiler.steps` to select complete training steps for profiling. For every selected step, profiling starts before the agent rollout and stops after old/reference log-probability computation and actor/critic updates. Validation and checkpoint saving are outside the captured training step. The rollout server is controlled separately because it runs in its own process.
+
+The following configuration captures global step 1 on every rank. Worker roles use one continuous database for the selected training step, while the rollout server uses discrete mode as required by the asynchronous vLLM profiler:
+
+```python
+def npu_profiler(*, discrete: bool) -> dict[str, object]:
+    return {
+        "tool": "npu",
+        "enable": True,
+        "all_ranks": True,
+        "tool_config": {
+            "npu": {
+                "contents": ["npu", "cpu", "memory", "shapes"],
+                "level": "level1",
+                "analysis": True,
+                "discrete": discrete,
+            }
+        },
+    }
+
+
+verl_config = {
+    "global_profiler": {
+        "tool": "npu",
+        "steps": [1],
+        "profile_continuous_steps": False,
+        "save_path": "outputs/profile",
+    },
+    "actor_rollout_ref": {
+        "actor": {"profiler": npu_profiler(discrete=False)},
+        "rollout": {"profiler": npu_profiler(discrete=True)},
+        "ref": {"profiler": npu_profiler(discrete=False)},
+    },
+    "critic": {"profiler": npu_profiler(discrete=False)},
+}
+```
+
+The reference-policy and critic entries take effect only when those worker roles are enabled by the algorithm. Profiling every rank with memory and shape collection produces large traces; use `all_ranks=False` with `ranks=[0]`, or remove `memory` and `shapes`, when a smaller diagnostic capture is sufficient.
+
 Install the platform-specific stack and compare the standard and shared-prefix paths with one or more ModelScope model IDs:
 
 ```bash
@@ -126,6 +167,42 @@ The two supported dependency matrices are intentionally separate because the acc
 | Ascend NPU | 2.10.0 | 0.22.1 | vLLM-Ascend 0.22.1rc1 / torch-npu 2.10.0 | 0.9.0 | 9.0.0 |
 
 The NPU installer first installs the CPU PyTorch wheel required by torch-npu, builds the source-only `arctic-inference==0.1.1` package without its obsolete isolated Torch 2.7 build dependency, and builds upstream vLLM with `VLLM_TARGET_DEVICE=empty`. The Ascend plugin then supplies the device kernels. This avoids installing vLLM 0.22.1's CUDA wheel, whose metadata requires PyTorch 2.11. The exact package pins live in `scripts/requirements_prefix_grouper_gpu.txt` and `scripts/requirements_prefix_grouper_npu.txt`; the matrices checked by the benchmark live in `scripts/prefix_grouper_stack.py`.
+
+### Develop the Ascend path without an NPU
+
+The repository includes an isolated Ubuntu 22.04 setup for importing and exercising the Ascend integration on an x86_64 CPU host without NPU devices. It targets Atlas A2 with `SOC_VERSION=ascend910b1` and installs CANN toolkit 9.0.0, 910B ops 9.0.0, NNAL 9.0.0, and the pinned NPU Python stack into `/opt/agent-npu-cpu-dev`. It does not install an Ascend driver or firmware on the host.
+
+Run the setup through the fixed proot wrapper with a clean environment so the proot's Python 3.10 is used instead of a host Conda interpreter:
+
+```bash
+PROOT_BIN=/home/huangzhong/bin/proot-5.4.0 \
+PROOT_NO_SECCOMP=1 ~/.codex/skills/proot-ubuntu2204/scripts/proot_ubuntu2204.sh -- \
+  /usr/bin/env -i \
+  HOME=/root \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  LANG=C.UTF-8 \
+  /bin/bash -lc \
+  'cd /home/huangzhong/Agent/agent-lightning && bash scripts/setup_prefix_grouper_npu_cpu_dev.sh'
+```
+
+Use PRoot 5.4.0 or newer because CANN checks installation-directory permissions through `faccessat2`; older PRoot versions can return a false permission error for paths inside the rootfs. Add `--dry-run` to the setup script to print the system, CANN, virtual-environment, and Python-stack installation commands without changing the proot. The setup is repeatable and refuses to continue when it finds a CANN toolkit version other than 9.0.0. CANN runfiles are invoked with Huawei's `--quiet` option; according to the bundled installer help, using that option means accepting Huawei's EULA for non-interactive installation.
+
+For a non-interactive development or validation command, activate the environment inside the same proot invocation:
+
+```bash
+PROOT_BIN=/home/huangzhong/bin/proot-5.4.0 \
+PROOT_NO_SECCOMP=1 ~/.codex/skills/proot-ubuntu2204/scripts/proot_ubuntu2204.sh -- \
+  /usr/bin/env -i \
+  HOME=/root \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  LANG=C.UTF-8 \
+  /bin/bash -lc \
+  'cd /home/huangzhong/Agent/agent-lightning && \
+   source scripts/activate_prefix_grouper_npu_cpu_dev.sh && \
+   python -m pip check'
+```
+
+This environment can verify package imports, vLLM plugin discovery, CPU-safe data flow, and interface contracts. A missing NPU is expected and `torch.npu.is_available()` must remain false. Do not use results from this environment as evidence for Ascend operator execution, inference, training, gradients, performance, or stability.
 
 Each case uses `PROMPT_LENGTH:GROUP_SIZE`. VERL's FSDP engine loads checkpoints through `from_pretrained`, so the distributed benchmark always uses pretrained weights; the former config-only random-weight path has been removed. The script checks response log-probability equivalence on every rank before recording PPA results. Backward runs enable the framework's gradient checkpointing by default; use `--no-gradient-checkpointing` only when intentionally measuring without activation recomputation.
 

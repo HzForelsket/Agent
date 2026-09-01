@@ -1,0 +1,44 @@
+[
+  {
+    "op": "SharedPrefixAttentionForward",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "q", "param_type": "required", "format": ["ND"], "type": ["bfloat16"]},
+      {"name": "k", "param_type": "required", "format": ["ND"], "type": ["bfloat16"]},
+      {"name": "v", "param_type": "required", "format": ["ND"], "type": ["bfloat16"]},
+      {"name": "prefix_start", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "prefix_end", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "sequence_start", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+    ],
+    "output_desc": [
+      {"name": "out", "param_type": "required", "format": ["ND"], "type": ["bfloat16"]},
+      {"name": "lse", "param_type": "required", "format": ["ND"], "type": ["float"]}
+    ],
+    "attr": [
+      {"name": "scale", "param_type": "required", "type": "float"}
+    ]
+  },
+  {
+    "op": "SharedPrefixAttentionBackward",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "grad_out", "param_type": "required", "format": ["ND"], "type": ["bfloat16"]},
+      {"name": "q", "param_type": "required", "format": ["ND"], "type": ["bfloat16"]},
+      {"name": "k", "param_type": "required", "format": ["ND"], "type": ["bfloat16"]},
+      {"name": "v", "param_type": "required", "format": ["ND"], "type": ["bfloat16"]},
+      {"name": "out", "param_type": "required", "format": ["ND"], "type": ["bfloat16"]},
+      {"name": "lse", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "prefix_start", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "prefix_end", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+      {"name": "sequence_start", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+    ],
+    "output_desc": [
+      {"name": "dq", "param_type": "required", "format": ["ND"], "type": ["bfloat16"]},
+      {"name": "dk", "param_type": "required", "format": ["ND"], "type": ["bfloat16"]},
+      {"name": "dv", "param_type": "required", "format": ["ND"], "type": ["bfloat16"]}
+    ],
+    "attr": [
+      {"name": "scale", "param_type": "required", "type": "float"}
+    ]
+  }
+]

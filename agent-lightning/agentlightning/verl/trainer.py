@@ -212,7 +212,7 @@ class AgentLightningTrainer(RayPPOTrainer):
         """Use VERL 0.9's TensorDict conversion and fused-reference routing."""
         return super()._compute_ref_log_prob(batch)
 
-    def _train_step(self, batch_dict: dict) -> dict:
+    def _train_step(self, batch_dict: dict, *, profile_rollout: bool = False) -> dict:
         # Isolate in a separate method to automatically recycle the variables before validation.
         batch: DataProto = DataProto.from_single_dict(batch_dict)
         metrics = {}
@@ -226,27 +226,33 @@ class AgentLightningTrainer(RayPPOTrainer):
             # generate a batch
             with _timer("gen", timing_raw):
                 self.checkpoint_manager.update_weights(self.global_steps)
-                self.agent_mode_daemon.set_up_data_and_server(
-                    gen_batch.non_tensor_batch, self.llm_server_manager.get_addresses()
-                )
-                self.agent_mode_daemon.run_until_all_finished()
-                batch, agent_metrics = self.agent_mode_daemon.get_train_data_batch(
-                    max_prompt_length=(
-                        self.config.agentlightning.trace_aggregator.trajectory_max_prompt_length
-                        if self.config.agentlightning.trace_aggregator.level.startswith("trajectory")
-                        else self.config.data.max_prompt_length
-                    ),
-                    max_response_length=(
-                        self.config.agentlightning.trace_aggregator.trajectory_max_response_length
-                        if self.config.agentlightning.trace_aggregator.level.startswith("trajectory")
-                        else self.config.data.max_response_length
-                    ),
-                    device=gen_batch.batch["fake_ids"].device,
-                    global_steps=self.global_steps,
-                )
-                metrics.update(agent_metrics)
-                self.agent_mode_daemon.clear_data_and_server()
-                self.checkpoint_manager.sleep_replicas()
+                if profile_rollout:
+                    self.llm_server_manager.start_profile()
+                try:
+                    self.agent_mode_daemon.set_up_data_and_server(
+                        gen_batch.non_tensor_batch, self.llm_server_manager.get_addresses()
+                    )
+                    self.agent_mode_daemon.run_until_all_finished()
+                    batch, agent_metrics = self.agent_mode_daemon.get_train_data_batch(
+                        max_prompt_length=(
+                            self.config.agentlightning.trace_aggregator.trajectory_max_prompt_length
+                            if self.config.agentlightning.trace_aggregator.level.startswith("trajectory")
+                            else self.config.data.max_prompt_length
+                        ),
+                        max_response_length=(
+                            self.config.agentlightning.trace_aggregator.trajectory_max_response_length
+                            if self.config.agentlightning.trace_aggregator.level.startswith("trajectory")
+                            else self.config.data.max_response_length
+                        ),
+                        device=gen_batch.batch["fake_ids"].device,
+                        global_steps=self.global_steps,
+                    )
+                    metrics.update(agent_metrics)
+                    self.agent_mode_daemon.clear_data_and_server()
+                    self.checkpoint_manager.sleep_replicas()
+                finally:
+                    if profile_rollout:
+                        self.llm_server_manager.stop_profile()
 
             batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
@@ -477,6 +483,12 @@ class AgentLightningTrainer(RayPPOTrainer):
         # we start from step 1
         self.global_steps += 1
         last_val_metrics = None
+        previous_step_profile = False
+        current_step_profile = (
+            self.global_steps in self.config.global_profiler.steps
+            if self.config.global_profiler.steps is not None
+            else False
+        )
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -484,8 +496,31 @@ class AgentLightningTrainer(RayPPOTrainer):
                 timing_raw = {}
                 is_last_step = self.global_steps >= self.total_training_steps
 
-                # train step
-                metrics = self._train_step(batch_dict)
+                start_worker_profile = (
+                    not previous_step_profile and current_step_profile
+                    if self.config.global_profiler.profile_continuous_steps
+                    else current_step_profile
+                )
+                self._start_profiling(start_worker_profile)
+                try:
+                    metrics = self._train_step(batch_dict, profile_rollout=current_step_profile)
+                except BaseException:
+                    self._stop_profiling(current_step_profile)
+                    raise
+
+                next_step_profile = (
+                    self.global_steps + 1 in self.config.global_profiler.steps
+                    if self.config.global_profiler.steps is not None
+                    else False
+                )
+                stop_worker_profile = (
+                    current_step_profile and not next_step_profile
+                    if self.config.global_profiler.profile_continuous_steps
+                    else current_step_profile
+                )
+                self._stop_profiling(stop_worker_profile)
+                previous_step_profile = current_step_profile
+                current_step_profile = next_step_profile
 
                 # validate
                 if (
