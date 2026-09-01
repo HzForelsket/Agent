@@ -7,6 +7,36 @@ from torch.autograd import Function
 from .utils.typing import Tuple
 
 IndicesTuple = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+LinearIndicesTuple = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+
+
+def _swap_head_sequence_dims(x: torch.Tensor) -> torch.Tensor:
+    """Swap the head and sequence dimensions and materialize an ND tensor."""
+    permutation = (0, 2, 1, *range(3, x.ndim))
+    return x.permute(permutation).contiguous()
+
+
+def _scatter_selected_rows(
+    output: torch.Tensor,
+    source: torch.Tensor,
+    source_indices: torch.Tensor,
+    output_indices: torch.Tensor,
+) -> None:
+    """Copy selected rows with device-native single-axis gather and scatter ops."""
+    if source_indices.numel() == 0:
+        return
+
+    updates = torch.index_select(source, 0, source_indices)
+    if output.device.type == "npu":
+        import torch_npu
+
+        torch_npu.scatter_update_(output, output_indices, updates, axis=0)
+    elif output.device.type == "cuda":
+        output.index_copy_(0, output_indices, updates)
+    else:
+        raise RuntimeError(
+            f"single-axis ungroup is only implemented for NPU and CUDA, got {output.device.type}"
+        )
 
 
 class UngroupFunction(Function):
@@ -82,6 +112,106 @@ class UngroupFunction(Function):
                 ungrouped_suffix_indices[:, 0], :, ungrouped_suffix_indices[:, 1]
             ]
         )
+        return grad_x, None, None
+
+
+class LinearUngroupFunction(Function):
+    """Ungroup with contiguous layouts and single-axis device indexing."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        linear_indices: LinearIndicesTuple,
+        shapes: Tuple[torch.Size, torch.Size],
+    ):
+        assert x.ndim >= 3
+        (
+            ungrouped_prefix_indices,
+            ungrouped_suffix_indices,
+            grouped_prefix_indices,
+            grouped_suffix_indices,
+        ) = linear_indices
+        prefix_x_shape, suffix_x_shape = shapes
+
+        ctx.save_for_backward(*linear_indices)
+        ctx.input_shape = x.shape
+
+        x_sequence_major = _swap_head_sequence_dims(x)
+        x_flat = x_sequence_major.flatten(0, 1)
+        trailing_shape = x_sequence_major.shape[2:]
+
+        prefix_flat = x.new_zeros(
+            (prefix_x_shape[0] * prefix_x_shape[1], *trailing_shape)
+        )
+        _scatter_selected_rows(
+            prefix_flat,
+            x_flat,
+            grouped_prefix_indices,
+            ungrouped_prefix_indices,
+        )
+        prefix_sequence_major = prefix_flat.reshape(
+            prefix_x_shape[0], prefix_x_shape[1], *trailing_shape
+        )
+        prefix_x = _swap_head_sequence_dims(prefix_sequence_major)
+
+        suffix_flat = x.new_zeros(
+            (suffix_x_shape[0] * suffix_x_shape[1], *trailing_shape)
+        )
+        _scatter_selected_rows(
+            suffix_flat,
+            x_flat,
+            grouped_suffix_indices,
+            ungrouped_suffix_indices,
+        )
+        suffix_sequence_major = suffix_flat.reshape(
+            suffix_x_shape[0], suffix_x_shape[1], *trailing_shape
+        )
+        suffix_x = _swap_head_sequence_dims(suffix_sequence_major)
+        return prefix_x, suffix_x
+
+    @staticmethod
+    def backward(ctx, grad_prefix_x: torch.Tensor, grad_suffix_x: torch.Tensor):
+        (
+            ungrouped_prefix_indices,
+            ungrouped_suffix_indices,
+            grouped_prefix_indices,
+            grouped_suffix_indices,
+        ) = ctx.saved_tensors
+        input_shape = ctx.input_shape
+
+        grad_prefix_sequence_major = _swap_head_sequence_dims(grad_prefix_x)
+        grad_suffix_sequence_major = _swap_head_sequence_dims(grad_suffix_x)
+        grad_prefix_flat = grad_prefix_sequence_major.flatten(0, 1)
+        grad_suffix_flat = grad_suffix_sequence_major.flatten(0, 1)
+
+        grad_x_sequence_major_shape = (
+            input_shape[0],
+            input_shape[2],
+            input_shape[1],
+            *input_shape[3:],
+        )
+        grad_x_flat = grad_prefix_x.new_zeros(
+            (
+                input_shape[0] * input_shape[2],
+                input_shape[1],
+                *input_shape[3:],
+            )
+        )
+        _scatter_selected_rows(
+            grad_x_flat,
+            grad_prefix_flat,
+            ungrouped_prefix_indices,
+            grouped_prefix_indices,
+        )
+        _scatter_selected_rows(
+            grad_x_flat,
+            grad_suffix_flat,
+            ungrouped_suffix_indices,
+            grouped_suffix_indices,
+        )
+        grad_x_sequence_major = grad_x_flat.reshape(grad_x_sequence_major_shape)
+        grad_x = _swap_head_sequence_dims(grad_x_sequence_major)
         return grad_x, None, None
 
 
@@ -174,5 +304,7 @@ class ConvertPaddingFunction(Function):
             dtype=grad_o.dtype,
             device=grad_o.device,
         )
-        grad_x[x_indices[:, 0], x_indices[:, 1]] = grad_o[o_indices[:, 0], o_indices[:, 1]]
+        grad_x[x_indices[:, 0], x_indices[:, 1]] = grad_o[
+            o_indices[:, 0], o_indices[:, 1]
+        ]
         return grad_x, None, None

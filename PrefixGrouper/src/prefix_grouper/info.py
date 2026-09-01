@@ -4,6 +4,11 @@ from .utils.typing import List, Union, Sequence, SupportsIndex
 from .utils.mask import create_mask, create_submask, create_padding_mask
 
 
+def _linearize_indices(indices: torch.Tensor, sequence_length: int) -> torch.Tensor:
+    """Flatten ``(batch, sequence)`` coordinates into int64 row indices."""
+    return indices[:, 0] * sequence_length + indices[:, 1]
+
+
 class Info(Sequence[int]):
     def __init__(self, prefix_len: int, suffix_lens: List[int]):
         assert len(suffix_lens) > 0, "Size of ``suffix_lens`` should be greater than 0"
@@ -151,6 +156,18 @@ class GroupInfo(Sequence[Info]):
         self.x_shape = self.padding_mask.shape
         self.prefix_x_shape = self.ungrouped_prefix_mask.shape
         self.suffix_x_shape = self.ungrouped_suffix_mask.shape
+        # Cache single-axis indices for the NPU ungroup path. Index arithmetic is
+        # intentionally performed once per group plan rather than once per layer.
+        linear_indices_int64 = (
+            _linearize_indices(self.ungrouped_prefix_indices, self.prefix_x_shape[1]),
+            _linearize_indices(self.ungrouped_suffix_indices, self.suffix_x_shape[1]),
+            _linearize_indices(self.grouped_prefix_indices, self.x_shape[1]),
+            _linearize_indices(self.grouped_suffix_indices, self.x_shape[1]),
+        )
+        self.linear_indices = {
+            torch.int64: linear_indices_int64,
+            torch.int32: tuple(index.to(torch.int32) for index in linear_indices_int64),
+        }
 
     def __getitem__(self, __index: Union[SupportsIndex, slice]):
         # NOTE: For backward compatibility

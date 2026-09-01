@@ -7,7 +7,12 @@ import torch
 from .utils import batch_repeat_cat
 from .utils.mask import create_padding_mask
 from .utils.typing import List, Union, Tuple, Optional
-from .function import GroupFunction, UngroupFunction, ConvertPaddingFunction
+from .function import (
+    ConvertPaddingFunction,
+    GroupFunction,
+    LinearUngroupFunction as _LinearUngroupFunction,
+    UngroupFunction,
+)
 from .forward import AttentionForward, AttnFuncType
 from .info import GroupInfo
 
@@ -125,6 +130,16 @@ class PrefixGrouper:
         shapes = (prefix_x_shape, suffix_x_shape)
         return indices, shapes
 
+    def _get_linear_ungroup_args(self, device=None):
+        """Get cached single-axis indices for the linear ungroup path."""
+        device_type = torch.device(device).type
+        index_dtype = torch.int64 if device_type == "cuda" else torch.int32
+        indices = tuple(
+            index.to(device) for index in self.group_info.linear_indices[index_dtype]
+        )
+        shapes = (self.prefix_x_shape, self.suffix_x_shape)
+        return indices, shapes
+
     def ungroup(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> UngroupedTuple:
@@ -137,10 +152,16 @@ class PrefixGrouper:
 
         NOTE: You should carefully check the input and output shapes.
         """
-        indices, shapes = self.get_ungroup_args(q.device)
-        q_prefix, q_suffix = UngroupFunction.apply(q, indices, shapes)
-        k_prefix, k_suffix = UngroupFunction.apply(k, indices, shapes)
-        v_prefix, v_suffix = UngroupFunction.apply(v, indices, shapes)
+        linear_path_dtypes = (torch.bfloat16, torch.float16, torch.float32)
+        if q.device.type in ("cuda", "npu") and q.dtype in linear_path_dtypes:
+            indices, shapes = self._get_linear_ungroup_args(q.device)
+            ungroup_function = _LinearUngroupFunction
+        else:
+            indices, shapes = self.get_ungroup_args(q.device)
+            ungroup_function = UngroupFunction
+        q_prefix, q_suffix = ungroup_function.apply(q, indices, shapes)
+        k_prefix, k_suffix = ungroup_function.apply(k, indices, shapes)
+        v_prefix, v_suffix = ungroup_function.apply(v, indices, shapes)
         return q_prefix, k_prefix, v_prefix, q_suffix, k_suffix, v_suffix
 
     def group(self, o_prefix: torch.Tensor, o_suffix: torch.Tensor) -> torch.Tensor:
