@@ -63,9 +63,9 @@ def prepare_model_for_accelerator(
     if backend != "npu" or not download_config.get("enabled", True):
         return []
 
-    from .model_download import materialize_npu_model_config
+    from .model_download import materialize_model_config
 
-    materializations = materialize_npu_model_config(
+    materializations = materialize_model_config(
         config,
         download_root or invocation_directory(),
         local_files_only=download_config.get("local_files_only", False),

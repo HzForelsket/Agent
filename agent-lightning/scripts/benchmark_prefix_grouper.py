@@ -32,7 +32,7 @@ from prefix_grouper_stack import NPU_CANN_VERSION, REQUIRED_STACKS
 
 from agentlightning.verl.accelerator import select_accelerator
 from agentlightning.verl.entrypoint import configure_accelerator
-from agentlightning.verl.model_download import materialize_model_for_npu
+from agentlightning.verl.model_download import materialize_model
 from agentlightning.verl.prefix_grouper_benchmark import (
     Case,
     DistributedBenchmarkTaskRunner as _DistributedBenchmarkTaskRunner,
@@ -654,7 +654,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             materialization = None
             resolved_model_ref = model_ref
             if model_download_root is not None:
-                materialization = materialize_model_for_npu(
+                materialization = materialize_model(
                     model_ref,
                     model_download_root,
                     local_files_only=args.local_files_only,

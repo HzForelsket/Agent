@@ -29,20 +29,23 @@ from packaging.version import InvalidVersion, Version
 
 import agentlightning as agl
 from agentlightning.verl.accelerator import AcceleratorRuntime, Backend, select_accelerator
+from agentlightning.verl.model_download import materialize_model
 from agentlightning.verl.trainer import AgentLightningTrainer
+from prepare_prefix_grouper_2wikimqa import dataset_source, download_source_rows, prepare_dataset
 from prefix_grouper_stack import NPU_CANN_VERSION, REQUIRED_STACKS
 
 BENCHMARK_ID = "pg-2wikimqa-e2e"
-RESULT_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 2
 DATASET_NAME = "2WikiMQA"
-DEFAULT_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+DEFAULT_MODEL = "Qwen/Qwen3-8B"
+DEFAULT_DOWNLOAD_DIR = Path(".cache/pg-2wikimqa-e2e")
 SYSTEM_PROMPT = (
     "Answer the question using only the supplied Wikipedia passages. "
     "Return only the shortest answer phrase, with no explanation."
 )
-MAX_PROMPT_TOKENS = 2048
-MIN_PROMPT_TOKENS = 1900
-MAX_RESPONSE_TOKENS = 64
+DEFAULT_MAX_PROMPT_TOKENS = 2048
+DEFAULT_MIN_PROMPT_TOKENS = 1900
+DEFAULT_MAX_RESPONSE_TOKENS = 64
 MINIMUM_DATASET_ROWS = 64
 DEFAULT_ROLLOUTS_PER_SAMPLE = 4
 DEFAULT_TRAIN_BATCH_SIZE = 8
@@ -146,7 +149,7 @@ async def wiki_agent(task: dict[str, Any], llm: agl.LLM, rollout: agl.Rollout) -
         "model": llm.model,
         "messages": messages,
         "temperature": 1.0,
-        "max_tokens": MAX_RESPONSE_TOKENS,
+        "max_tokens": int(task["max_response_tokens"]),
         "seed": request_seed,
         "return_token_ids": True,
     }
@@ -184,7 +187,13 @@ async def wiki_agent(task: dict[str, Any], llm: agl.LLM, rollout: agl.Rollout) -
     return reward
 
 
-def load_dataset(path: Path, benchmark_seed: int) -> list[dict[str, Any]]:
+def load_dataset(
+    path: Path,
+    benchmark_seed: int,
+    min_prompt_tokens: int,
+    max_prompt_tokens: int,
+    max_response_tokens: int,
+) -> list[dict[str, Any]]:
     """Load and validate the maintained 2WikiMQA JSONL schema."""
     rows: list[dict[str, Any]] = []
     sample_ids: set[str] = set()
@@ -195,6 +204,8 @@ def load_dataset(path: Path, benchmark_seed: int) -> list[dict[str, Any]]:
             source = cast(dict[str, Any], json.loads(line))
             if source.get("dataset") != DATASET_NAME:
                 raise ValueError(f"{path}:{line_number} is not marked as {DATASET_NAME}.")
+            if source.get("input_policy") != "filter-untruncated":
+                raise ValueError(f"{path}:{line_number} is not an untruncated, token-filtered workload row.")
             sample_id = str(source["sample_id"])
             if sample_id in sample_ids:
                 raise ValueError(f"Duplicate sample ID at {path}:{line_number}: {sample_id}")
@@ -204,10 +215,10 @@ def load_dataset(path: Path, benchmark_seed: int) -> list[dict[str, Any]]:
                 raise ValueError(f"{path}:{line_number} has no golden answers.")
             answer_values = cast(list[Any], answers)
             prompt_tokens = int(source["prompt_tokens"])
-            if not MIN_PROMPT_TOKENS <= prompt_tokens <= MAX_PROMPT_TOKENS:
+            if not min_prompt_tokens <= prompt_tokens <= max_prompt_tokens:
                 raise ValueError(
                     f"{path}:{line_number} has {prompt_tokens} prompt tokens; "
-                    f"the maintained range is {MIN_PROMPT_TOKENS}–{MAX_PROMPT_TOKENS}."
+                    f"the configured range is {min_prompt_tokens}–{max_prompt_tokens}."
                 )
             rows.append(
                 {
@@ -216,6 +227,7 @@ def load_dataset(path: Path, benchmark_seed: int) -> list[dict[str, Any]]:
                     "sample_id": sample_id,
                     "prompt_tokens": prompt_tokens,
                     "benchmark_seed": benchmark_seed,
+                    "max_response_tokens": max_response_tokens,
                 }
             )
     return rows
@@ -270,8 +282,8 @@ def build_config(
         "algorithm": {"adv_estimator": "grpo", "use_kl_in_reward": False},
         "data": {
             "train_batch_size": args.train_batch_size,
-            "max_prompt_length": MAX_PROMPT_TOKENS,
-            "max_response_length": MAX_RESPONSE_TOKENS,
+            "max_prompt_length": args.max_prompt_tokens,
+            "max_response_length": args.max_response_tokens,
             "filter_overlong_prompts": False,
         },
         "actor_rollout_ref": {
@@ -285,7 +297,7 @@ def build_config(
                 "log_prob_micro_batch_size_per_gpu": args.micro_batch_size_per_device,
                 "multi_turn": {"enable": False, "format": "hermes"},
                 "gpu_memory_utilization": 0.35,
-                "max_model_len": MAX_PROMPT_TOKENS + MAX_RESPONSE_TOKENS,
+                "max_model_len": args.max_prompt_tokens + args.max_response_tokens,
             },
             "actor": {
                 "strategy": "fsdp",
@@ -341,7 +353,7 @@ def build_config(
             "critic_warmup": 0,
             "logger": ["console"],
             "project_name": "AgentLightningE2EBenchmark",
-            "experiment_name": f"2wikimqa_qwen3_30b_{backend}_{mode}",
+            "experiment_name": f"2wikimqa_qwen3_8b_{backend}_{mode}",
             "save_freq": -1,
             "test_freq": -1,
             "total_epochs": total_epochs,
@@ -351,8 +363,6 @@ def build_config(
             "benchmark_backend": backend,
         },
     }
-    if backend == "npu":
-        config["agentlightning"] = {"npu_model_download": {"enabled": True, "local_files_only": args.local_files_only}}
     if mode == "prefix_grouper":
         config.setdefault("agentlightning", {})["prefix_grouper"] = {"enabled": True}
     return config
@@ -364,9 +374,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("baseline", "prefix_grouper"), required=True)
     parser.add_argument("--device", choices=("auto", "gpu", "cuda", "npu"), default="auto")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Pretrained model ID or local model directory.")
-    parser.add_argument("--dataset-path", type=Path, required=True)
+    parser.add_argument(
+        "--dataset-path",
+        type=Path,
+        help="Existing prepared workload; otherwise download and prepare the pinned 2WikiMQA source.",
+    )
+    parser.add_argument(
+        "--download-dir",
+        type=Path,
+        default=DEFAULT_DOWNLOAD_DIR,
+        help="Shared GPU/NPU cache root for model and dataset artifacts.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
+    parser.add_argument("--min-prompt-tokens", type=int, default=DEFAULT_MIN_PROMPT_TOKENS)
+    parser.add_argument("--max-prompt-tokens", type=int, default=DEFAULT_MAX_PROMPT_TOKENS)
+    parser.add_argument("--max-response-tokens", type=int, default=DEFAULT_MAX_RESPONSE_TOKENS)
     parser.add_argument("--train-batch-size", type=int, default=DEFAULT_TRAIN_BATCH_SIZE)
     parser.add_argument("--micro-batch-size-per-device", type=int, default=DEFAULT_MICRO_BATCH_SIZE)
     parser.add_argument("--rollouts-per-sample", type=int, default=DEFAULT_ROLLOUTS_PER_SAMPLE)
@@ -374,7 +397,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-devices-per-node", type=int)
     parser.add_argument("--tensor-model-parallel-size", type=int)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    parser.add_argument("--local-files-only", action="store_true", help="Disable NPU model downloads.")
+    parser.add_argument(
+        "--local-files-only",
+        action="store_true",
+        help="Require both model and dataset artifacts to exist locally; disable all downloads.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Replace benchmark JSONL outputs.")
     parser.add_argument("--dry-run", action="store_true", help="Validate and print the config without using hardware.")
     return parser.parse_args()
@@ -431,6 +458,68 @@ def prepare_outputs(output_dir: Path, overwrite: bool) -> tuple[Path, Path]:
     return metrics_path.resolve(), responses_path.resolve()
 
 
+def materialize_workload(args: argparse.Namespace) -> None:
+    """Resolve the same model and 2WikiMQA artifacts for GPU and NPU runs."""
+    model_ref = str(args.model)
+    download_dir = args.download_dir.expanduser().resolve()
+    model_result = materialize_model(
+        model_ref,
+        download_dir / "models",
+        local_files_only=args.local_files_only,
+    )
+    args.model_ref = model_ref
+    args.model = model_result.local_path
+
+    if args.dataset_path is None:
+        source_identity = dataset_source()
+        tokenizer_key = hashlib.sha256(model_ref.encode("utf-8")).hexdigest()[:12]
+        source_key = hashlib.sha256(
+            json.dumps(source_identity, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:12]
+        prepared_path = (
+            download_dir
+            / "datasets"
+            / (
+                f"2wikimqa-{args.min_prompt_tokens}-{args.max_prompt_tokens}-"
+                f"{source_key}-{tokenizer_key}.jsonl"
+            )
+        ).resolve()
+        if not prepared_path.is_file():
+            source_path = download_source_rows(
+                download_dir / "datasets",
+                local_files_only=args.local_files_only,
+            )
+            prepare_dataset(
+                [source_path],
+                Path(model_result.local_path),
+                prepared_path,
+                min_prompt_tokens=args.min_prompt_tokens,
+                max_prompt_tokens=args.max_prompt_tokens,
+                overwrite=False,
+            )
+        args.dataset_path = prepared_path
+        args.dataset_source = source_identity
+    else:
+        args.dataset_path = args.dataset_path.expanduser().resolve()
+        args.dataset_source = {"kind": "provided", "path": str(args.dataset_path)}
+
+    print(
+        "AGL_2WIKIMQA_ARTIFACTS="
+        + json.dumps(
+            {
+                "model_ref": args.model_ref,
+                "model_path": args.model,
+                "model_source": model_result.source,
+                "dataset_path": str(args.dataset_path),
+                "dataset_source": args.dataset_source,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+
 def run_benchmark(
     args: argparse.Namespace,
     runtime: AcceleratorRuntime,
@@ -468,14 +557,18 @@ def run_benchmark(
         "train_batch_size": args.train_batch_size,
         "micro_batch_size_per_device": args.micro_batch_size_per_device,
         "rollouts_per_sample": args.rollouts_per_sample,
-        "min_prompt_tokens": MIN_PROMPT_TOKENS,
-        "max_prompt_tokens": MAX_PROMPT_TOKENS,
-        "max_response_tokens": MAX_RESPONSE_TOKENS,
+        "input_policy": "filter-untruncated",
+        "response_policy": "truncate-at-max-tokens",
+        "min_prompt_tokens": args.min_prompt_tokens,
+        "max_prompt_tokens": args.max_prompt_tokens,
+        "max_response_tokens": args.max_response_tokens,
         "n_devices_per_node": config["trainer"]["n_gpus_per_node"],
         "tensor_model_parallel_size": config["actor_rollout_ref"]["rollout"]["tensor_model_parallel_size"],
         "n_runners": args.n_runners,
         "seed": args.seed,
+        "model_ref": args.model_ref,
         "model": args.model,
+        "dataset_source": args.dataset_source,
         "dataset_path": str(args.dataset_path.resolve()),
         "stack": stack,
         "required_cann": NPU_CANN_VERSION if runtime.backend == "npu" else None,
@@ -493,18 +586,13 @@ def main() -> None:
         "--micro-batch-size-per-device",
         "--rollouts-per-sample",
         "--n-runners",
+        "--min-prompt-tokens",
+        "--max-prompt-tokens",
+        "--max-response-tokens",
     ):
         _validate_positive(name, int(getattr(args, name[2:].replace("-", "_"))))
-    if not args.dataset_path.is_file():
-        raise FileNotFoundError(f"Prepared 2WikiMQA JSONL does not exist: {args.dataset_path}")
-    dataset = load_dataset(args.dataset_path, args.seed)
-    if len(dataset) < MINIMUM_DATASET_ROWS:
-        raise ValueError(
-            f"Dataset has {len(dataset)} rows; the maintained workload requires at least {MINIMUM_DATASET_ROWS}."
-        )
-    if len(dataset) < args.train_batch_size:
-        raise ValueError(f"Dataset has {len(dataset)} rows, fewer than train batch size {args.train_batch_size}.")
-
+    if args.min_prompt_tokens > args.max_prompt_tokens:
+        raise ValueError("--min-prompt-tokens cannot exceed --max-prompt-tokens.")
     runtime: AcceleratorRuntime | None = None
     if args.dry_run:
         backend = _requested_backend(args.device)
@@ -516,6 +604,24 @@ def main() -> None:
     stack = installed_stack(backend)
     check_stack(backend, stack)
     n_devices_per_node, tensor_model_parallel_size = resolve_resources(args, available_devices)
+
+    materialize_workload(args)
+    assert args.dataset_path is not None
+    if not args.dataset_path.is_file():
+        raise FileNotFoundError(f"Prepared 2WikiMQA JSONL does not exist: {args.dataset_path}")
+    dataset = load_dataset(
+        args.dataset_path,
+        args.seed,
+        args.min_prompt_tokens,
+        args.max_prompt_tokens,
+        args.max_response_tokens,
+    )
+    if len(dataset) < MINIMUM_DATASET_ROWS:
+        raise ValueError(
+            f"Dataset has {len(dataset)} rows; the maintained workload requires at least {MINIMUM_DATASET_ROWS}."
+        )
+    if len(dataset) < args.train_batch_size:
+        raise ValueError(f"Dataset has {len(dataset)} rows, fewer than train batch size {args.train_batch_size}.")
 
     output_dir = args.output_dir.resolve()
     metrics_path = output_dir / "metrics.jsonl"

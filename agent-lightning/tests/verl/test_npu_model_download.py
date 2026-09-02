@@ -40,7 +40,7 @@ def test_remote_model_is_materialized_under_command_directory(tmp_path: Path, mo
         return str(local_dir)
 
     monkeypatch.setattr(model_download, "_download_repository", fake_download)
-    result = model_download.materialize_model_for_npu(
+    result = model_download.materialize_model(
         "Qwen/Qwen2.5-0.5B-Instruct",
         tmp_path,
         download_weights=False,
@@ -69,12 +69,12 @@ def test_existing_local_model_never_downloads(tmp_path: Path, monkeypatch: pytes
         raise AssertionError("existing local directories must not be downloaded")
 
     monkeypatch.setattr(model_download, "_download_repository", unexpected_download)
-    result = model_download.materialize_model_for_npu(str(model_dir), tmp_path)
+    result = model_download.materialize_model(str(model_dir), tmp_path)
     assert result.local_path == str(model_dir.resolve())
     assert result.source == "existing-local"
 
     with pytest.raises(FileNotFoundError, match="本地模型目录不存在"):
-        model_download.materialize_model_for_npu("./missing-model", tmp_path)
+        model_download.materialize_model("./missing-model", tmp_path)
 
 
 def test_local_files_only_requires_completed_git_checkout(tmp_path: Path) -> None:
@@ -97,9 +97,9 @@ def test_proxy_credentials_are_encoded_for_git_and_wget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:8080")
-    monkeypatch.delenv(model_download.NPU_MODEL_PROXY_ENV, raising=False)
-    monkeypatch.setenv(model_download.NPU_MODEL_PROXY_USERNAME_ENV, "domain/user")
-    monkeypatch.setenv(model_download.NPU_MODEL_PROXY_PASSWORD_ENV, "p@ss word")
+    monkeypatch.delenv(model_download.MODEL_PROXY_ENV, raising=False)
+    monkeypatch.setenv(model_download.MODEL_PROXY_USERNAME_ENV, "domain/user")
+    monkeypatch.setenv(model_download.MODEL_PROXY_PASSWORD_ENV, "p@ss word")
 
     environment, secrets = model_download._download_environment()
     expected = "http://domain%2Fuser:p%40ss%20word@proxy.internal:8080"
@@ -111,9 +111,9 @@ def test_proxy_credentials_are_encoded_for_git_and_wget(
 
 
 def test_proxy_credentials_must_be_complete(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(model_download.NPU_MODEL_PROXY_ENV, "http://proxy.invalid:8080")
-    monkeypatch.setenv(model_download.NPU_MODEL_PROXY_USERNAME_ENV, "user")
-    monkeypatch.delenv(model_download.NPU_MODEL_PROXY_PASSWORD_ENV, raising=False)
+    monkeypatch.setenv(model_download.MODEL_PROXY_ENV, "http://proxy.invalid:8080")
+    monkeypatch.setenv(model_download.MODEL_PROXY_USERNAME_ENV, "user")
+    monkeypatch.delenv(model_download.MODEL_PROXY_PASSWORD_ENV, raising=False)
     with pytest.raises(RuntimeError, match="必须同时设置"):
         model_download._model_proxy()
 
@@ -171,7 +171,7 @@ def test_git_clone_disables_ssl_and_lfs_smudge(tmp_path: Path, monkeypatch: pyte
 
     monkeypatch.setattr(model_download.shutil, "which", fake_which)
     monkeypatch.setattr(model_download, "_run_download_command", fake_run)
-    monkeypatch.delenv(model_download.NPU_MODEL_BASE_URL_ENV, raising=False)
+    monkeypatch.delenv(model_download.MODEL_BASE_URL_ENV, raising=False)
     model_download._clone_repository("Qwen/Test", tmp_path / "model", {}, ())
 
     command = calls[0][0]
@@ -210,7 +210,7 @@ def test_wget_uses_modelscope_api_and_replaces_verified_pointer(
 
     monkeypatch.setattr(model_download.shutil, "which", fake_which)
     monkeypatch.setattr(model_download, "_run_download_command", fake_run)
-    monkeypatch.delenv(model_download.NPU_MODEL_BASE_URL_ENV, raising=False)
+    monkeypatch.delenv(model_download.MODEL_BASE_URL_ENV, raising=False)
     model_download._download_lfs_files("Qwen/Test", model_dir, "master", {}, ())
 
     assert target.read_bytes() == content
@@ -255,8 +255,8 @@ def test_verl_model_config_reuses_download_and_rewrites_all_remote_paths(
             tls_verification=False,
         )
 
-    monkeypatch.setattr(model_download, "materialize_model_for_npu", fake_materialize)
-    results = model_download.materialize_npu_model_config(config, tmp_path, local_files_only=True)
+    monkeypatch.setattr(model_download, "materialize_model", fake_materialize)
+    results = model_download.materialize_model_config(config, tmp_path, local_files_only=True)
 
     main_path = str((tmp_path / "Qwen--main-model").resolve())
     adapter_path = str((tmp_path / "Qwen--adapter").resolve())

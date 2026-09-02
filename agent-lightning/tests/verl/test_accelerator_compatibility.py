@@ -138,7 +138,7 @@ def test_npu_prepares_model_before_workers_and_gpu_skips_download(
         calls.append((received, root, local_files_only))
         return [expected]
 
-    monkeypatch.setattr(model_download, "materialize_npu_model_config", fake_materialize)
+    monkeypatch.setattr(model_download, "materialize_model_config", fake_materialize)
     assert prepare_model_for_accelerator(config, "npu", tmp_path) == [expected]
     assert calls == [(config, tmp_path, True)]
     assert prepare_model_for_accelerator(config, "cuda", tmp_path) == []

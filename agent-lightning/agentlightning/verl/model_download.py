@@ -1,6 +1,6 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Materialize model Git repositories on Ascend hosts without CA certificates."""
+"""Materialize ModelScope model Git repositories for accelerator workloads."""
 
 from __future__ import annotations
 
@@ -16,10 +16,10 @@ from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
 
-NPU_MODEL_BASE_URL_ENV = "AGENTLIGHTNING_NPU_MODEL_BASE_URL"
-NPU_MODEL_PROXY_ENV = "AGENTLIGHTNING_NPU_MODEL_PROXY"
-NPU_MODEL_PROXY_USERNAME_ENV = "AGENTLIGHTNING_NPU_MODEL_PROXY_USERNAME"
-NPU_MODEL_PROXY_PASSWORD_ENV = "AGENTLIGHTNING_NPU_MODEL_PROXY_PASSWORD"
+MODEL_BASE_URL_ENV = "AGENTLIGHTNING_MODEL_BASE_URL"
+MODEL_PROXY_ENV = "AGENTLIGHTNING_MODEL_PROXY"
+MODEL_PROXY_USERNAME_ENV = "AGENTLIGHTNING_MODEL_PROXY_USERNAME"
+MODEL_PROXY_PASSWORD_ENV = "AGENTLIGHTNING_MODEL_PROXY_PASSWORD"
 
 DEFAULT_MODEL_BASE_URL = "https://www.modelscope.cn"
 
@@ -37,12 +37,12 @@ _LFS_HEADER = b"version https://git-lfs.github.com/spec/v1\n"
 __all__ = [
     "DEFAULT_MODEL_BASE_URL",
     "ModelMaterialization",
-    "NPU_MODEL_BASE_URL_ENV",
-    "NPU_MODEL_PROXY_ENV",
-    "NPU_MODEL_PROXY_PASSWORD_ENV",
-    "NPU_MODEL_PROXY_USERNAME_ENV",
-    "materialize_model_for_npu",
-    "materialize_npu_model_config",
+    "MODEL_BASE_URL_ENV",
+    "MODEL_PROXY_ENV",
+    "MODEL_PROXY_PASSWORD_ENV",
+    "MODEL_PROXY_USERNAME_ENV",
+    "materialize_model",
+    "materialize_model_config",
 ]
 
 
@@ -80,16 +80,16 @@ def _model_directory(download_root: Path, model_ref: str) -> Path:
 
 
 def _model_proxy() -> tuple[str | None, tuple[str, str] | None]:
-    proxy_url = os.environ.get(NPU_MODEL_PROXY_ENV)
+    proxy_url = os.environ.get(MODEL_PROXY_ENV)
     if not proxy_url:
         proxy_url = next((os.environ[name] for name in _STANDARD_PROXY_ENV_VARS if os.environ.get(name)), None)
 
-    username = os.environ.get(NPU_MODEL_PROXY_USERNAME_ENV)
-    password = os.environ.get(NPU_MODEL_PROXY_PASSWORD_ENV)
+    username = os.environ.get(MODEL_PROXY_USERNAME_ENV)
+    password = os.environ.get(MODEL_PROXY_PASSWORD_ENV)
     if bool(username) != bool(password):
-        raise RuntimeError(f"{NPU_MODEL_PROXY_USERNAME_ENV} 和 {NPU_MODEL_PROXY_PASSWORD_ENV} 必须同时设置。")
+        raise RuntimeError(f"{MODEL_PROXY_USERNAME_ENV} 和 {MODEL_PROXY_PASSWORD_ENV} 必须同时设置。")
     if username and password and proxy_url is None:
-        raise RuntimeError(f"已设置代理账号密码，但没有设置 {NPU_MODEL_PROXY_ENV} 或 HTTPS_PROXY。")
+        raise RuntimeError(f"已设置代理账号密码，但没有设置 {MODEL_PROXY_ENV} 或 HTTPS_PROXY。")
     return proxy_url, (username, password) if username and password else None
 
 
@@ -143,8 +143,8 @@ def _run_download_command(
         details = _redact((completed.stderr or completed.stdout).strip(), secrets)
         if "407" in details and "Proxy Authentication Required" in details:
             details = (
-                f"代理返回 407；请通过 {NPU_MODEL_PROXY_USERNAME_ENV} 和 "
-                f"{NPU_MODEL_PROXY_PASSWORD_ENV} 提供有效凭据"
+                f"代理返回 407；请通过 {MODEL_PROXY_USERNAME_ENV} 和 "
+                f"{MODEL_PROXY_PASSWORD_ENV} 提供有效凭据"
             )
         raise RuntimeError(details or f"下载命令退出码为 {completed.returncode}")
     return completed.stdout.strip()
@@ -196,7 +196,7 @@ def _clone_repository(model_ref: str, local_dir: Path, environment: dict[str, st
     git = shutil.which("git")
     if git is None:
         raise RuntimeError("自动下载模型需要 git，但当前 PATH 中未找到 git。")
-    base_url = os.environ.get(NPU_MODEL_BASE_URL_ENV, DEFAULT_MODEL_BASE_URL).rstrip("/")
+    base_url = os.environ.get(MODEL_BASE_URL_ENV, DEFAULT_MODEL_BASE_URL).rstrip("/")
     repository_url = f"{base_url}/{quote(model_ref.removesuffix('.git'), safe='/')}.git"
     _run_download_command(
         (
@@ -239,7 +239,7 @@ def _download_lfs_files(
     wget = shutil.which("wget")
     if wget is None:
         raise RuntimeError("下载模型权重需要 wget，但当前 PATH 中未找到 wget。")
-    base_url = os.environ.get(NPU_MODEL_BASE_URL_ENV, DEFAULT_MODEL_BASE_URL).rstrip("/")
+    base_url = os.environ.get(MODEL_BASE_URL_ENV, DEFAULT_MODEL_BASE_URL).rstrip("/")
     repo_path = quote(model_ref.removesuffix(".git"), safe="/")
     pointers = _lfs_files(local_dir)
     for path, pointer in pointers:
@@ -290,7 +290,7 @@ def _download_repository(
     return str(local_dir)
 
 
-def materialize_model_for_npu(
+def materialize_model(
     model_ref: str,
     download_root: Path,
     *,
@@ -324,8 +324,8 @@ def materialize_model_for_npu(
         ).resolve()
     except Exception as exc:
         raise RuntimeError(
-            f"无法用 Git/wget 把 NPU 模型 {model_ref!r} 下载到 {local_dir}。"
-            f"请检查代理凭据、{NPU_MODEL_BASE_URL_ENV}、仓库权限和磁盘空间：{exc}"
+            f"无法用 Git/wget 把模型 {model_ref!r} 下载到 {local_dir}。"
+            f"请检查代理凭据、{MODEL_BASE_URL_ENV}、仓库权限和磁盘空间：{exc}"
         ) from exc
     return ModelMaterialization(
         model_ref=model_ref,
@@ -336,7 +336,7 @@ def materialize_model_for_npu(
     )
 
 
-def materialize_npu_model_config(
+def materialize_model_config(
     config: Any,
     download_root: Path,
     *,
@@ -354,7 +354,7 @@ def materialize_npu_model_config(
         model_ref = str(value)
         result = materialized_by_ref.get(model_ref)
         if result is None:
-            result = materialize_model_for_npu(model_ref, download_root, local_files_only=local_files_only)
+            result = materialize_model(model_ref, download_root, local_files_only=local_files_only)
             materialized_by_ref[model_ref] = result
         model_config[field] = result.local_path
 

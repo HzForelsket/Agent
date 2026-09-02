@@ -73,52 +73,51 @@ PrefixGrouper currently requires FSDP/FSDP2, `use_remove_padding=False`, fused k
 
 ### Benchmark the full 2WikiMQA training loop
 
-The maintained end-to-end benchmark covers 2WikiMQA only. It runs Agent Lightning rollout generation, trace conversion, GRPO advantage computation, old/reference log-probability passes, and the actor update on either the pinned GPU or Ascend NPU stack. Prepare the fixed 1900–2048-token workload with the same local Qwen tokenizer used by training:
+The maintained end-to-end benchmark covers 2WikiMQA only. It runs Agent Lightning rollout generation, trace conversion, GRPO advantage computation, old/reference log-probability passes, and the actor update on either the pinned GPU or Ascend NPU stack. GPU and NPU use the same artifact preparation path: unless local paths are supplied, the entrypoint materializes `Qwen/Qwen3-8B`, caches the complete pinned 2WikiMQA validation split, and derives a workload with that model's tokenizer below `--download-dir`.
 
-```bash
-conda run -n agent --no-capture-output python scripts/prepare_prefix_grouper_2wikimqa.py \
-    --input /data/2wikimqa.json \
-    --tokenizer /models/Qwen3-30B-A3B-Instruct-2507 \
-    --output /data/2wikimqa-2k.jsonl
-```
+Input and output lengths are ordinary workload parameters. `--min-prompt-tokens` and `--max-prompt-tokens` default to 1900 and 2048; they filter the original, fully rendered chat prompts without truncating their context. `--max-response-tokens` defaults to 64 and is passed to both VERL and every rollout request, where generation is truncated. The derived cache name includes the input range, source identity, and tokenizer identity. A later, separately authorized full-dataset comparison can therefore select a wider input interval and reuse the same raw source cache instead of manually preparing another dataset.
 
-Run the baseline and PrefixGrouper modes as separate processes and use distinct output directories. The same seed, sample order, model, resource shape, and workload arguments are required for a comparison:
+Run the baseline and PrefixGrouper modes as separate processes and use distinct output directories. Point both at one cache directory so the model and prepared dataset are downloaded only once. The same seed, sample order, model, resource shape, and workload arguments are required for a comparison:
 
 ```bash
 conda run -n agent --no-capture-output python scripts/benchmark_prefix_grouper_2wikimqa_e2e.py \
     --device gpu \
     --mode baseline \
-    --dataset-path /data/2wikimqa-2k.jsonl \
+    --model Qwen/Qwen3-8B \
+    --download-dir /shared/cache/pg-2wikimqa-e2e \
     --n-devices-per-node 4 \
     --output-dir /results/2wikimqa/gpu-baseline
 
 conda run -n agent --no-capture-output python scripts/benchmark_prefix_grouper_2wikimqa_e2e.py \
     --device gpu \
     --mode prefix_grouper \
-    --dataset-path /data/2wikimqa-2k.jsonl \
+    --model Qwen/Qwen3-8B \
+    --download-dir /shared/cache/pg-2wikimqa-e2e \
     --n-devices-per-node 4 \
     --output-dir /results/2wikimqa/gpu-prefix-grouper
 ```
 
-For Ascend, run the same two modes in the project's pinned NPU proot environment with the visible 910B device count:
+On a separate Ascend machine with usable devices and the pinned stack, run the same two modes and artifact options; only the device selector, device count, and output directories differ:
 
 ```bash
 python scripts/benchmark_prefix_grouper_2wikimqa_e2e.py \
     --device npu \
     --mode baseline \
-    --dataset-path /data/2wikimqa-2k.jsonl \
+    --model Qwen/Qwen3-8B \
+    --download-dir /shared/cache/pg-2wikimqa-e2e \
     --n-devices-per-node 8 \
     --output-dir /results/2wikimqa/npu-baseline
 
 python scripts/benchmark_prefix_grouper_2wikimqa_e2e.py \
     --device npu \
     --mode prefix_grouper \
-    --dataset-path /data/2wikimqa-2k.jsonl \
+    --model Qwen/Qwen3-8B \
+    --download-dir /shared/cache/pg-2wikimqa-e2e \
     --n-devices-per-node 8 \
     --output-dir /results/2wikimqa/npu-prefix-grouper
 ```
 
-The entrypoint rejects package-version drift before starting Ray and records the required CANN 9.0.0 version in `metrics.jsonl`; CANN and usable-device evidence must still be checked in the NPU environment. Use `--dry-run` with an explicit device count to validate the dataset, package matrix, and merged VERL configuration without starting the hardware workload. Registry membership and dry-run support do not authorize benchmark execution.
+`--local-files-only` applies uniformly to both model and dataset and rejects missing artifacts without network access. `--model` and `--dataset-path` may still point to existing local artifacts. The entrypoint records the original model ID, resolved local paths, and pinned dataset source in result schema 2. It rejects package-version drift before starting Ray and records the required CANN 9.0.0 version in `metrics.jsonl`; CANN and usable-device evidence must still be checked in the NPU environment. Use `--dry-run` with an explicit device count to validate the dataset, package matrix, and merged VERL configuration without starting the hardware workload. Registry membership and dry-run support do not authorize benchmark execution.
 
 After both modes finish, build the canonical comparison report from their raw artifacts:
 
@@ -133,23 +132,23 @@ The reporter first requires the model, dataset, seed, backend, device, software 
 
 Agent Lightning calls VERL's device auto-configuration before creating Ray resources. If `torch-npu` and a usable Ascend device are present it selects `trainer.device=npu`; otherwise it selects CUDA. `VERL_PLATFORM=huawei` or `VERL_PLATFORM=nvidia` remains available as an explicit override.
 
-When NPU is selected, a ModelScope model ID is automatically downloaded before Ray starts. The repository is stored below the directory where the command was launched and the VERL configuration is rewritten to an absolute local path. For example, launching with `actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct` creates `./Qwen--Qwen2.5-0.5B-Instruct/`. Existing local model directories are used directly. Explicit `hf_config_path`, `tokenizer_path`, and `lora_adapter_path` repositories are materialized in the same way.
+The formal 2WikiMQA benchmark resolves a ModelScope model ID before starting Ray, stores it below `<download-dir>/models`, and rewrites the VERL configuration to an absolute local path. Existing local model directories are used directly. The general Agent Lightning NPU entrypoint also materializes explicit `path`, `hf_config_path`, `tokenizer_path`, and `lora_adapter_path` repositories before Ray starts.
 
 The download path does not import or call `huggingface_hub`. It shallow-clones `https://www.modelscope.cn/<namespace>/<model>.git` with Git certificate verification disabled. Since Git LFS is not required on the host, LFS smudge is disabled; full-weight runs parse the checked-out LFS pointers and use `wget --no-check-certificate` against ModelScope's model-file API. Every downloaded large file must match the pointer's byte size and SHA-256 before replacing it. Agent Lightning neither installs nor updates SSL certificates. This mode encrypts traffic but cannot authenticate the remote server, so use it only on a trusted network.
 
-The Git/wget subprocesses use `AGENTLIGHTNING_NPU_MODEL_PROXY` when present; otherwise they select `HTTPS_PROXY`, `HTTP_PROXY`, or `ALL_PROXY` in that order. One authenticated proxy URL is generated for both commands. Proxy credentials can be supplied separately without writing them to the VERL configuration or logs:
+The Git/wget subprocesses use `AGENTLIGHTNING_MODEL_PROXY` when present; otherwise they select `HTTPS_PROXY`, `HTTP_PROXY`, or `ALL_PROXY` in that order. One authenticated proxy URL is generated for both commands. Proxy credentials can be supplied separately without writing them to the VERL configuration or logs:
 
 ```bash
-export AGENTLIGHTNING_NPU_MODEL_PROXY='http://proxy.example.com:8080'
-export AGENTLIGHTNING_NPU_MODEL_PROXY_USERNAME='USER'
-export AGENTLIGHTNING_NPU_MODEL_PROXY_PASSWORD='PASSWORD'
+export AGENTLIGHTNING_MODEL_PROXY='http://proxy.example.com:8080'
+export AGENTLIGHTNING_MODEL_PROXY_USERNAME='USER'
+export AGENTLIGHTNING_MODEL_PROXY_PASSWORD='PASSWORD'
 ```
 
 If `HTTPS_PROXY` already contains the correct proxy address, the first line can be omitted. Credentials embedded and percent-encoded in the proxy URL are also accepted. The proxy URL and credentials are read only by the model download client and are never printed. A 407 response means the supplied proxy credentials are missing, expired, or rejected; Agent Lightning cannot synthesize proxy credentials.
 
-`AGENTLIGHTNING_NPU_MODEL_BASE_URL` defaults to `https://www.modelscope.cn`. It may point to an internal ModelScope-compatible mirror only if that mirror exposes both `/<namespace>/<model>.git` and `/api/v1/models/<namespace>/<model>/repo`.
+`AGENTLIGHTNING_MODEL_BASE_URL` defaults to `https://www.modelscope.cn`. It may point to an internal ModelScope-compatible mirror only if that mirror exposes both `/<namespace>/<model>.git` and `/api/v1/models/<namespace>/<model>/repo`. The fixed 2WikiMQA source is one complete, SHA-256-pinned validation Parquet file; `AGENTLIGHTNING_DATASET_PARQUET_URL` may point to an internal mirror serving those exact bytes.
 
-Automatic NPU download is enabled by default. Set `agentlightning.npu_model_download.enabled=false` to require an existing local path, or set `agentlightning.npu_model_download.local_files_only=true` to require an already cloned and fully materialized Git model repository below the current command directory. On multi-node runs, launch from a shared filesystem path visible at the same absolute location on every node.
+For the formal benchmark, pass `--local-files-only` to require an already cloned and fully materialized model plus a prepared dataset cache, or a pinned source cache from which it can be prepared. For the general NPU entrypoint, set `agentlightning.npu_model_download.enabled=false` to require an existing local path, or set `agentlightning.npu_model_download.local_files_only=true` to require a completed cache. On multi-node runs, use a shared filesystem path visible at the same absolute location on every node.
 
 ### Profile an end-to-end Agent Lightning training step on Ascend
 
