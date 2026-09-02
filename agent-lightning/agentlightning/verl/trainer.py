@@ -225,41 +225,47 @@ class AgentLightningTrainer(RayPPOTrainer):
 
             # generate a batch
             with _timer("gen", timing_raw):
-                self.checkpoint_manager.update_weights(self.global_steps)
+                with _timer("weight_sync", timing_raw):
+                    self.checkpoint_manager.update_weights(self.global_steps)
                 if profile_rollout:
                     self.llm_server_manager.start_profile()
                 try:
-                    self.agent_mode_daemon.set_up_data_and_server(
-                        gen_batch.non_tensor_batch, self.llm_server_manager.get_addresses()
-                    )
-                    self.agent_mode_daemon.run_until_all_finished()
-                    batch, agent_metrics = self.agent_mode_daemon.get_train_data_batch(
-                        max_prompt_length=(
-                            self.config.agentlightning.trace_aggregator.trajectory_max_prompt_length
-                            if self.config.agentlightning.trace_aggregator.level.startswith("trajectory")
-                            else self.config.data.max_prompt_length
-                        ),
-                        max_response_length=(
-                            self.config.agentlightning.trace_aggregator.trajectory_max_response_length
-                            if self.config.agentlightning.trace_aggregator.level.startswith("trajectory")
-                            else self.config.data.max_response_length
-                        ),
-                        device=gen_batch.batch["fake_ids"].device,
-                        global_steps=self.global_steps,
-                    )
+                    with _timer("rollout_setup", timing_raw):
+                        self.agent_mode_daemon.set_up_data_and_server(
+                            gen_batch.non_tensor_batch, self.llm_server_manager.get_addresses()
+                        )
+                    with _timer("rollout_execution", timing_raw):
+                        self.agent_mode_daemon.run_until_all_finished()
+                    with _timer("trace_conversion", timing_raw):
+                        batch, agent_metrics = self.agent_mode_daemon.get_train_data_batch(
+                            max_prompt_length=(
+                                self.config.agentlightning.trace_aggregator.trajectory_max_prompt_length
+                                if self.config.agentlightning.trace_aggregator.level.startswith("trajectory")
+                                else self.config.data.max_prompt_length
+                            ),
+                            max_response_length=(
+                                self.config.agentlightning.trace_aggregator.trajectory_max_response_length
+                                if self.config.agentlightning.trace_aggregator.level.startswith("trajectory")
+                                else self.config.data.max_response_length
+                            ),
+                            device=gen_batch.batch["fake_ids"].device,
+                            global_steps=self.global_steps,
+                        )
                     metrics.update(agent_metrics)
-                    self.agent_mode_daemon.clear_data_and_server()
-                    self.checkpoint_manager.sleep_replicas()
+                    with _timer("rollout_cleanup", timing_raw):
+                        self.agent_mode_daemon.clear_data_and_server()
+                        self.checkpoint_manager.sleep_replicas()
                 finally:
                     if profile_rollout:
                         self.llm_server_manager.stop_profile()
 
             batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
-            if self.config.agentlightning.prefix_grouper.enabled:
-                from .prefix_grouper import reorder_by_prompt
+            with _timer("prompt_group_reorder", timing_raw):
+                if self.config.agentlightning.prefix_grouper.enabled:
+                    from .prefix_grouper import reorder_by_prompt
 
-                reorder_by_prompt(batch)
+                    reorder_by_prompt(batch)
 
             if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                 with _timer("gen_max", timing_raw):
@@ -355,39 +361,42 @@ class AgentLightningTrainer(RayPPOTrainer):
                     config=self.config.algorithm,
                 )
 
-            # Calculate the metrics before processing. Refer to the comments of function `compute_data_metrics` for details.
-            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic, suffix="_before_processing"))
+            with _timer("batch_postprocess", timing_raw):
+                # Calculate the metrics before processing. Refer to the comments of function `compute_data_metrics` for details.
+                metrics.update(
+                    compute_data_metrics(batch=batch, use_critic=self.use_critic, suffix="_before_processing")
+                )
 
-            # after advantages are assigned, we begin to drop (1) long prompt (2) floor to ppo minisize
-            keep_indices = (~batch.batch["is_drop_mask"]).nonzero(as_tuple=True)[0]
-            metrics["training/n_triplets_prompt_too_long"] = (
-                batch.batch["is_drop_mask"].shape[0] - keep_indices.shape[0]
-            )
-            batch = batch[keep_indices]
-            # next, round to minibatch size
-            mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-            n_transition = len(batch)
-            if self.config.agentlightning.prefix_grouper.enabled:
-                from .prefix_grouper import reorder_by_prompt
+                # after advantages are assigned, we begin to drop (1) long prompt (2) floor to ppo minisize
+                keep_indices = (~batch.batch["is_drop_mask"]).nonzero(as_tuple=True)[0]
+                metrics["training/n_triplets_prompt_too_long"] = (
+                    batch.batch["is_drop_mask"].shape[0] - keep_indices.shape[0]
+                )
+                batch = batch[keep_indices]
+                # next, round to minibatch size
+                mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                n_transition = len(batch)
+                if self.config.agentlightning.prefix_grouper.enabled:
+                    from .prefix_grouper import reorder_by_prompt
 
-                reorder_by_prompt(batch)
-            else:
-                random_indices = list(range(n_transition))
-                random.shuffle(random_indices)
-                batch.reorder(torch.tensor(random_indices).type(torch.int32))
-            n_remained_transition = n_transition // mini_batch_size * mini_batch_size
-            batch = batch[list(range(n_remained_transition))]
-            metrics["training/n_triplets_dropped_remainder"] = n_transition - n_remained_transition
+                    reorder_by_prompt(batch)
+                else:
+                    random_indices = list(range(n_transition))
+                    random.shuffle(random_indices)
+                    batch.reorder(torch.tensor(random_indices).type(torch.int32))
+                n_remained_transition = n_transition // mini_batch_size * mini_batch_size
+                batch = batch[list(range(n_remained_transition))]
+                metrics["training/n_triplets_dropped_remainder"] = n_transition - n_remained_transition
 
-            # Agent mode note: Change the order of balance batch;
-            #     1. first calculate advantage
-            #     2. then drop the samples (too long prompt & floor to ppo minisize)
-            #     3. balance
-            # balance the number of valid tokens on each dp rank.
-            # Note that this breaks the order of data inside the batch.
-            # Please take care when you implement group based adv computation such as GRPO and rloo
-            if self.config.trainer.balance_batch:
-                self._balance_batch(batch, metrics=metrics)
+                # Agent mode note: Change the order of balance batch;
+                #     1. first calculate advantage
+                #     2. then drop the samples (too long prompt & floor to ppo minisize)
+                #     3. balance
+                # balance the number of valid tokens on each dp rank.
+                # Note that this breaks the order of data inside the batch.
+                # Please take care when you implement group based adv computation such as GRPO and rloo
+                if self.config.trainer.balance_batch:
+                    self._balance_batch(batch, metrics=metrics)
 
             # update critic
             if self.use_critic:

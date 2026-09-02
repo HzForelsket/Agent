@@ -546,8 +546,12 @@ class AgentModeDaemon:
 
             # For training, each sample is rolled out multiple times
             # Data ID is different from Rollout ID, as one data can have multiple rollouts.
-            for _ in range(rollouts_per_sample):
-                task_metadata = {"data_id": data_id, "is_train": is_train}
+            for rollout_index in range(rollouts_per_sample):
+                task_metadata = {
+                    "data_id": data_id,
+                    "is_train": is_train,
+                    "rollout_index": rollout_index,
+                }
                 if self.mode == "v0":
                     # Queue immediately
                     rollout_id = await self.server.queue_task(

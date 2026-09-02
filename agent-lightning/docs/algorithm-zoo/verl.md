@@ -71,6 +71,66 @@ The optimization applies to the actor update and the old/reference-policy log-pr
 
 PrefixGrouper currently requires FSDP/FSDP2, `use_remove_padding=False`, fused kernels disabled, Ulysses sequence parallel size 1, and text-only batches. Unsupported multimodal, distillation-top-k, and sum-pi-squared batches fall back to the standard VERL forward.
 
+### Benchmark the full 2WikiMQA training loop
+
+The maintained end-to-end benchmark covers 2WikiMQA only. It runs Agent Lightning rollout generation, trace conversion, GRPO advantage computation, old/reference log-probability passes, and the actor update on either the pinned GPU or Ascend NPU stack. Prepare the fixed 1900–2048-token workload with the same local Qwen tokenizer used by training:
+
+```bash
+conda run -n agent --no-capture-output python scripts/prepare_prefix_grouper_2wikimqa.py \
+    --input /data/2wikimqa.json \
+    --tokenizer /models/Qwen3-30B-A3B-Instruct-2507 \
+    --output /data/2wikimqa-2k.jsonl
+```
+
+Run the baseline and PrefixGrouper modes as separate processes and use distinct output directories. The same seed, sample order, model, resource shape, and workload arguments are required for a comparison:
+
+```bash
+conda run -n agent --no-capture-output python scripts/benchmark_prefix_grouper_2wikimqa_e2e.py \
+    --device gpu \
+    --mode baseline \
+    --dataset-path /data/2wikimqa-2k.jsonl \
+    --n-devices-per-node 4 \
+    --output-dir /results/2wikimqa/gpu-baseline
+
+conda run -n agent --no-capture-output python scripts/benchmark_prefix_grouper_2wikimqa_e2e.py \
+    --device gpu \
+    --mode prefix_grouper \
+    --dataset-path /data/2wikimqa-2k.jsonl \
+    --n-devices-per-node 4 \
+    --output-dir /results/2wikimqa/gpu-prefix-grouper
+```
+
+For Ascend, run the same two modes in the project's pinned NPU proot environment with the visible 910B device count:
+
+```bash
+python scripts/benchmark_prefix_grouper_2wikimqa_e2e.py \
+    --device npu \
+    --mode baseline \
+    --dataset-path /data/2wikimqa-2k.jsonl \
+    --n-devices-per-node 8 \
+    --output-dir /results/2wikimqa/npu-baseline
+
+python scripts/benchmark_prefix_grouper_2wikimqa_e2e.py \
+    --device npu \
+    --mode prefix_grouper \
+    --dataset-path /data/2wikimqa-2k.jsonl \
+    --n-devices-per-node 8 \
+    --output-dir /results/2wikimqa/npu-prefix-grouper
+```
+
+The entrypoint rejects package-version drift before starting Ray and records the required CANN 9.0.0 version in `metrics.jsonl`; CANN and usable-device evidence must still be checked in the NPU environment. Use `--dry-run` with an explicit device count to validate the dataset, package matrix, and merged VERL configuration without starting the hardware workload. Registry membership and dry-run support do not authorize benchmark execution.
+
+After both modes finish, build the canonical comparison report from their raw artifacts:
+
+```bash
+conda run -n agent --no-capture-output python scripts/report_prefix_grouper_2wikimqa_e2e.py \
+    --baseline-dir /results/2wikimqa/gpu-baseline \
+    --prefix-grouper-dir /results/2wikimqa/gpu-prefix-grouper \
+    --output-dir /results/2wikimqa/gpu-report
+```
+
+The reporter first requires the model, dataset, seed, backend, device, software stack, batch shape, device count, tensor parallelism, and all other controlled workload fields to match. It then writes `report.json` and `report.md` with all-step and steady-state statistics. Steady state always excludes step 1 as warmup. Timings cover the whole step, the aggregate generation block, weight synchronization, rollout setup, agent execution, trace conversion, rollout cleanup, prompt-group reordering, old/reference log-probability, reward, advantage, batch post-processing, and actor update. The report includes count, mean, median, standard deviation, min, max, p90, and p95 for every common numeric step metric; the Markdown summary highlights phase timing, per-token timing, throughput, MFU, memory, F1, and exact match. It refuses mismatched or incomplete results instead of producing a speedup from incomparable runs.
+
 Agent Lightning calls VERL's device auto-configuration before creating Ray resources. If `torch-npu` and a usable Ascend device are present it selects `trainer.device=npu`; otherwise it selects CUDA. `VERL_PLATFORM=huawei` or `VERL_PLATFORM=nvidia` remains available as an explicit override.
 
 When NPU is selected, a ModelScope model ID is automatically downloaded before Ray starts. The repository is stored below the directory where the command was launched and the VERL configuration is rewritten to an absolute local path. For example, launching with `actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct` creates `./Qwen--Qwen2.5-0.5B-Instruct/`. Existing local model directories are used directly. Explicit `hf_config_path`, `tokenizer_path`, and `lora_adapter_path` repositories are materialized in the same way.
