@@ -24,6 +24,13 @@ class PatchedvLLMServer(_unwrap_ray_remote(vLLMHttpServer)):
         instrument_vllm()
         super().__init__(*args, **kwargs)
 
+    async def run_server(self, args):
+        """Expose the configured logical name instead of the local weight path."""
+        served_model_name = self.config.prometheus.served_model_name
+        if served_model_name:
+            args.served_model_name = [str(served_model_name)]
+        await super().run_server(args)
+
 
 def install_vllm_server_patch() -> None:
     """Make VERL 0.9 replicas use the instrumented HTTP server class.

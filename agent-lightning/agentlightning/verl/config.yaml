@@ -8,6 +8,9 @@ defaults:
 
 agentlightning:
   port: 9999
+  # Stable name exposed to agents and LiteLLM. When unset, the trainer keeps a
+  # remote model ID or derives a basename from an absolute local model path.
+  model_name: null
   npu_model_download:
     # NPU workers load absolute local paths, avoiding HTTPS in Ray child processes.
     enabled: true

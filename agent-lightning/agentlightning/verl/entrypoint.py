@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "configure_accelerator",
+    "configure_model_name",
     "invocation_directory",
     "main",
     "prepare_model_for_accelerator",
@@ -42,6 +43,25 @@ def configure_accelerator(config: Any) -> str:
 
     auto_set_device(config)
     return str(config.trainer.device)
+
+
+def configure_model_name(config: Any) -> str:
+    """Separate the stable API model name from the model weight location."""
+    model_path = str(config.actor_rollout_ref.model.path)
+    configured_name = config.agentlightning.get("model_name")
+    model_name = (
+        Path(model_path).name if configured_name is None and Path(model_path).is_absolute() else configured_name
+    )
+    if model_name is None:
+        model_name = model_path
+    model_name = str(model_name).strip()
+    if not model_name:
+        raise ValueError("agentlightning.model_name must not be empty.")
+    if Path(model_name).is_absolute():
+        raise ValueError("agentlightning.model_name must be a logical name, not an absolute path.")
+    config.agentlightning.model_name = model_name
+    config.actor_rollout_ref.rollout.prometheus.served_model_name = model_name
+    return model_name
 
 
 def invocation_directory() -> Path:
@@ -102,6 +122,7 @@ def run_ppo(
     trainer_cls: Type[AgentLightningTrainer],
     daemon_cls: Type[AgentModeDaemon],
 ) -> None:
+    configure_model_name(config)
     backend = configure_accelerator(config)
     prepare_model_for_accelerator(config, backend)
     if not ray.is_initialized():

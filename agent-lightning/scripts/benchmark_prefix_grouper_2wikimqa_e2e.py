@@ -35,7 +35,7 @@ from prepare_prefix_grouper_2wikimqa import dataset_source, download_source_rows
 from prefix_grouper_stack import NPU_CANN_VERSION, REQUIRED_STACKS
 
 BENCHMARK_ID = "pg-2wikimqa-e2e"
-RESULT_SCHEMA_VERSION = 2
+RESULT_SCHEMA_VERSION = 3
 DATASET_NAME = "2WikiMQA"
 DEFAULT_MODEL = "Qwen/Qwen3-8B"
 DEFAULT_DOWNLOAD_DIR = Path(".cache/pg-2wikimqa-e2e")
@@ -280,6 +280,7 @@ def build_config(
     total_epochs = math.ceil(args.steps / steps_per_epoch)
     config: dict[str, Any] = {
         "algorithm": {"adv_estimator": "grpo", "use_kl_in_reward": False},
+        "agentlightning": {"model_name": args.model_name},
         "data": {
             "train_batch_size": args.train_batch_size,
             "max_prompt_length": args.max_prompt_tokens,
@@ -298,6 +299,7 @@ def build_config(
                 "multi_turn": {"enable": False, "format": "hermes"},
                 "gpu_memory_utilization": 0.35,
                 "max_model_len": args.max_prompt_tokens + args.max_response_tokens,
+                "prometheus": {"served_model_name": args.model_name},
             },
             "actor": {
                 "strategy": "fsdp",
@@ -374,6 +376,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("baseline", "prefix_grouper"), required=True)
     parser.add_argument("--device", choices=("auto", "gpu", "cuda", "npu"), default="auto")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Pretrained model ID or local model directory.")
+    parser.add_argument(
+        "--model-name",
+        help="Stable logical model name exposed to LiteLLM; defaults to the model ID or local directory name.",
+    )
     parser.add_argument(
         "--dataset-path",
         type=Path,
@@ -469,6 +475,13 @@ def materialize_workload(args: argparse.Namespace) -> None:
     )
     args.model_ref = model_ref
     args.model = model_result.local_path
+    if args.model_name is None:
+        args.model_name = Path(model_result.local_path).name if model_result.source == "existing-local" else model_ref
+    args.model_name = str(args.model_name).strip()
+    if not args.model_name:
+        raise ValueError("--model-name must not be empty.")
+    if Path(args.model_name).is_absolute():
+        raise ValueError("--model-name must be a logical name, not an absolute path.")
 
     if args.dataset_path is None:
         source_identity = dataset_source()
@@ -508,6 +521,7 @@ def materialize_workload(args: argparse.Namespace) -> None:
         + json.dumps(
             {
                 "model_ref": args.model_ref,
+                "model_name": args.model_name,
                 "model_path": args.model,
                 "model_source": model_result.source,
                 "dataset_path": str(args.dataset_path),
@@ -567,7 +581,8 @@ def run_benchmark(
         "n_runners": args.n_runners,
         "seed": args.seed,
         "model_ref": args.model_ref,
-        "model": args.model,
+        "model_name": args.model_name,
+        "model_path": args.model,
         "dataset_source": args.dataset_source,
         "dataset_path": str(args.dataset_path.resolve()),
         "stack": stack,

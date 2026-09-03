@@ -455,12 +455,12 @@ class AgentLightningTrainer(RayPPOTrainer):
         assert self.async_rollout_mode, "If agent mode is enabled, async server must be enabled"
         if self.adapter is not None and not isinstance(self.adapter, TraceToTripletBase):
             raise ValueError("Adapter must be a TraceToTripletBase for currently VERL implementation.")
-        model = self.config.actor_rollout_ref.model.path
+        model_name = str(self.config.agentlightning.model_name)
         self.agent_mode_daemon = self.daemon_cls(
             self.config.agentlightning.port,
             self.config.actor_rollout_ref.rollout.n,
             train_information={
-                "model": model,
+                "model_name": model_name,
                 "temperature": self.config.actor_rollout_ref.rollout.temperature,
             },
             tokenizer=self.tokenizer,

@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 BENCHMARK_ID = "pg-2wikimqa-e2e"
-RESULT_SCHEMA_VERSION = 2
+RESULT_SCHEMA_VERSION = 3
 Direction = Literal["higher", "lower", "neutral"]
 Record = dict[str, Any]
 
@@ -76,7 +76,8 @@ COMPARABLE_RUN_FIELDS = (
     "n_runners",
     "seed",
     "model_ref",
-    "model",
+    "model_name",
+    "model_path",
     "dataset_source",
     "dataset_path",
     "stack",
@@ -513,7 +514,7 @@ def render_markdown(report: Record) -> str:
         "",
         f"- Benchmark ID：`{BENCHMARK_ID}`",
         f"- 后端：`{invariants['backend']}`；设备：`{invariants['device_name']}`",
-        f"- 模型：`{invariants['model_ref']}`（本地：`{invariants['model']}`）",
+        f"- 模型：`{invariants['model_name']}`（来源：`{invariants['model_ref']}`；本地：`{invariants['model_path']}`）",
         f"- 数据：`{invariants['dataset']}`，{invariants['dataset_rows']} rows",
         f"- 输入：原始 prompt 过滤 {invariants['min_prompt_tokens']}–{invariants['max_prompt_tokens']} tokens；"
         f"输出最多 {invariants['max_response_tokens']} tokens",

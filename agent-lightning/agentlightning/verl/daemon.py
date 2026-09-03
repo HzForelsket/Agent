@@ -263,6 +263,7 @@ class AgentModeDaemon:
         # Training and Data Configuration
         self.train_rollout_n = train_rollout_n
         self.train_information = train_information
+        self.model_name = str(train_information["model_name"])
         self.mini_batch_size = mini_batch_size
         self.pad_token_id = pad_token_id
         self.tokenizer = tokenizer
@@ -451,16 +452,13 @@ class AgentModeDaemon:
         print(f"Proxy server running on port {self.proxy_port}")
 
     async def _update_proxy_server_v1(self):
-        model_name = self.train_information.get("model")
-        if not model_name:
-            raise ValueError("Model name is not set.")
         self.llm_proxy.update_model_list(
             [
                 ModelConfig(
                     {
-                        "model_name": model_name,
+                        "model_name": self.model_name,
                         "litellm_params": {
-                            "model": "hosted_vllm/" + model_name,
+                            "model": "hosted_vllm/" + self.model_name,
                             "api_base": f"http://{address}/v1/",
                         },
                     }
@@ -510,7 +508,7 @@ class AgentModeDaemon:
         if self.mode == "v0":
             llm_resource = LLM(
                 endpoint=f"http://127.0.0.1:{self.proxy_port}/v1",
-                model=self.train_information.get("model", "default-model"),
+                model=self.model_name,
                 sampling_parameters={
                     "temperature": self.train_information.get("temperature", 0.7 if is_train else 0.0)
                 },
