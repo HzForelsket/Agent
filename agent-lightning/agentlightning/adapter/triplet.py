@@ -884,6 +884,16 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
                 return v
         return v
 
+    def _coerce_token_ids(self, value: Any) -> List[int]:
+        """Normalize serialized or OpenTelemetry token-id sequences."""
+        value = self._literal_eval_maybe(value)
+        if not isinstance(value, (list, tuple)):
+            return []
+        token_ids = cast(Sequence[Any], value)
+        if not all(type(token_id) is int for token_id in token_ids):
+            return []
+        return [cast(int, token_id) for token_id in token_ids]
+
     def _extract_tokens_from_raw(self, attrs: Dict[str, Any]) -> Tuple[List[int], List[int]]:
         """Extract token ids from raw_gen_ai_request attributes.
 
@@ -895,42 +905,30 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
         resp_ids: List[int] = []
 
         # prompt
-        p = attrs.get("llm.hosted_vllm.prompt_token_ids")
-        p = self._literal_eval_maybe(p)
-        if isinstance(p, list) and all(isinstance(x, int) for x in p):  # type: ignore
-            prompt_ids = cast(List[int], p)
+        prompt_ids = self._coerce_token_ids(attrs.get("llm.hosted_vllm.prompt_token_ids"))
 
         # response preferred path
         r = attrs.get("llm.hosted_vllm.response_token_ids")
         r = self._literal_eval_maybe(r)
-        if isinstance(r, list) and len(r) > 0 and isinstance(r[0], list):  # type: ignore
-            first = cast(List[Any], r[0])
-            if all(isinstance(x, int) for x in first):
-                resp_ids = cast(List[int], first)
+        if isinstance(r, (list, tuple)) and r:
+            resp_ids = self._coerce_token_ids(cast(Sequence[Any], r)[0])
 
         # fallback via choices
         if not resp_ids:
             choices = attrs.get("llm.hosted_vllm.choices")
             choices = self._literal_eval_maybe(choices)
-            if isinstance(choices, list) and choices:
-                cand = cast(Any, choices[0])
+            if isinstance(choices, (list, tuple)) and choices:
+                cand = cast(Sequence[Any], choices)[0]
                 if isinstance(cand, dict):
                     tids = cast(Dict[str, Any], cand).get("token_ids")
-                    if isinstance(tids, list) and all(isinstance(x, int) for x in tids):  # type: ignore
-                        resp_ids = cast(List[int], tids)
+                    resp_ids = self._coerce_token_ids(tids)
 
         return prompt_ids, resp_ids
 
     def _extract_tokens_from_openai(self, attrs: Dict[str, Any]) -> Tuple[List[int], List[int]]:
-        prompt_ids = cast(Any, attrs.get("prompt_token_ids") or [])
-        resp_ids = cast(Any, attrs.get("response_token_ids") or [])
-        prompt_ids = self._literal_eval_maybe(prompt_ids)
-        resp_ids = self._literal_eval_maybe(resp_ids)
-        if not (isinstance(prompt_ids, list) and all(isinstance(x, int) for x in prompt_ids)):  # type: ignore
-            prompt_ids = []
-        if not (isinstance(resp_ids, list) and all(isinstance(x, int) for x in resp_ids)):  # type: ignore
-            resp_ids = []
-        return cast(List[int], prompt_ids), cast(List[int], resp_ids)
+        prompt_ids = self._coerce_token_ids(attrs.get("prompt_token_ids"))
+        resp_ids = self._coerce_token_ids(attrs.get("response_token_ids"))
+        return prompt_ids, resp_ids
 
     def _maybe_reward_value(self, span: Span) -> Optional[float]:
         """Parse reward from typical AgentOps payloads or explicit reward spans."""

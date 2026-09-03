@@ -1026,6 +1026,14 @@ class AgentModeDaemon:
             raise ValueError(f"Unknown trace_aggregator level: {self.trace_aggregator.get('level')}")
 
         n_transition = len(input_ids_list)
+        if n_transition == 0:
+            raise RuntimeError(
+                "No trainable transitions were produced from "
+                f"{len(self._completed_rollouts_v0)} completed rollouts; "
+                f"{len(finished_id_to_sample_info)} rollouts contained token-bearing triplets. "
+                "Check that the LLM response exposes non-empty prompt_token_ids and response token_ids "
+                "and that LiteLLM exported those fields to the rollout trace."
+            )
         batch_input_ids = torch.LongTensor(input_ids_list).to(device)
         input_attention_mask = torch.LongTensor(input_attention_mask_list).to(device)
         batch_response_ids = torch.LongTensor(response_ids_list).to(device)

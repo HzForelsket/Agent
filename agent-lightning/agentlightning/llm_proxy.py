@@ -515,6 +515,57 @@ class LightningOpenTelemetry(OpenTelemetry):
 
         super().__init__(config=config)  # pyright: ignore[reportUnknownMemberType]
 
+    @staticmethod
+    def _mapping_value(value: Any, key: str) -> Any:
+        """Read a response field from either a mapping or a model object."""
+        if isinstance(value, dict):
+            return cast(Dict[str, Any], value).get(key)
+        getter: Any = getattr(value, "get", None)
+        if callable(getter):
+            return cast(Any, getter(key))
+        return cast(Any, getattr(value, key, None))
+
+    @staticmethod
+    def _token_ids(value: Any) -> Optional[List[int]]:
+        """Normalize one non-empty JSON token-id array."""
+        if not isinstance(value, (list, tuple)) or not value:
+            return None
+        token_ids = cast(Sequence[Any], value)
+        if not all(type(token_id) is int for token_id in token_ids):
+            return None
+        return [cast(int, token_id) for token_id in token_ids]
+
+    @classmethod
+    def _response_token_ids(cls, response_obj: Any) -> Tuple[Optional[List[int]], Optional[List[int]]]:
+        """Extract vLLM token IDs from LiteLLM's current response shapes."""
+        if response_obj is None:
+            return None, None
+
+        prompt_ids = cls._token_ids(cls._mapping_value(response_obj, "prompt_token_ids"))
+        response_ids_value = cls._mapping_value(response_obj, "response_token_ids")
+        response_ids = cls._token_ids(response_ids_value)
+        if response_ids is None and isinstance(response_ids_value, (list, tuple)) and response_ids_value:
+            response_ids = cls._token_ids(response_ids_value[0])
+
+        choices = cls._mapping_value(response_obj, "choices")
+        if response_ids is None and isinstance(choices, (list, tuple)) and choices:
+            first_choice: Any = cast(Sequence[Any], choices)[0]
+            response_ids = cls._token_ids(cls._mapping_value(first_choice, "token_ids"))
+            if response_ids is None:
+                provider_fields = cls._mapping_value(first_choice, "provider_specific_fields")
+                response_ids = cls._token_ids(cls._mapping_value(provider_fields, "token_ids"))
+
+        return prompt_ids, response_ids
+
+    def set_attributes(self, span: Any, kwargs: Any, response_obj: Optional[Any]) -> None:
+        """Add normalized token IDs to LiteLLM's primary request span."""
+        super().set_attributes(span, kwargs, response_obj)  # pyright: ignore[reportUnknownMemberType]
+        prompt_ids, response_ids = self._response_token_ids(response_obj)
+        if prompt_ids is not None:
+            span.set_attribute("prompt_token_ids", prompt_ids)
+        if response_ids is not None:
+            span.set_attribute("response_token_ids", response_ids)
+
     async def async_pre_call_deployment_hook(
         self, kwargs: Dict[str, Any], call_type: Optional[CallTypes] = None
     ) -> Optional[Dict[str, Any]]:
