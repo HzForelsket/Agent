@@ -137,6 +137,68 @@ def _rollout_seed(task: dict[str, Any], rollout: agl.Rollout) -> tuple[int, int]
     return request_seed, rollout_index
 
 
+def _token_ids(value: Any) -> list[int]:
+    """Return one non-empty token-id sequence from a JSON response field."""
+    if not isinstance(value, list) or not value:
+        return []
+    if not all(type(token_id) is int for token_id in value):
+        return []
+    return cast(list[int], value)
+
+
+def _response_token_ids(payload: dict[str, Any]) -> tuple[list[int], list[int]]:
+    """Normalize token IDs returned by vLLM through supported LiteLLM shapes."""
+    prompt_ids = _token_ids(payload.get("prompt_token_ids"))
+    response_ids_value = payload.get("response_token_ids")
+    response_ids = _token_ids(response_ids_value)
+    if not response_ids and isinstance(response_ids_value, list) and response_ids_value:
+        response_ids = _token_ids(response_ids_value[0])
+
+    choices = payload.get("choices")
+    if not response_ids and isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        choice = cast(dict[str, Any], choices[0])
+        response_ids = _token_ids(choice.get("token_ids"))
+        provider_fields = choice.get("provider_specific_fields")
+        if not response_ids and isinstance(provider_fields, dict):
+            response_ids = _token_ids(cast(dict[str, Any], provider_fields).get("token_ids"))
+    return prompt_ids, response_ids
+
+
+def _record_training_tokens(payload: dict[str, Any], model: str) -> None:
+    """Record the exact serving token IDs in the rollout's own trace."""
+    prompt_ids, response_ids = _response_token_ids(payload)
+    if not prompt_ids or not response_ids:
+        choices = payload.get("choices")
+        choice_keys: list[str] = []
+        provider_keys: list[str] = []
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            choice = cast(dict[str, Any], choices[0])
+            choice_keys = sorted(choice)
+            provider_fields = choice.get("provider_specific_fields")
+            if isinstance(provider_fields, dict):
+                provider_keys = sorted(provider_fields)
+        raise RuntimeError(
+            "The serving response did not expose non-empty training token IDs despite "
+            "return_token_ids=true: "
+            f"prompt_token_ids={len(prompt_ids)}, response_token_ids={len(response_ids)}, "
+            f"response_keys={sorted(payload)}, choice_keys={choice_keys}, "
+            f"provider_specific_fields_keys={provider_keys}."
+        )
+
+    tracer = agl.get_active_tracer()
+    if tracer is None:
+        raise RuntimeError("No active Agent Lightning tracer is available for the rollout.")
+    attributes: dict[str, Any] = {
+        "gen_ai.request.model": model,
+        "prompt_token_ids": prompt_ids,
+        "response_token_ids": response_ids,
+    }
+    response_id = payload.get("id")
+    if isinstance(response_id, str) and response_id:
+        attributes["gen_ai.response.id"] = response_id
+    tracer.create_span("litellm_request", attributes=attributes)
+
+
 @agl.rollout
 async def wiki_agent(task: dict[str, Any], llm: agl.LLM, rollout: agl.Rollout) -> float:
     """Answer one 2WikiMQA question and return token-overlap F1 as reward."""
@@ -160,6 +222,7 @@ async def wiki_agent(task: dict[str, Any], llm: agl.LLM, rollout: agl.Rollout) -
         response.raise_for_status()
         payload = response.json()
 
+    _record_training_tokens(payload, llm.model)
     message = payload["choices"][0]["message"]
     text = str(message.get("content") or message.get("reasoning_content") or "").strip()
     answers = [str(answer) for answer in task["answers"]]

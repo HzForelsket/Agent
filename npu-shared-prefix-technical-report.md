@@ -6,7 +6,7 @@
 
 ## 1. 核心设计
 
-当前方案在 Agent Lightning + VERL 的 Actor/Reference FSDP 前向中接入 PrefixGrouper。同一 prompt 的多条 response 从：
+当前方案在 Agent Lightning + VERL 的 Actor/Reference FSDP 前向与反向中接入 PrefixGrouper。同一 prompt 的多条 response 从：
 
 ```text
 [P, R1] [P, R2] [P, R3] [P, R4]
@@ -18,7 +18,7 @@
 [P, R1, R2, R3, R4]
 ```
 
-模型层间只保留一份 prefix hidden state。Attention 拆成一次 prefix attention 和多条 suffix attention；位置编码与 mask 保证每条 response 的逻辑语义仍等价于独立执行 `[P, Ri]`。输出最终恢复为 VERL 原格式，继续使用原 loss 和 FSDP backward。
+前向时，模型层间只保留一份 prefix hidden state 和一份 prefix 计算图。每层使用一次批量 prefix attention 和一次批量 suffix attention；后者将 micro-batch 中的所有 response 一次送入 NPU。位置编码与 mask 保证各 response 的逻辑语义仍等价于独立执行 `[P, Ri]`。反向时，各 response 对 prefix 的梯度先求和，再通过这同一份 prefix 计算图回传，因此 prefix 的反向计算同样只执行一份。
 
 ## 2. 接入链路
 
@@ -30,7 +30,7 @@ flowchart TD
     D --> E[构造 grouped input 和 position_ids]
     E --> F[每层拆分 prefix/suffix QKV]
     F --> G[prefix NPU attention]
-    F --> H[suffix NPU attention]
+    F --> H[全部 response 的批量 suffix NPU attention]
     G --> I[合并 grouped hidden state]
     H --> I
     I --> J[恢复逐 response 输出]
@@ -88,6 +88,8 @@ Os = Attention(Qs, repeat(Kp)+Ks, repeat(Vp)+Vs)
 group(Op, Os) -> grouped hidden state
 ```
 
+这里 `Qp/Kp/Vp` 的 batch 维是唯一 prompt 数，`Qs/Ks/Vs` 的 batch 维是 response 总数。`Os` 来自一次批量 NPU 算子调用，不是逐条 response 循环调用。
+
 其中：
 
 - prefix token 只能看到自身及之前的 prefix token；
@@ -131,7 +133,7 @@ Q/K/V 拆分使用 NPU 线性索引路径：BHSD 转为连续 BSHD，展平 batc
 
 之后依次完成 completion token 对齐、log-prob/entropy 计算、`inverse_order` 原顺序恢复和 VERL jagged nested tensor 转换，再进入原 loss function。
 
-梯度由 NPU fusion attention、Group/Ungroup autograd 和 `repeat_interleave` 共同回传，多条 response 对共享 prefix 的梯度自动累加：
+反向同样按 batch 执行：一次 suffix fusion-attention backward 同时得到全部 response 的梯度。各 response 是逻辑上独立的梯度分支，不是逐条发起 backward。随后 `repeat_interleave` backward 将它们对 prefix K/V 的梯度求和，Group/Ungroup autograd 再写回唯一的 grouped prefix：
 
 ```text
 dL/dP = dL_R1/dP + dL_R2/dP + ... + dL_RG/dP
