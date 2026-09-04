@@ -125,7 +125,11 @@ class ClientServerExecutionStrategy(ExecutionStrategy):
         self.allowed_exit_codes = tuple(allowed_exit_codes)
 
     async def _execute_algorithm(
-        self, algorithm: AlgorithmBundle, store: LightningStore, stop_evt: ExecutionEvent
+        self,
+        algorithm: AlgorithmBundle,
+        store: LightningStore,
+        stop_evt: ExecutionEvent,
+        before_store_stop: Callable[[], None] | None = None,
     ) -> None:
         wrapper_store: LightningStore | None = None
         if self.managed_store:
@@ -156,13 +160,17 @@ class ClientServerExecutionStrategy(ExecutionStrategy):
             stop_evt.set()
             raise
         finally:
-            if self.managed_store and isinstance(wrapper_store, LightningStoreServer) and server_started:
-                try:
-                    await wrapper_store.stop()
-                except Exception:
-                    logger.exception("Error stopping LightningStore server")
-                else:
-                    logger.debug("LightningStore server shutdown completed")
+            try:
+                if before_store_stop is not None:
+                    before_store_stop()
+            finally:
+                if self.managed_store and isinstance(wrapper_store, LightningStoreServer) and server_started:
+                    try:
+                        await wrapper_store.stop()
+                    except Exception:
+                        logger.exception("Error stopping LightningStore server")
+                    else:
+                        logger.debug("LightningStore server shutdown completed")
 
     async def _execute_runner(
         self,
@@ -391,13 +399,22 @@ class ClientServerExecutionStrategy(ExecutionStrategy):
                 if self.main_process == "algorithm":
                     logger.info("Spawning runner processes...")
                     processes = self._spawn_runners(runner, store, stop_evt, ctx=ctx)
-                    try:
-                        logger.info("Running algorithm...")
-                        asyncio.run(self._execute_algorithm(algorithm, store, stop_evt))
-                    finally:
-                        # Always request the runner side to unwind once the
-                        # algorithm/server portion finishes (successfully or not).
+
+                    def stop_runners_before_store() -> None:
+                        # Keep the managed Store alive while runners finish their
+                        # current request, heartbeat, and client teardown.
                         stop_evt.set()
+                        self._shutdown_processes(processes, stop_evt)
+
+                    logger.info("Running algorithm...")
+                    asyncio.run(
+                        self._execute_algorithm(
+                            algorithm,
+                            store,
+                            stop_evt,
+                            before_store_stop=stop_runners_before_store,
+                        )
+                    )
                 else:  # main_process == "runner"
                     if self.n_runners > 1:
                         raise ValueError("main_process='runner' requires n_runners to be 1")
