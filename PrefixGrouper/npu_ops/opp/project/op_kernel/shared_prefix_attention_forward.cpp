@@ -48,15 +48,12 @@ public:
 
     __aicore__ inline void Process()
     {
-        if (GetBlockIdx() != 0) {
-            return;
-        }
         const uint32_t taskCount = totalTokens_ * qHeads_;
         const uint32_t lseBlocks =
             (taskCount + kSharedPrefixLseBlockElements - 1) / kSharedPrefixLseBlockElements;
         LocalTensor<float> lseLocal = lseBuf_.Get<float>();
-        // Keep the existing LSE DMA path; this branch changes only task scheduling.
-        for (uint32_t block = 0; block < lseBlocks; ++block) {
+        // One core owns each 64-byte LSE block; GM scalar stores can lose neighboring writes.
+        for (uint32_t block = GetBlockIdx(); block < lseBlocks; block += GetBlockNum()) {
             const uint32_t firstTask = block * kSharedPrefixLseBlockElements;
             const uint32_t remaining = taskCount - firstTask;
             const uint32_t count = remaining < kSharedPrefixLseBlockElements

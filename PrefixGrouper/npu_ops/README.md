@@ -10,11 +10,12 @@ the shared prefix and its own causal suffix range. The backward kernel writes
 each compact K/V gradient once and accumulates all response contributions to a
 shared prefix.
 
-This branch isolates backward multi-core execution. Forward remains at
-`blockDim=1`, with only block 0 processing its rows serially. Backward restores
-the original round-robin task assignment with up to 20 blocks. The arithmetic
-and LSE DMA path are unchanged. The single numerical test now uses the original
-smallest failing random case. This is not a performance implementation.
+This branch restores forward multi-core execution while keeping backward and
+the single numerical test unchanged. Forward assigns 64-byte LSE blocks
+round-robin across up to 20 blocks. Backward retains its original round-robin
+task assignment with up to 20 blocks. Arithmetic and the LSE DMA path are
+unchanged. The test uses the original smallest failing random case and reports
+LSE differences explicitly. This is not a performance implementation.
 
 ## Native NPU build
 
@@ -127,8 +128,9 @@ It does not run benchmarks or profiler collection automatically.
 
 The entrypoint selects exactly one numerical case, the original smallest
 failing random case: 65 tokens, `Hq=Hkv=2`, head dimension 128,
-`prefix_lens=(1,)`, `suffix_lens=(1,63)`, `group_sizes=(2,)`. Forward uses one
-block and backward uses 20 blocks to process 130 dQ rows and 130 dK/dV row pairs.
+`prefix_lens=(1,)`, `suffix_lens=(1,63)`, `group_sizes=(2,)`. Forward uses nine
+blocks for 130 output/LSE rows: eight blocks handle 16 rows each, and the last
+handles two. Backward uses 20 blocks to process 130 dQ rows and 130 dK/dV row pairs.
 
 The test preserves the original CPU RNG sequence: `torch.manual_seed(1234)`,
 then FP32 `randn` for Q, K and V in that order, each cast to BF16, followed by
@@ -146,4 +148,4 @@ its actual and expected values.
 The original random-case thresholds are retained: cosine >= 0.999 for output
 and gradients, output max absolute error <= 0.05, gradient max absolute error
 <= 0.1. LSE uses `rtol=1e-5, atol=1e-6`. No eight-case matrix or benchmark is run.
-A passing case does not validate other shapes or multi-core forward execution.
+A passing case does not establish correctness for other inputs or shapes.
