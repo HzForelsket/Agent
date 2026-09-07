@@ -115,6 +115,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--power-interval", type=float, default=0.1, help="功耗采样间隔（秒）")
     parser.add_argument("--power-idle-samples", type=int, default=3, help="每个模型加载后的空闲功耗采样数")
     parser.add_argument("--npu-chip-id", type=int, default=0, help="npu-smi 功耗查询使用的 chip id")
+    parser.add_argument("--npu-attention-backend", choices=("fusion", "custom"), default="fusion")
     parser.add_argument(
         "--profile",
         action=argparse.BooleanOptionalAction,
@@ -560,6 +561,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     platform_config = OmegaConf.create({"trainer": {"device": accelerator.device_type}})
     device_name = configure_accelerator(platform_config)
+    if args.npu_attention_backend == "custom" and accelerator.backend != "npu":
+        raise ValueError("--npu-attention-backend custom requires --device npu.")
     n_devices_per_node = args.n_devices_per_node or int(accelerator.module.device_count())
     if n_devices_per_node > int(accelerator.module.device_count()) and args.nnodes == 1:
         raise ValueError(f"请求 {n_devices_per_node} 个设备，但当前节点只发现 {accelerator.module.device_count()} 个。")
@@ -576,6 +579,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "batch_size_per_rank": args.batch_size_per_rank,
         "response_length": args.response_length,
         "dtype": args.dtype,
+        "npu_attention_backend": args.npu_attention_backend,
         "strategy": args.strategy,
         "nnodes": args.nnodes,
         "n_devices_per_node": n_devices_per_node,
@@ -614,6 +618,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "world_size": world_size,
         },
         "required_cann": NPU_CANN_VERSION if accelerator.backend == "npu" else None,
+        "npu_attention_backend": args.npu_attention_backend if accelerator.backend == "npu" else None,
         "dtype": args.dtype,
         "weights": "pretrained",
         "model_download_root": str(model_download_root) if model_download_root is not None else None,

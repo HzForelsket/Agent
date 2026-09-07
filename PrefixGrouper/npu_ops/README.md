@@ -151,9 +151,68 @@ expected values. The analytical CPU reference check verifies uniform attention,
 LSE and shared-prefix gradient accumulation; it is not NPU execution evidence.
 
 The integration case covers composition with PyTorch autograd, not a model
-training step. Agent Lightning/VERL currently calls `npu_fusion_attention` and
-does not route through this package, so its model benchmarks cannot establish
-this custom operator's integration correctness or performance.
+training step. Agent Lightning/VERL can select this package explicitly as
+described below; its model-level correctness still requires a separate run on
+real NPU hardware.
+
+## Optional Agent Lightning / VERL Backend
+
+For VERL 0.9.0 and Transformers 5.5.4, configure the model attention backend:
+
+```yaml
+agentlightning:
+  prefix_grouper:
+    enabled: true
+actor_rollout_ref:
+  model:
+    use_remove_padding: false
+    use_fused_kernels: false
+    override_config:
+      attn_implementation: sdpa
+      prefix_grouper_npu_backend: custom
+```
+
+`prefix_grouper_npu_backend` accepts `fusion` (the default) or `custom`.
+`fusion` keeps the existing duplicated-prefix BNSD `npu_fusion_attention` path.
+`custom` packs valid grouped tokens into TND before any prefix duplication or
+GQA head expansion, calls this package once per attention layer, and restores
+the padded model layout. Packing/restoration remain in the autograd graph;
+padding gradients cannot reach the compact tokens. Actor and reference workers
+receive the same model setting. Calls without a PrefixGrouper still use the
+original attention implementation, including rollout and ungrouped batches.
+
+Custom mode requires BF16, head_dim=128, positive prefix/suffix lengths,
+Hq divisible by Hkv, zero attention dropout, and full causal attention without
+sliding windows, softcap or KV-cache decoding. Unsupported custom calls fail;
+there is no automatic fallback to fusion. Use FSDP/FSDP2 with Ulysses size 1.
+
+Install the architecture-native operator wheel in every worker environment,
+then source `scripts/activate.sh` before starting the Ray processes. Fusion mode
+does not require the operator package. Neither mode changes the global attention
+backend of a separate baseline process.
+
+Both existing model benchmark entrypoints accept an explicit comparison flag:
+
+- `agent-lightning/scripts/benchmark_prefix_grouper.py` (`pg-verl-ppa`):
+  `--device npu --npu-attention-backend custom` or `--npu-attention-backend fusion`.
+- `agent-lightning/scripts/benchmark_prefix_grouper_2wikimqa_e2e.py`
+  (`pg-2wikimqa-e2e`): `--device npu --mode prefix_grouper --npu-attention-backend custom`.
+  A separate `--mode baseline` process must not select `custom`; its config does
+  not enable PrefixGrouper or inject the backend override.
+
+The selected backend is recorded in result metadata. Keep all other workload
+and environment settings identical when comparing fusion/custom. These flags
+do not authorize a model benchmark run on this device-free development machine.
+
+### PyTorch JIT Deprecation
+
+With the pinned torch/torch-npu 2.10.0 stack, importing `torch_npu` can load
+Inductor, then `torch.fx.experimental.optimization`, then `torch.utils.mkldnn`.
+The latter uses `torch.jit.script_method` and emits its deprecation warning.
+This happens before the custom operator is loaded and is not an operator
+correctness failure. No project code uses `script_method`; the warning does
+not require replacing this package's autograd function with `torch.compile`.
+Do not change the pinned dependencies or globally suppress warnings to hide it.
 
 ## Small Native Performance Run
 

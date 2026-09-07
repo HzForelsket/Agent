@@ -127,6 +127,57 @@ def _repeat_kv(hidden_states: torch.Tensor, query_heads: int) -> torch.Tensor:
     return hidden_states.repeat_interleave(query_heads // key_value_heads, dim=1)
 
 
+def _npu_compact_attention(
+    prefix_grouper: PrefixGrouper,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    dropout: float,
+    scaling: float | None,
+) -> torch.Tensor:
+    """Run one compact TND call and restore the model's padded BSHD layout."""
+    if query.device.type != "npu":
+        raise ValueError("prefix_grouper_npu_backend=custom requires NPU tensors.")
+    if dropout != 0.0:
+        raise ValueError("The custom shared-prefix NPU operator requires attention dropout=0.")
+    for name, tensor in (("query", query), ("key", key), ("value", value)):
+        if tensor.ndim != 4 or tensor.dtype != torch.bfloat16 or tensor.shape[-1] != 128:
+            raise ValueError(f"Custom NPU attention requires BF16 BNSD {name} with head_dim=128.")
+        if (tensor.shape[0], tensor.shape[2]) != tuple(prefix_grouper.x_shape):
+            raise ValueError(f"{name} must match PrefixGrouper's grouped batch/sequence shape (no KV cache).")
+        if tensor.device != query.device:
+            raise ValueError("Custom NPU attention requires Q/K/V on the same device.")
+    if key.shape != value.shape:
+        raise ValueError("Custom NPU attention requires matching K/V shapes.")
+    if key.shape[1] == 0 or query.shape[1] == 0 or query.shape[1] % key.shape[1]:
+        raise ValueError("Custom NPU attention requires positive Hq divisible by Hkv.")
+
+    _torch_npu_module()
+    from prefix_grouper_npu import build_shared_prefix_plan, shared_prefix_attention
+
+    info = prefix_grouper.group_info
+    compact_indices = info.compact_indices.to(query.device)
+    restore_indices = info.restore_indices.to(query.device)
+    plan = build_shared_prefix_plan(
+        [group.prefix_len for group in info.info_list],
+        [length for group in info.info_list for length in group.suffix_lens],
+        [group.num_samples for group in info.info_list],
+        device=query.device,
+    )
+
+    def pack(tensor: torch.Tensor) -> torch.Tensor:
+        rows = tensor.transpose(1, 2).reshape(-1, tensor.shape[1], 128)
+        return rows.index_select(0, compact_indices).contiguous()
+
+    output = shared_prefix_attention(pack(query), pack(key), pack(value), plan, softmax_scale=scaling)
+    # Padding gathers a separate zero row, so its gradient never reaches compact attention.
+    padded_output = torch.cat((output, output.new_zeros((1, query.shape[1], 128))), dim=0)
+    return padded_output.index_select(0, restore_indices).reshape(
+        query.shape[0], query.shape[2], query.shape[1], 128
+    )
+
+
 def _causal_sdpa_mask(padding_mask: torch.Tensor, query_length: int, key_length: int) -> torch.Tensor:
     """Expand PrefixGrouper's 2-D padding mask into SDPA's causal mask."""
     suffix_offset = key_length - query_length
@@ -149,6 +200,17 @@ def _sdpa_prefix_grouper_wrapper(original_fn):
 
         dropout = kwargs.pop("dropout", 0.0)
         scaling = kwargs.pop("scaling", None)
+        backend = getattr(module.config, "prefix_grouper_npu_backend", "fusion")
+        if backend not in {"fusion", "custom"}:
+            raise ValueError(f"Unknown prefix_grouper_npu_backend: {backend!r}; use fusion or custom.")
+        if backend == "custom":
+            if kwargs.get("sliding_window") is not None or getattr(module, "sliding_window", None) is not None:
+                raise ValueError("Custom shared-prefix attention does not support sliding-window attention.")
+            if kwargs.get("softcap") not in (None, 0.0) or not kwargs.get("is_causal", True):
+                raise ValueError("Custom shared-prefix attention requires causal attention without softcap.")
+            return _npu_compact_attention(
+                prefix_grouper, query, key, value, dropout=dropout, scaling=scaling
+            ), None
 
         def attention_forward(inner_query, inner_key, inner_value, padding_mask, *_args, **_kwargs):
             inner_key = _repeat_kv(inner_key, inner_query.shape[1])
@@ -226,6 +288,13 @@ def build_prefix_grouper(
         device=torch.device("cpu"),
     )
 
+    # Compute packing maps on the host once per batch, not inside each attention layer.
+    compact_indices = prefix_grouper.padding_mask.flatten().nonzero(as_tuple=True)[0]
+    restore_indices = torch.full((prefix_grouper.padding_mask.numel(),), compact_indices.numel(), dtype=torch.int64)
+    restore_indices[compact_indices] = torch.arange(compact_indices.numel(), dtype=torch.int64)
+    prefix_grouper.group_info.compact_indices = compact_indices
+    prefix_grouper.group_info.restore_indices = restore_indices
+
     moved_tensors: dict[int, torch.Tensor] = {}
     for name, value in vars(prefix_grouper.group_info).items():
         if not torch.is_tensor(value):
@@ -242,8 +311,8 @@ def _check_verl_version() -> None:
     import verl
 
     current = Version(verl.__version__)
-    if not Version("0.9.0") <= current < Version("0.10.0"):
-        raise RuntimeError(f"This PrefixGrouper integration requires VERL 0.9.x, found {verl.__version__}.")
+    if current.public != Version("0.9.0").public:
+        raise RuntimeError(f"This PrefixGrouper integration requires VERL 0.9.0, found {verl.__version__}.")
 
 
 def _prompt_key(prompt: torch.Tensor, pad_token_id: int) -> tuple[int, ...]:
@@ -478,6 +547,12 @@ class PrefixGrouperTrainingWorker(TrainingWorker):
             raise ValueError("PrefixGrouper does not support Ulysses sequence parallelism.")
         if config.engine_config.strategy not in {"fsdp", "fsdp2"}:
             raise ValueError("PrefixGrouper requires VERL's FSDP or FSDP2 engine.")
+        hf_config = config.model_config.hf_config
+        backend = getattr(hf_config, "prefix_grouper_npu_backend", "fusion")
+        if backend not in {"fusion", "custom"}:
+            raise ValueError("prefix_grouper_npu_backend must be fusion or custom.")
+        if backend == "custom" and hf_config._attn_implementation != "sdpa":
+            raise ValueError("The custom PrefixGrouper NPU backend requires attn_implementation=sdpa.")
 
         apply_prefix_grouper_patch()
         super().__init__(config=config)

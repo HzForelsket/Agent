@@ -698,7 +698,11 @@ class DistributedBenchmarkTaskRunner:
             path=model_path,
             load_tokenizer=False,
             trust_remote_code=bool(settings["trust_remote_code"]),
-            override_config={"attn_implementation": "sdpa", "use_cache": False},
+            override_config={
+                "attn_implementation": "sdpa",
+                "use_cache": False,
+                "prefix_grouper_npu_backend": settings["npu_attention_backend"],
+            },
             enable_gradient_checkpointing=bool(settings["gradient_checkpointing"]),
             use_remove_padding=False,
             use_fused_kernels=False,

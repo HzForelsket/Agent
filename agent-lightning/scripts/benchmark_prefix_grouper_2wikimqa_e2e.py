@@ -430,6 +430,9 @@ def build_config(
     }
     if mode == "prefix_grouper":
         config.setdefault("agentlightning", {})["prefix_grouper"] = {"enabled": True}
+        config["actor_rollout_ref"]["model"]["override_config"]["prefix_grouper_npu_backend"] = (
+            args.npu_attention_backend
+        )
     return config
 
 
@@ -438,6 +441,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("baseline", "prefix_grouper"), required=True)
     parser.add_argument("--device", choices=("auto", "gpu", "cuda", "npu"), default="auto")
+    parser.add_argument("--npu-attention-backend", choices=("fusion", "custom"), default="fusion")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Pretrained model ID or local model directory.")
     parser.add_argument(
         "--model-name",
@@ -626,6 +630,7 @@ def run_benchmark(
         "dataset": DATASET_NAME,
         "mode": args.mode,
         "backend": runtime.backend,
+        "npu_attention_backend": args.npu_attention_backend if args.mode == "prefix_grouper" else None,
         "device_name": runtime.device_name(),
         "started_at": started_at,
         "wall_seconds": time.perf_counter() - started,
@@ -680,6 +685,8 @@ def main() -> None:
         backend = runtime.backend
         available_devices = int(runtime.module.device_count())
     stack = installed_stack(backend)
+    if args.npu_attention_backend == "custom" and (backend != "npu" or args.mode != "prefix_grouper"):
+        raise ValueError("--npu-attention-backend custom requires --device npu --mode prefix_grouper.")
     check_stack(backend, stack)
     n_devices_per_node, tensor_model_parallel_size = resolve_resources(args, available_devices)
 
