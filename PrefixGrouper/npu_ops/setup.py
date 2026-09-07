@@ -63,7 +63,7 @@ extension = NpuExtension(
 
 setup(
     name="prefix-grouper-npu",
-    version="0.1.0",
+    version="0.1.1",
     description="Shared-prefix AscendC attention for PrefixGrouper",
     python_requires=">=3.10,<3.11",
     install_requires=["torch==2.10.0", "torch-npu==2.10.0"],

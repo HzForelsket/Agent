@@ -1,6 +1,6 @@
 # prefix-grouper-npu
 
-`prefix-grouper-npu` is an optional AscendC extension for compact shared-prefix
+`prefix-grouper-npu` 0.1.1 is an optional AscendC extension for compact shared-prefix
 attention on Atlas A2 / Ascend 910B. It targets CANN 9.0.0, PyTorch 2.10.0 and
 torch-npu 2.10.0, supports BF16 TND tensors with head dimension 128, and does
 not provide a CPU fallback.
