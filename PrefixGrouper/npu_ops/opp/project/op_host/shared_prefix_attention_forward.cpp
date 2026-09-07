@@ -27,7 +27,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
         return ge::GRAPH_FAILED;
     }
     tiling->scale = *scale;
-    context->SetBlockDim(std::min<uint32_t>(20, std::max<uint32_t>(1, tiling->task_count)));
+    const uint32_t lse_blocks =
+        (tiling->task_count + kSharedPrefixLseBlockElements - 1) / kSharedPrefixLseBlockElements;
+    context->SetBlockDim(std::min<uint32_t>(20, std::max<uint32_t>(1, lse_blocks)));
     size_t* workspace = context->GetWorkspaceSizes(1);
     workspace[0] = 0;
     return ge::GRAPH_SUCCESS;

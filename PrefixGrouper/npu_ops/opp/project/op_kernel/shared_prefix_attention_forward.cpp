@@ -43,15 +43,33 @@ public:
         pipe_.InitBuffer(workFpBuf_, kFp32Bytes);
         pipe_.InitBuffer(scalarInBuf_, 32);
         pipe_.InitBuffer(scalarOutBuf_, 32);
+        pipe_.InitBuffer(lseBuf_, kSharedPrefixLseBlockElements * sizeof(float));
     }
 
     __aicore__ inline void Process()
     {
         const uint32_t taskCount = totalTokens_ * qHeads_;
-        for (uint32_t task = GetBlockIdx(); task < taskCount; task += GetBlockNum()) {
-            const uint32_t queryToken = task / qHeads_;
-            const uint32_t queryHead = task % qHeads_;
-            ComputeOne(queryToken, queryHead);
+        const uint32_t lseBlocks =
+            (taskCount + kSharedPrefixLseBlockElements - 1) / kSharedPrefixLseBlockElements;
+        LocalTensor<float> lseLocal = lseBuf_.Get<float>();
+        // One core owns each 64-byte LSE block; GM scalar stores can lose neighboring writes.
+        for (uint32_t block = GetBlockIdx(); block < lseBlocks; block += GetBlockNum()) {
+            const uint32_t firstTask = block * kSharedPrefixLseBlockElements;
+            const uint32_t remaining = taskCount - firstTask;
+            const uint32_t count = remaining < kSharedPrefixLseBlockElements
+                ? remaining : kSharedPrefixLseBlockElements;
+            for (uint32_t i = 0; i < count; ++i) {
+                const uint32_t task = firstTask + i;
+                lseLocal.SetValue(i, ComputeOne(task / qHeads_, task % qHeads_));
+            }
+            event_t ready = static_cast<event_t>(pipe_.FetchEventID(HardEvent::S_MTE3));
+            SetFlag<HardEvent::S_MTE3>(ready);
+            WaitFlag<HardEvent::S_MTE3>(ready);
+            const DataCopyExtParams copyParams{1, count * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
+            DataCopyPad(lseGm_[firstTask], lseLocal, copyParams);
+            event_t finished = static_cast<event_t>(pipe_.FetchEventID(HardEvent::MTE3_S));
+            SetFlag<HardEvent::MTE3_S>(finished);
+            WaitFlag<HardEvent::MTE3_S>(finished);
         }
     }
 
@@ -130,7 +148,7 @@ private:
         runningMax = nextMax;
     }
 
-    __aicore__ inline void ComputeOne(uint32_t queryToken, uint32_t queryHead)
+    __aicore__ inline float ComputeOne(uint32_t queryToken, uint32_t queryHead)
     {
         LocalTensor<bfloat16_t> qBf = qBfBuf_.Get<bfloat16_t>();
         LocalTensor<bfloat16_t> outBf = outBfBuf_.Get<bfloat16_t>();
@@ -166,15 +184,15 @@ private:
         Cast(outBf, accFp, RoundMode::CAST_RINT, kHeadDim);
         PipeBarrier<PIPE_ALL>();
         DataCopy(outGm_[qOffset], outBf, kHeadDim);
-        lseGm_.SetValue(static_cast<uint64_t>(queryToken) * qHeads_ + queryHead,
-                        runningMax + LogScalar(runningSum));
+        const float lse = runningMax + LogScalar(runningSum);
         PipeBarrier<PIPE_ALL>();
+        return lse;
     }
 
     TPipe pipe_;
     TBuf<QuePosition::VECCALC> qBfBuf_, kBfBuf_, vBfBuf_, outBfBuf_;
     TBuf<QuePosition::VECCALC> qFpBuf_, kFpBuf_, vFpBuf_, accFpBuf_, tmpFpBuf_, workFpBuf_;
-    TBuf<QuePosition::VECCALC> scalarInBuf_, scalarOutBuf_;
+    TBuf<QuePosition::VECCALC> scalarInBuf_, scalarOutBuf_, lseBuf_;
     GlobalTensor<bfloat16_t> qGm_, kGm_, vGm_, outGm_;
     GlobalTensor<int32_t> prefixStartGm_, prefixEndGm_, sequenceStartGm_;
     GlobalTensor<float> lseGm_;

@@ -48,6 +48,7 @@ public:
         pipe_.InitBuffer(workBuf_, kFp32Bytes);
         pipe_.InitBuffer(scalarInBuf_, 32);
         pipe_.InitBuffer(scalarOutBuf_, 32);
+        pipe_.InitBuffer(lseBuf_, 32);
     }
 
     __aicore__ inline void Process()
@@ -66,6 +67,23 @@ public:
     }
 
 private:
+    __aicore__ inline float LoadLse(uint64_t offset)
+    {
+        // Read through MTE2 instead of retaining GM values in the scalar data cache.
+        LocalTensor<float> lseLocal = lseBuf_.Get<float>();
+        const DataCopyExtParams copyParams{1, sizeof(float), 0, 0, 0};
+        const DataCopyPadExtParams<float> padParams{false, 0, 0, 0.0f};
+        DataCopyPad(lseLocal, lseGm_[offset], copyParams, padParams);
+        event_t ready = static_cast<event_t>(pipe_.FetchEventID(HardEvent::MTE2_S));
+        SetFlag<HardEvent::MTE2_S>(ready);
+        WaitFlag<HardEvent::MTE2_S>(ready);
+        const float lse = lseLocal.GetValue(0);
+        event_t finished = static_cast<event_t>(pipe_.FetchEventID(HardEvent::S_MTE2));
+        SetFlag<HardEvent::S_MTE2>(finished);
+        WaitFlag<HardEvent::S_MTE2>(finished);
+        return lse;
+    }
+
     __aicore__ inline void Load(
         GlobalTensor<bfloat16_t>& gm, uint64_t offset, LocalTensor<float>& fp)
     {
@@ -154,7 +172,7 @@ private:
         Load(gradOutGm_, qOffset, gradFp);
         Load(outGm_, qOffset, outFp);
         const float delta = Dot(gradFp, outFp);
-        const float lse = lseGm_.GetValue(static_cast<uint64_t>(queryToken) * qHeads_ + queryHead);
+        const float lse = LoadLse(static_cast<uint64_t>(queryToken) * qHeads_ + queryHead);
         Duplicate(accFp, 0.0f, kHeadDim);
         PipeBarrier<PIPE_ALL>();
 
@@ -203,7 +221,7 @@ private:
                 Load(qGm_, qOffset, qFp);
                 Load(gradOutGm_, qOffset, gradFp);
                 Load(outGm_, qOffset, outFp);
-                const float lse = lseGm_.GetValue(static_cast<uint64_t>(queryToken) * qHeads_ + queryHead);
+                const float lse = LoadLse(static_cast<uint64_t>(queryToken) * qHeads_ + queryHead);
                 const float probability = ExpScalar(Dot(qFp, kFp) * scale_ - lse);
                 const float delta = Dot(gradFp, outFp);
                 const float ds = probability * (Dot(gradFp, vFp) - delta) * scale_;
@@ -223,7 +241,7 @@ private:
     TBuf<QuePosition::VECCALC> loadBfBuf_, storeBfBuf_;
     TBuf<QuePosition::VECCALC> fp0Buf_, fp1Buf_, fp2Buf_, fp3Buf_, fp4Buf_;
     TBuf<QuePosition::VECCALC> acc0Buf_, acc1Buf_, tmpBuf_, workBuf_;
-    TBuf<QuePosition::VECCALC> scalarInBuf_, scalarOutBuf_;
+    TBuf<QuePosition::VECCALC> scalarInBuf_, scalarOutBuf_, lseBuf_;
     GlobalTensor<bfloat16_t> gradOutGm_, qGm_, kGm_, vGm_, outGm_;
     GlobalTensor<bfloat16_t> dqGm_, dkGm_, dvGm_;
     GlobalTensor<int32_t> prefixStartGm_, prefixEndGm_, sequenceStartGm_;

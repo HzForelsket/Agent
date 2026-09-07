@@ -3,6 +3,8 @@
 
 #include <cstdint>
 
+constexpr uint32_t kSharedPrefixLseBlockElements = 64 / sizeof(float);
+
 struct SharedPrefixAttentionTilingData {
     uint32_t total_tokens;
     uint32_t q_heads;
