@@ -6,59 +6,10 @@ from pathlib import Path
 import pytest
 import torch
 
-from reference import _attention, materialized_reference
-
-
 _PATH = Path(__file__).resolve().parents[1] / "benchmarks" / "benchmark_shared_prefix_attention.py"
 _SPEC = importlib.util.spec_from_file_location("shared_prefix_benchmark", _PATH)
 benchmark = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(benchmark)
-
-
-def test_expanded_gradients_accumulate_prefix_copies_without_crossing_groups():
-    metadata = ((1, 2), (1, 2, 1), (1, 2))
-    dq = torch.arange(7.0).reshape(7, 1, 1)
-    dk = torch.arange(12.0).reshape(12, 1, 1)
-    dv = torch.ones_like(dk)
-    actual = benchmark._fold_baseline_gradients((dq, dk, dv), *metadata)
-    expected = (
-        dq,
-        torch.tensor([1, 2, 17, 20, 7, 8, 11]).reshape(7, 1, 1).float(),
-        torch.tensor([2, 1, 3, 3, 1, 1, 1]).reshape(7, 1, 1).float(),
-    )
-    for grad, reference in zip(actual, expected, strict=True):
-        torch.testing.assert_close(grad, reference)
-
-
-def test_gradient_check_compares_same_compact_tokens_and_output_gradient():
-    torch.manual_seed(1234)
-    metadata = ((1, 2), (1, 2, 1), (1, 2))
-    inputs = tuple(torch.randn(7, heads, 4, requires_grad=True) for heads in (2, 1, 1))
-    scale = inputs[0].shape[-1] ** -0.5
-    bq, bk, bv, qends, kvends = benchmark._baseline_inputs(*inputs, *metadata)
-    expanded = tuple(tensor.detach().requires_grad_(True) for tensor in (bq, bk, bv))
-
-    def fusion_reference():
-        parts = []
-        qstart = kvstart = 0
-        for qend, kvend in zip(qends, kvends, strict=True):
-            nq, nkv = qend - qstart, kvend - kvstart
-            mask = torch.ones(nq, nkv, dtype=torch.bool).triu(diagonal=nkv - nq + 1)
-            parts.append(_attention(
-                expanded[0][qstart:qend], expanded[1][kvstart:kvend], expanded[2][kvstart:kvend],
-                mask, scale,
-            ))
-            qstart, kvstart = qend, kvend
-        return torch.cat(parts)
-
-    metrics = benchmark._check_gradients(
-        lambda: materialized_reference(*inputs, *metadata, scale=scale), fusion_reference,
-        inputs, expanded, torch.randn_like(inputs[0]), metadata,
-    )
-    for metric in metrics.values():
-        assert metric["cosine"] >= 0.99999
-        assert metric["max_abs"] < 1e-6
-    assert all(tensor.grad is None for tensor in (*inputs, *expanded))
 
 
 @pytest.mark.parametrize("mode", ["forward", "backward", "forward_backward"])

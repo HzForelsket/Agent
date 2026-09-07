@@ -278,51 +278,60 @@ bash scripts/run_910b_benchmark.sh \
 The wrapper configures the installed OPP automatically and runs the hardware
 tests in a separate Python process first. Any failure prevents timing. It then
 runs the existing benchmark in the active Python environment, without proot.
-For the requested workload, the benchmark also compares custom and materialized
-fusion-attention outputs before timing (cosine at least 0.999, max absolute
-error at most 0.05). With `--backward`, it also checks dQ/dK/dV using the same
-random output gradient for both operators (cosine at least 0.999, max absolute
-error at most 0.1). Fusion gradients for duplicated prefix K/V rows are summed
-back into compact token positions on CPU before comparison. A failed gradient
-check prevents all timing; details are saved under `gradient_correctness`.
+Both paths start from the same compact BF16 Q/K/V and produce compact outputs
+and gradients. Fusion gathers repeated prefix K/V rows using a precomputed index
+inside each forward call; autograd accumulates those copies back into compact
+K/V gradients on the NPU inside backward. Q is already in sequence order and is
+not copied. Both paths reuse metadata (custom plan, fusion indices, sequence
+lengths and causal mask), whose construction is outside timing.
+
+Before timing, the benchmark compares outputs (cosine at least 0.999, max
+absolute error at most 0.05). With `--backward`, it compares compact dQ/dK/dV
+using the same random upstream gradient (cosine at least 0.999, max absolute
+error at most 0.1). Any failed check prevents timing; gradient metrics are saved
+under `gradient_correctness`.
 The directory must not already exist. `validation/` contains environment and
 correctness logs; `benchmark.log` captures errors; `benchmark.json` records
-configuration before input allocation and is updated after each timed sample.
-The same saves also generate `benchmark.md`, with the workload, per-mode median
-latencies, sample counts, process-wide memory peaks, correctness checks, and
-measurement scope. Incomplete runs are explicitly marked as incomplete in both
-reports. Report writing is outside the timing window.
+configuration before input allocation and is updated after each paired round.
+The same saves generate `benchmark.md`, with per-mode median, P25/P75/P95,
+sample counts, incremental allocation peaks, correctness and measurement scope.
+Report writing is outside each pair of samples. Incomplete runs are explicitly
+marked; measurement failures save the error and any samples already collected.
 When invoking the Python benchmark directly, `--output results.json` also writes
-`results.md`; use `--output-markdown PATH` to choose a different Markdown path
-or request a Markdown report without a JSON file. Both output paths must be new
-and must differ from each other.
-Only `status=complete` indicates that all requested stages finished. A partial
-file retains completed measurements but is not a completed comparison.
+`results.md`; use `--output-markdown PATH` to choose a different Markdown path.
+Both output paths must be new and differ from each other.
+Only `status=complete` indicates that all requested stages finished.
 
-The measurements are synchronized host wall-clock latency samples and their
-median, process-wide peak allocated NPU memory, and input storage sizes.
-The existing top-level `shared_prefix_attention` and
-`npu_fusion_attention_materialized` records remain no-grad forward measurements.
-With `--backward`, the `backward` and `forward_backward` objects each contain
-the same two operator records, including `samples_ms`, `median_ms`, and `status`.
-`--no-backward` preserves the forward-only behavior.
+Warmup and measurement alternate custom/fusion and fusion/custom order each
+round to reduce systematic ordering bias. Each path gets the requested number
+of warmups and samples. Samples use synchronized host wall-clock latency,
+including Python dispatch and synchronization overhead; they are not device-only
+kernel times or steady-state throughput. Outputs/gradients stay alive until the
+timer stops, then are released before the other path runs. Raw samples are kept
+without outlier removal; short runs provide only descriptive percentiles.
 
-Backward-only timing rebuilds a fresh forward graph before each sample and
-synchronizes before starting the clock, so forward is excluded. Forward+backward
-times a fresh forward and its gradient computation together. Both modes use
-`torch.autograd.grad` without retaining graphs or accumulating leaf `.grad`
-buffers. Optional `--trace-dir` profiling covers every selected mode; backward
-and forward+backward traces are under `backward/` and `forward_backward/`.
+The result uses `schema_version=2` with records under `timings.<mode>` for
+`shared_prefix_attention` and `npu_fusion_attention_compact`. Each record contains
+`samples_ms`, median/mean/min/max, P25/P75/P95, `memory_samples`,
+`peak_increment_bytes` and `status`. The mode is `forward`, and with `--backward`
+also `backward` and `forward_backward`. The former pre-materialized baseline and
+its old result keys are removed because their timing boundary differs.
 
-Input materialization and plan construction are outside the timing window;
-both compact and materialized inputs remain resident for both measurements.
-Peak memory is therefore not an isolated per-operator allocation comparison.
-Custom backward returns gradients for compact Q/K/V, including shared-prefix
-accumulation. Fusion backward returns gradients for its expanded Q/K/V; summing
-those prefix copies back into compact gradients is **excluded from timing** and
-done only for correctness. These are raw operator timings with different input
-layouts, not a full comparison of the permute/gather/scatter and custom paths.
-The `npu_fusion_attention_materialized` entry is an operator-level comparator,
-not Agent Lightning without PrefixGrouper. Report raw measurements only, not
-end-to-end speedup or production throughput. No benchmark
-is run by `run_cpu_dev.sh` or by the correctness-only validation entrypoint.
+Backward-only timing prepares and synchronizes a fresh forward graph before
+starting the clock. Forward+backward includes fresh forward and gradient
+computation together. Both use `torch.autograd.grad` without retained graphs or
+leaf `.grad` accumulation. Fusion K/V materialization is included in forward;
+its gradient reduction is included in backward. Profiling starts only after
+all measurements and covers the same call boundaries in every selected mode.
+
+Memory peaks are reset per sample before graph preparation and reported relative
+to the allocation already resident at that point. Backward memory therefore
+includes saved tensors from its untimed forward. Both paths' static metadata
+remain resident and their sizes are recorded separately. These are incremental
+allocated-memory measurements, not isolated process totals or allocator-reserved
+memory; no allocator-cache flush is performed between paths.
+
+This is an attention-path microbenchmark on prebuilt compact input, not an
+Agent Lightning without PrefixGrouper baseline. It does not measure model
+packing/restoration, training or end-to-end speedup. No benchmark is run by
+`run_cpu_dev.sh` or by the correctness-only validation entrypoint.

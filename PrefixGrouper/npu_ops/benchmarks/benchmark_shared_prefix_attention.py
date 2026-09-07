@@ -13,26 +13,25 @@ from pathlib import Path
 import torch
 
 
-def _baseline_inputs(q, k, v, prefix_lens, suffix_lens, group_sizes):
-    q_parts, k_parts, v_parts = [], [], []
+def _baseline_layout(prefix_lens, suffix_lens, group_sizes, device):
+    """Prepare reusable metadata only; K/V gathering stays inside the timed call."""
+    kv_rows = []
     q_cumulative, kv_cumulative = [], []
     token_offset = suffix_index = q_total = kv_total = 0
     for prefix_len, group_size in zip(prefix_lens, group_sizes, strict=True):
-        p = slice(token_offset, token_offset + prefix_len)
-        q_parts.append(q[p]); k_parts.append(k[p]); v_parts.append(v[p])
+        prefix_rows = range(token_offset, token_offset + prefix_len)
+        kv_rows.extend(prefix_rows)
         q_total += prefix_len; kv_total += prefix_len
         q_cumulative.append(q_total); kv_cumulative.append(kv_total)
         token_offset += prefix_len
         for _ in range(group_size):
             suffix_len = suffix_lens[suffix_index]; suffix_index += 1
-            s = slice(token_offset, token_offset + suffix_len)
-            q_parts.append(q[s])
-            k_parts.append(torch.cat((k[p], k[s]), dim=0))
-            v_parts.append(torch.cat((v[p], v[s]), dim=0))
+            kv_rows.extend(prefix_rows)
+            kv_rows.extend(range(token_offset, token_offset + suffix_len))
             q_total += suffix_len; kv_total += prefix_len + suffix_len
             q_cumulative.append(q_total); kv_cumulative.append(kv_total)
             token_offset += suffix_len
-    return (torch.cat(q_parts), torch.cat(k_parts), torch.cat(v_parts), q_cumulative, kv_cumulative)
+    return torch.tensor(kv_rows, dtype=torch.int64, device=device), q_cumulative, kv_cumulative
 
 
 def _prepare_step(fn, inputs, grad_output, mode):
@@ -47,26 +46,66 @@ def _prepare_step(fn, inputs, grad_output, mode):
     raise ValueError(f"Unknown measurement mode: {mode}")
 
 
-def _measure(prepare, warmup: int, iterations: int, record, save):
-    for _ in range(warmup):
-        step = prepare()
-        step()
-        del step
-    torch.npu.synchronize()
-    torch.npu.reset_peak_memory_stats()
-    for _ in range(iterations):
-        step = prepare()
-        # In backward mode, wait for the untimed forward to finish first.
-        torch.npu.synchronize()
-        start = time.perf_counter()
-        step()
-        torch.npu.synchronize()
-        record["samples_ms"].append((time.perf_counter() - start) * 1000)
-        record["median_ms"] = statistics.median(record["samples_ms"])
-        record["peak_bytes"] = torch.npu.max_memory_allocated()
-        del step
+def _percentile(samples, fraction):
+    ordered = sorted(samples)
+    position = (len(ordered) - 1) * fraction
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def _measure(operators, mode, grad_output, warmup, iterations, records, save):
+    # Alternate AB/BA for both warmup and paired samples. Each step owns a fresh
+    # graph, and neither path retains outputs or gradients into the next step.
+    for name, _, _ in operators:
+        records[name] = {"status": "warming_up", "samples_ms": [], "memory_samples": []}
+    save()
+    for index in range(warmup):
+        order = operators if index % 2 == 0 else operators[::-1]
+        for _, fn, inputs in order:
+            step = _prepare_step(fn, inputs, grad_output, mode)
+            output = step()
+            torch.npu.synchronize()
+            del output, step
+    for index in range(iterations):
+        order = operators if index % 2 == 0 else operators[::-1]
+        for position, (name, fn, inputs) in enumerate(order):
+            torch.npu.synchronize()
+            resident = torch.npu.memory_allocated()
+            torch.npu.reset_peak_memory_stats()
+            step = _prepare_step(fn, inputs, grad_output, mode)
+            # Backward graph construction is untimed, but its saved tensors
+            # count towards the full step's incremental allocation peak.
+            torch.npu.synchronize()
+            prepared = torch.npu.memory_allocated()
+            start = time.perf_counter()
+            output = step()
+            torch.npu.synchronize()
+            elapsed = (time.perf_counter() - start) * 1000
+            record = records[name]
+            record["samples_ms"].append(elapsed)
+            record["memory_samples"].append({
+                "round": index, "position": position,
+                "resident_bytes": resident,
+                "prepared_bytes": prepared,
+                "peak_increment_bytes": max(0, torch.npu.max_memory_allocated() - resident),
+            })
+            record["status"] = "running"
+            del output, step
+        # Summaries and report I/O stay outside the pair of device workloads.
+        for name, _, _ in operators:
+            record = records[name]
+            samples = record["samples_ms"]
+            record.update({
+                "median_ms": statistics.median(samples),
+                "mean_ms": statistics.mean(samples), "min_ms": min(samples), "max_ms": max(samples),
+                "p25_ms": _percentile(samples, 0.25), "p75_ms": _percentile(samples, 0.75),
+                "p95_ms": _percentile(samples, 0.95),
+                "peak_increment_bytes": max(s["peak_increment_bytes"] for s in record["memory_samples"]),
+            })
         save()
-    record["status"] = "complete"
+    for name, _, _ in operators:
+        records[name]["status"] = "complete"
     save()
 
 
@@ -90,25 +129,9 @@ def _check_outputs(custom, baseline):
     return _metric(custom(), baseline())
 
 
-def _fold_baseline_gradients(grads, prefix_lens, suffix_lens, group_sizes):
-    """Map expanded fusion gradients to compact tokens, outside measurement."""
-    total = sum(prefix_lens) + sum(suffix_lens)
-    rows = torch.arange(total)
-    q_rows, k_rows, v_rows, _, _ = _baseline_inputs(
-        rows, rows, rows, prefix_lens, suffix_lens, group_sizes
-    )
-    folded = []
-    for grad, indices in zip(grads, (q_rows, k_rows, v_rows), strict=True):
-        grad = grad.detach().float().cpu()
-        compact = grad.new_zeros((total, *grad.shape[1:]))
-        folded.append(compact.index_add_(0, indices, grad))
-    return tuple(folded)
-
-
-def _check_gradients(custom, baseline, custom_inputs, baseline_inputs, grad_output, metadata):
-    actual = torch.autograd.grad(custom(), custom_inputs, grad_output)
-    expanded = torch.autograd.grad(baseline(), baseline_inputs, grad_output)
-    expected = _fold_baseline_gradients(expanded, *metadata)
+def _check_gradients(custom, baseline, inputs, grad_output):
+    actual = torch.autograd.grad(custom(), inputs, grad_output)
+    expected = torch.autograd.grad(baseline(), inputs, grad_output)
     return {
         name: _metric(grad, reference)
         for name, grad, reference in zip(("dq", "dk", "dv"), actual, expected, strict=True)
@@ -128,21 +151,23 @@ def _markdown_report(result):
         f"Hq={inputs['hq']}，Hkv={inputs['hkv']}，head_dim=128，BF16。",
         f"- 预热：{inputs['warmup']} 次；每项采样：{inputs['iterations']} 次。", "",
         "## 耗时", "",
-        "| 模式 | 算子 | 中位耗时（ms） | 已采样次数 | 峰值分配（MiB） | 状态 |",
-        "|---|---|---:|---:|---:|---|",
+        "| 模式 | 算子 | 中位耗时（ms） | P25–P75（ms） | P95（ms） | 已采样次数 | 峰值增量（MiB） | 状态 |",
+        "|---|---|---:|---:|---:|---:|---:|---|",
     ]
     labels = {"forward": "前向", "backward": "后向", "forward_backward": "前向＋后向"}
     for mode in result["timing_modes"]:
-        records = result if mode == "forward" else result.get(mode, {})
+        records = result["timings"].get(mode, {})
         for name, label in (
             ("shared_prefix_attention", "custom"),
-            ("npu_fusion_attention_materialized", "fusion（预展开输入）"),
+            ("npu_fusion_attention_compact", "fusion（含展开及梯度归并）"),
         ):
             record = records.get(name, {})
             median = f"{record['median_ms']:.6f}" if "median_ms" in record else "—"
-            peak = f"{record['peak_bytes'] / 2**20:.2f}" if "peak_bytes" in record else "—"
+            spread = f"{record['p25_ms']:.6f}–{record['p75_ms']:.6f}" if "p25_ms" in record else "—"
+            p95 = f"{record['p95_ms']:.6f}" if "p95_ms" in record else "—"
+            peak = f"{record['peak_increment_bytes'] / 2**20:.2f}" if "peak_increment_bytes" in record else "—"
             lines.append(
-                f"| {labels[mode]} | {label} | {median} | {len(record.get('samples_ms', []))} | "
+                f"| {labels[mode]} | {label} | {median} | {spread} | {p95} | {len(record.get('samples_ms', []))} | "
                 f"{peak} | {record.get('status', '未开始')} |"
             )
     lines.extend([
@@ -166,10 +191,13 @@ def _markdown_report(result):
     lines.extend([
         "", "## 计时范围", "",
         "- 使用设备同步后的主机墙钟耗时；前向使用 no-grad。",
+        "- 两边共用紧凑 Q/K/V、上游梯度和精度；每轮交替 AB/BA，预热不计入样本。",
         "- 后向每次重新建图并同步，前向建图不计时；前向＋后向包含两者。",
-        "- 输入展开和 plan 构建不计时；fusion 的共享前缀梯度累加仅用于正确性检查，不计时。",
-        "- 峰值分配为进程级统计，两套输入同时驻留，不代表单个算子的独立显存开销。",
-        "- 结果是 custom 与预展开 fusion 的裸算子比较，不代表完整 permute 路径或模型端到端加速。",
+        "- 双方复用预先构建的 plan/索引/序列长度/掩码；fusion 的 K/V 展开计入前向，梯度归并计入后向。",
+        "- 峰值增量为每次准备建图前的驻留分配之上的最大分配量；后向包含未计时前向的保存张量。",
+        "- 双方元数据同时驻留；峰值增量不是独立进程总显存，也不包含缓存分配器预留内存。",
+        "- 使用相同紧凑输入到输出/梯度的算子路径；不代表 Agent Lightning 或模型端到端加速。",
+        "- 输出/梯度保留到计时结束；报告写入在每对采样结束后，profiler 在所有采样结束后运行。",
         "- 未完成的运行仅保留已有采样，不能作为完整对比结果。", "",
     ])
     return "\n".join(lines)
@@ -249,16 +277,20 @@ def main() -> None:
         "custom_opp_path": os.environ.get("ASCEND_CUSTOM_OPP_PATH"),
         "input": {key: str(value) if isinstance(value, Path) else value
                   for key, value in vars(args).items()},
-        "measurement": "synchronized host wall time; prebuilt inputs and plan",
+        "schema_version": 2,
+        "measurement": "synchronized host wall time; alternating paired AB/BA samples",
         "timing_modes": modes,
+        "timings": {},
         "timing_scope": {
-            "forward": "no-grad forward; input materialization and plan construction excluded",
+            "forward": "no-grad compact input to compact output; fusion K/V gathering included",
             "backward": "autograd.grad with a fresh untimed, synchronized forward per sample",
             "forward_backward": "fresh forward plus autograd.grad in one timing window",
-            "gradients": "custom returns compact dq/dk/dv; fusion returns expanded dq/dk/dv; "
-                "fusion prefix-gradient reduction is used only for correctness, outside timing",
+            "gradients": "both return compact dq/dk/dv; fusion gather backward and prefix reduction included",
+            "setup": "input generation, plan, gather indices, sequence lengths and causal mask excluded for both",
+            "memory": "per-sample peak allocated bytes minus residency before graph preparation; "
+                "includes untimed backward graph preparation; not isolated process memory",
         },
-        "comparison": "raw operator measurements, not an Agent Lightning baseline or end-to-end speedup",
+        "comparison": "equivalent compact-input attention paths, not an Agent Lightning baseline or end-to-end speedup",
     }
 
     def save():
@@ -280,19 +312,24 @@ def main() -> None:
     plan = build_shared_prefix_plan([args.prefix], args.suffixes, [len(args.suffixes)], device="npu")
     compact_storage = (q.numel() + k.numel() + v.numel()) * q.element_size()
 
-    bq, bk, bv, qlens, kvlens = _baseline_inputs(q, k, v, [args.prefix], args.suffixes, [len(args.suffixes)])
+    kv_rows, qlens, kvlens = _baseline_layout([args.prefix], args.suffixes, [len(args.suffixes)], q.device)
     causal = torch.triu(torch.ones((2048, 2048), device="npu", dtype=torch.bool), diagonal=1)
     scale = torch.tensor(128.0, dtype=torch.float32, device="cpu").rsqrt().item()
     custom = lambda: shared_prefix_attention(q, k, v, plan)
     baseline = lambda: torch_npu.npu_fusion_attention(
-        bq, bk, bv, head_num=args.hq, input_layout="TND", atten_mask=causal,
+        q, k.index_select(0, kv_rows), v.index_select(0, kv_rows),
+        head_num=args.hq, input_layout="TND", atten_mask=causal,
         scale=scale, keep_prob=1.0, actual_seq_qlen=qlens, actual_seq_kvlen=kvlens,
         sparse_mode=3,
     )[0]
 
     result.update({
         "compact_input_bytes": compact_storage,
-        "materialized_baseline_input_bytes": (bq.numel() + bk.numel() + bv.numel()) * bq.element_size(),
+        "fusion_materialized_kv_bytes": kv_rows.numel() * (args.hkv * 128 * 2) * k.element_size(),
+        "fusion_index_bytes": kv_rows.numel() * kv_rows.element_size(),
+        "fusion_mask_bytes": causal.numel() * causal.element_size(),
+        "custom_plan_bytes": sum(getattr(plan, name).numel() * getattr(plan, name).element_size()
+                                 for name in ("prefix_start", "prefix_end", "sequence_start", "sequence_end", "group_end")),
     })
     result["status"] = "checking_outputs"
     save()
@@ -302,17 +339,16 @@ def main() -> None:
         result["status"] = "failed_correctness"
         save()
         raise RuntimeError(f"benchmark outputs disagree: {result['correctness']}")
-    custom_inputs, baseline_inputs = (q, k, v), (bq, bk, bv)
+    inputs = (q, k, v)
     grad_output = None
     if args.backward:
-        for tensor in (*custom_inputs, *baseline_inputs):
+        for tensor in inputs:
             tensor.requires_grad_(True)
         grad_output = torch.randn_like(q)
         result["status"] = "checking_gradients"
         save()
         result["gradient_correctness"] = _check_gradients(
-            custom, baseline, custom_inputs, baseline_inputs, grad_output,
-            ([args.prefix], args.suffixes, [len(args.suffixes)]),
+            custom, baseline, inputs, grad_output,
         )
         save()
         if any(
@@ -324,28 +360,28 @@ def main() -> None:
             raise RuntimeError(f"benchmark gradients disagree: {result['gradient_correctness']}")
 
     operators = (
-        ("shared_prefix_attention", custom, custom_inputs),
-        ("npu_fusion_attention_materialized", baseline, baseline_inputs),
+        ("shared_prefix_attention", custom, inputs),
+        ("npu_fusion_attention_compact", baseline, inputs),
     )
     for mode in modes:
-        # Preserve the existing top-level forward result keys.
-        records = result if mode == "forward" else result.setdefault(mode, {})
-        for name, fn, inputs in operators:
-            result["status"] = f"{mode}:{name}"
-            record = {"status": "running", "samples_ms": []}
-            records[name] = record
-            save()
+        records = result["timings"].setdefault(mode, {})
+        result["status"] = f"measuring:{mode}"
+        try:
             _measure(
-                lambda: _prepare_step(fn, inputs, grad_output, mode),
-                args.warmup, args.iterations, record, save,
+                operators, mode, grad_output, args.warmup, args.iterations, records, save,
             )
+        except Exception as exc:
+            result["status"] = "failed_measurement"
+            result["error"] = {"mode": mode, "type": type(exc).__name__, "message": str(exc)}
+            save()
+            raise
     if args.trace_dir:
         result["status"] = "profiling"
         save()
         args.trace_dir.mkdir(parents=True, exist_ok=True)
         for mode in modes:
             for name, fn, inputs in operators:
-                trace_name = "shared_prefix" if name == "shared_prefix_attention" else "materialized_fusion_attention"
+                trace_name = "shared_prefix" if name == "shared_prefix_attention" else "compact_fusion_attention"
                 trace_root = args.trace_dir if mode == "forward" else args.trace_dir / mode
                 step = _prepare_step(fn, inputs, grad_output, mode)
                 torch.npu.synchronize()
@@ -358,9 +394,9 @@ def main() -> None:
                     record_shapes=True,
                     profile_memory=True,
                 ):
-                    step()
+                    output = step()
                     torch.npu.synchronize()
-                del step
+                del output, step
         result["trace_dir"] = str(args.trace_dir)
     result["status"] = "complete"
     save()
