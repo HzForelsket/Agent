@@ -19,12 +19,18 @@ and torch-npu 2.10.0, then build and install locally:
 cd /home/huangzhong/Agent/PrefixGrouper/npu_ops
 export ASCEND_HOME_PATH="$HOME/Ascend/cann-9.0.0"
 bash scripts/build_wheel.sh
-python -m pip install --no-deps --force-reinstall "build/native/$(uname -m)/dist/"prefix_grouper_npu-*.whl
 ```
 
 Import, schema discovery and Meta shape inference can be checked without an
 NPU. Numerical correctness and performance results require a real 910B with a
 matching driver and are never inferred from device-free checks.
+
+`build_wheel.sh` automatically installs the newly built wheel using the active
+Python's `python -m pip install --no-deps --force-reinstall`. It prints the target
+interpreter and keeps the wheel in the build output's `dist` directory.
+After installation it configures the installed custom OPP in the build process.
+The validation entrypoints configure it again before starting Python, so no
+manual sourcing of a staging directory's `set_env.bash` is required.
 
 The scripts use the active Python environment; activate the environment with
 PyTorch 2.10.0 and torch-npu 2.10.0 before invoking them. CANN is selected by
@@ -42,6 +48,16 @@ Set the path to the actual toolkit directory containing `compiler/version.info`.
 without importing the operator package. Native builds select the current host
 architecture (`aarch64` or `x86_64`) for CANN headers and the OPP installer.
 Cross-compilation is disabled; an aarch64 NPU server builds its own aarch64 wheel.
+
+`activate.sh` locates the wheel through the current Python's package metadata,
+without importing torch or initializing the NPU runtime. It sets both
+`ASCEND_CUSTOM_OPP_PATH` and `LD_LIBRARY_PATH` to the installed vendor and its
+`op_api/lib` directory. The generated OPP environment script embeds the build
+staging path, so it is not sourced from the installed wheel.
+For Python commands launched directly from your shell, first run
+`source scripts/activate.sh`. Running a build via `bash` cannot modify the parent
+shell's environment. The native and CPU proot validation entrypoints already
+source this script in their own environments.
 
 ## CPU proot development
 

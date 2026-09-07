@@ -20,8 +20,6 @@ exec "$HOME/.codex/skills/proot-ubuntu2204/scripts/proot_ubuntu2204.sh" -- \
         cd /tmp
         if [[ "${action}" == build ]]; then
             bash "${root_dir}/scripts/build_wheel.sh"
-            python -m pip install --no-deps --force-reinstall \
-                "${PREFIX_GROUPER_NPU_BUILD_DIR}/$(uname -m)/dist/"prefix_grouper_npu-*.whl
         else
             source "${root_dir}/scripts/activate.sh"
             python -m pytest -q -o cache_dir="${root_dir}/build/proot/pytest-cache" \

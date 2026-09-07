@@ -13,6 +13,9 @@ source "${ROOT_DIR}/scripts/activate.sh"
     echo "command: $0 ${RESULT_DIR}"
     date --iso-8601=seconds
     echo "ASCEND_HOME_PATH: ${ASCEND_HOME_PATH}"
+    echo "PREFIX_GROUPER_NPU_VENDOR_ROOT: ${PREFIX_GROUPER_NPU_VENDOR_ROOT}"
+    echo "ASCEND_CUSTOM_OPP_PATH: ${ASCEND_CUSTOM_OPP_PATH}"
+    echo "LD_LIBRARY_PATH: ${LD_LIBRARY_PATH}"
     python - <<'PY'
 import torch
 import torch_npu

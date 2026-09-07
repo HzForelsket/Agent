@@ -45,6 +45,22 @@ cp "${ROOT_DIR}/setup.py" "${ROOT_DIR}/pyproject.toml" \
     "${ROOT_DIR}/MANIFEST.in" "${ROOT_DIR}/README.md" "${SOURCE_DIR}/"
 cp "${ROOT_DIR}/prefix_grouper_npu/"*.py "${SOURCE_DIR}/prefix_grouper_npu/"
 cp "${ROOT_DIR}/csrc/"*.cpp "${SOURCE_DIR}/csrc/"
+WHEEL_DIR="$(mktemp -d "${OUTPUT_DIR}/wheel.XXXXXX")"
 PREFIX_GROUPER_NPU_OPP_ROOT="${STAGE_DIR}" \
     python -m pip wheel --no-deps --no-build-isolation \
-        --wheel-dir "${OUTPUT_DIR}/dist" "${SOURCE_DIR}"
+        --wheel-dir "${WHEEL_DIR}" "${SOURCE_DIR}"
+shopt -s nullglob
+WHEELS=("${WHEEL_DIR}"/prefix_grouper_npu-*.whl)
+shopt -u nullglob
+if [[ ${#WHEELS[@]} -ne 1 ]]; then
+    echo "Expected exactly one newly built wheel in ${WHEEL_DIR}; found ${#WHEELS[@]}." >&2
+    exit 2
+fi
+mkdir -p "${OUTPUT_DIR}/dist"
+WHEEL_PATH="${OUTPUT_DIR}/dist/$(basename "${WHEELS[0]}")"
+mv -f "${WHEELS[0]}" "${WHEEL_PATH}"
+rmdir "${WHEEL_DIR}"
+echo "Installing into Python environment: $(python -c 'import sys; print(sys.executable)')"
+python -m pip install --no-deps --force-reinstall "${WHEEL_PATH}"
+source "${ROOT_DIR}/scripts/activate.sh"
+echo "Configured installed custom OPP: ${PREFIX_GROUPER_NPU_VENDOR_ROOT}"
