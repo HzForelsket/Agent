@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 import torch
 
 
@@ -24,7 +22,11 @@ def materialized_reference(
     group_sizes: tuple[int, ...],
     scale: float | None = None,
 ) -> torch.Tensor:
-    scale = 1.0 / math.sqrt(128.0) if scale is None else scale
+    scale = (
+        torch.tensor(128.0, dtype=torch.float32, device="cpu").rsqrt().item()
+        if scale is None
+        else torch.tensor(scale, dtype=torch.float32, device="cpu").item()
+    )
     outputs: list[torch.Tensor] = []
     token_offset = 0
     suffix_index = 0

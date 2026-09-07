@@ -28,6 +28,10 @@ cmake --preset default -S "${PROJECT_DIR}" -B "${BUILD_DIR}" \
 cmake --build "${BUILD_DIR}" --target binary -j"${BUILD_JOBS:-2}"
 cmake --build "${BUILD_DIR}" --target package -j"${BUILD_JOBS:-2}"
 
+# The OPP installer leaves read-only directories in the staging tree.
+if [[ -d "${STAGE_DIR}" ]]; then
+    chmod -R u+w "${STAGE_DIR}"
+fi
 rm -rf "${STAGE_DIR}"
 mkdir -p "${STAGE_DIR}"
 shopt -s nullglob
@@ -40,6 +44,11 @@ fi
 "${OPP_INSTALLERS[0]}" --quiet --install-path="${STAGE_DIR}"
 
 # Stage only build inputs so setuptools cannot reuse another environment's artifacts.
+# copytree preserves OPP permissions in setuptools' build directory as well.
+if [[ -d "${SOURCE_DIR}" ]]; then
+    chmod -R u+w "${SOURCE_DIR}"
+fi
+rm -rf "${SOURCE_DIR}"
 mkdir -p "${SOURCE_DIR}/prefix_grouper_npu" "${SOURCE_DIR}/csrc"
 cp "${ROOT_DIR}/setup.py" "${ROOT_DIR}/pyproject.toml" \
     "${ROOT_DIR}/MANIFEST.in" "${ROOT_DIR}/README.md" "${SOURCE_DIR}/"

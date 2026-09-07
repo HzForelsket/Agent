@@ -24,7 +24,7 @@ void check_metadata(const at::Tensor& tensor, const at::Tensor& q, const char* n
 void check_inputs(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     const at::Tensor& prefix_start, const at::Tensor& prefix_end,
-    const at::Tensor& sequence_start, double scale)
+    const at::Tensor& sequence_start, float scale)
 {
     TORCH_CHECK(q.device().type() == c10::DeviceType::PrivateUse1,
                 "shared_prefix_attention is NPU-only and has no CPU fallback");
@@ -43,7 +43,7 @@ void check_inputs(
                 "Hq must be divisible by Hkv");
     TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
                 "q, k and v must be contiguous");
-    TORCH_CHECK(std::isfinite(scale) && scale > 0.0,
+    TORCH_CHECK(std::isfinite(scale) && scale > 0.0f,
                 "softmax scale must be finite and positive");
     check_metadata(prefix_start, q, "prefix_start");
     check_metadata(prefix_end, q, "prefix_end");
@@ -55,7 +55,10 @@ std::tuple<at::Tensor, at::Tensor> forward_npu(
     const at::Tensor& prefix_start, const at::Tensor& prefix_end,
     const at::Tensor& sequence_start, double scale)
 {
-    check_inputs(q, k, v, prefix_start, prefix_end, sequence_start, scale);
+    // PyTorch and generated ACLNN signatures require double; arithmetic uses FP32.
+    const float scale_fp32 = static_cast<float>(scale);
+    check_inputs(q, k, v, prefix_start, prefix_end, sequence_start, scale_fp32);
+    scale = static_cast<double>(scale_fp32);
     const c10::OptionalDeviceGuard device_guard(device_of(q));
     at::Tensor out = at::empty_like(q);
     at::Tensor lse = at::empty({q.size(0), q.size(1)}, q.options().dtype(at::kFloat));
@@ -71,7 +74,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> backward_npu(
     const at::Tensor& prefix_start, const at::Tensor& prefix_end,
     const at::Tensor& sequence_start, double scale)
 {
-    check_inputs(q, k, v, prefix_start, prefix_end, sequence_start, scale);
+    const float scale_fp32 = static_cast<float>(scale);
+    check_inputs(q, k, v, prefix_start, prefix_end, sequence_start, scale_fp32);
+    scale = static_cast<double>(scale_fp32);
     TORCH_CHECK(grad_out.device() == q.device() && grad_out.scalar_type() == at::kBFloat16 &&
                 grad_out.sizes() == q.sizes() && grad_out.is_contiguous(),
                 "grad_out must be a contiguous BF16 tensor matching q");

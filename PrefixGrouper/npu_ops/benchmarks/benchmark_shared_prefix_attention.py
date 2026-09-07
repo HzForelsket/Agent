@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import statistics
 import sys
 import time
@@ -71,7 +70,7 @@ def main() -> None:
 
     bq, bk, bv, qlens, kvlens = _baseline_inputs(q, k, v, [args.prefix], args.suffixes, [len(args.suffixes)])
     causal = torch.triu(torch.ones((2048, 2048), device="npu", dtype=torch.bool), diagonal=1)
-    scale = 1.0 / math.sqrt(128.0)
+    scale = torch.tensor(128.0, dtype=torch.float32, device="cpu").rsqrt().item()
     custom = lambda: shared_prefix_attention(q, k, v, plan)
     baseline = lambda: torch_npu.npu_fusion_attention(
         bq, bk, bv, head_num=args.hq, input_layout="TND", atten_mask=causal,

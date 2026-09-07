@@ -93,6 +93,10 @@ out = shared_prefix_attention(q, k, v, plan)
 
 `q` has shape `[T, Hq, 128]`; `k` and `v` have shape `[T, Hkv, 128]`.
 All tensors must be contiguous BF16 tensors on one NPU, and `Hq % Hkv == 0`.
+Scale computation and validation, softmax, and kernel accumulation use FP32.
+PyTorch and the generated CANN ACLNN scalar interfaces require a host `double`
+parameter; it only transports the FP32 scale and does not introduce FP64 tensor
+computation. BF16 inputs, outputs and gradients are retained.
 The compact token order for each group is one prefix followed by every suffix.
 Prefix queries use a causal prefix slice. A suffix query uses a full shared
 prefix slice plus a causal slice over only its own suffix.

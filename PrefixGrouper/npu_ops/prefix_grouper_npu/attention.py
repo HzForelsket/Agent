@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import numbers
 from dataclasses import dataclass
 from threading import Lock
@@ -13,6 +12,7 @@ from ._extension import load_extension
 
 _PLAN_CACHE: dict[tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], str], "SharedPrefixPlan"] = {}
 _PLAN_LOCK = Lock()
+_DEFAULT_SOFTMAX_SCALE = torch.tensor(128.0, dtype=torch.float32, device="cpu").rsqrt()
 
 
 def _positive_ints(values: Sequence[int] | torch.Tensor | Iterable[int], name: str) -> tuple[int, ...]:
@@ -171,9 +171,15 @@ def shared_prefix_attention(
     softmax_scale: float | None = None,
 ) -> torch.Tensor:
     _validate(q, k, v, plan)
-    scale = 1.0 / math.sqrt(128.0) if softmax_scale is None else float(softmax_scale)
-    if not math.isfinite(scale) or scale <= 0.0:
+    scale_fp32 = (
+        _DEFAULT_SOFTMAX_SCALE
+        if softmax_scale is None
+        else torch.tensor(softmax_scale, dtype=torch.float32, device="cpu")
+    )
+    if not torch.isfinite(scale_fp32).item() or not (scale_fp32 > 0).item():
         raise ValueError("softmax_scale must be finite and positive")
+    # Python/PyTorch transport scalars as doubles; the value is computed in FP32.
+    scale = scale_fp32.item()
     load_extension()
     return _SharedPrefixAttention.apply(
         q, k, v, plan.prefix_start, plan.prefix_end, plan.sequence_start, scale
