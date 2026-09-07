@@ -19,7 +19,7 @@ and torch-npu 2.10.0, then build and install locally:
 cd /home/huangzhong/Agent/PrefixGrouper/npu_ops
 export ASCEND_HOME_PATH="$HOME/Ascend/cann-9.0.0"
 bash scripts/build_wheel.sh
-python -m pip install --no-deps --force-reinstall build/native/dist/prefix_grouper_npu-*.whl
+python -m pip install --no-deps --force-reinstall "build/native/$(uname -m)/dist/"prefix_grouper_npu-*.whl
 ```
 
 Import, schema discovery and Meta shape inference can be checked without an
@@ -39,7 +39,9 @@ source scripts/activate.sh
 
 Set the path to the actual toolkit directory containing `compiler/version.info`.
 `activate.sh` requires the installed operator wheel; `build_wheel.sh` loads CANN
-without importing the operator package. The build currently targets x86_64.
+without importing the operator package. Native builds select the current host
+architecture (`aarch64` or `x86_64`) for CANN headers and the OPP installer.
+Cross-compilation is disabled; an aarch64 NPU server builds its own aarch64 wheel.
 
 ## CPU proot development
 
@@ -57,8 +59,8 @@ plan and schema/Meta tests. It never runs hardware correctness or benchmarks.
 The fixed project proot wrapper, its rootfs and the project path inside that
 rootfs must already be available. It does not install development dependencies.
 
-Native build outputs are under `build/native`; proot outputs are under
-`build/proot`. Each has separate CMake, staged Python sources, setuptools and
+Native build outputs are under `build/native/<architecture>`; proot outputs are
+under `build/proot/<architecture>`. Each has separate CMake, staged Python sources, setuptools and
 wheel directories. Do not install the proot wheel on the NPU server; build there
 using its own environment. No hardware validation is performed on this CPU host.
 

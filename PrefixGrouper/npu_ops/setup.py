@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import platform
 import re
 import shutil
 
@@ -29,6 +30,12 @@ version_macro = f"-DCURRENT_VERSION=V{match.group(1)}R{match.group(2)}"
 torch_npu_root = pathlib.Path(torch_npu.__file__).resolve().parent
 op_api = VENDOR / "op_api"
 cann_root = pathlib.Path(os.environ["ASCEND_HOME_PATH"])
+build_arch = platform.machine()
+if build_arch not in {"x86_64", "aarch64"}:
+    raise RuntimeError(f"Unsupported native build architecture: {build_arch}")
+cann_include = cann_root / f"{build_arch}-linux" / "include"
+if not cann_include.is_dir():
+    raise RuntimeError(f"CANN headers for {build_arch} are missing: {cann_include}")
 
 
 class build_py(_build_py):
@@ -43,7 +50,7 @@ extension = NpuExtension(
     sources=["csrc/shared_prefix_attention.cpp"],
     include_dirs=[
         str(op_api / "include"),
-        str(cann_root / "x86_64-linux" / "include"),
+        str(cann_include),
         str(torch_npu_root / "include" / "third_party" / "acl" / "inc"),
         str(torch_npu_root / "include" / "third_party" / "op-plugin"),
         str(torch_npu_root / "include" / "third_party" / "op-plugin" / "op_plugin" / "include"),

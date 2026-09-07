@@ -3,7 +3,12 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_DIR="${ROOT_DIR}/opp/project"
-OUTPUT_DIR="${PREFIX_GROUPER_NPU_BUILD_DIR:-${ROOT_DIR}/build/native}"
+BUILD_ARCH="$(uname -m)"
+case "${BUILD_ARCH}" in
+    x86_64|aarch64) ;;
+    *) echo "Unsupported native build architecture: ${BUILD_ARCH}" >&2; exit 2 ;;
+esac
+OUTPUT_DIR="${PREFIX_GROUPER_NPU_BUILD_DIR:-${ROOT_DIR}/build/native}/${BUILD_ARCH}"
 mkdir -p "${OUTPUT_DIR}"
 OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd -P)"
 echo "Build output: ${OUTPUT_DIR}"
@@ -25,7 +30,14 @@ cmake --build "${BUILD_DIR}" --target package -j"${BUILD_JOBS:-2}"
 
 rm -rf "${STAGE_DIR}"
 mkdir -p "${STAGE_DIR}"
-"${BUILD_DIR}/custom_opp_ubuntu_x86_64.run" --quiet --install-path="${STAGE_DIR}"
+shopt -s nullglob
+OPP_INSTALLERS=("${BUILD_DIR}"/custom_opp_*_"${BUILD_ARCH}".run)
+shopt -u nullglob
+if [[ ${#OPP_INSTALLERS[@]} -ne 1 ]]; then
+    echo "Expected exactly one ${BUILD_ARCH} OPP installer in ${BUILD_DIR}; found ${#OPP_INSTALLERS[@]}." >&2
+    exit 2
+fi
+"${OPP_INSTALLERS[0]}" --quiet --install-path="${STAGE_DIR}"
 
 # Stage only build inputs so setuptools cannot reuse another environment's artifacts.
 mkdir -p "${SOURCE_DIR}/prefix_grouper_npu" "${SOURCE_DIR}/csrc"
