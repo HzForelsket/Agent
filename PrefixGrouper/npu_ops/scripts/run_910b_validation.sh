@@ -35,5 +35,5 @@ PY
 
 cd "${RESULT_DIR}"
 python -m pytest -vv -s -o cache_dir="${RESULT_DIR}/pytest-cache" \
-    "${ROOT_DIR}/tests/test_npu_correctness.py::test_single_core_minimal_forward_backward" \
+    "${ROOT_DIR}/tests/test_npu_correctness.py::test_original_minimal_random_forward_backward" \
     2>&1 | tee "${RESULT_DIR}/correctness.log"

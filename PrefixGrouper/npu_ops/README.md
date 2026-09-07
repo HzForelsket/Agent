@@ -12,9 +12,9 @@ shared prefix.
 
 This branch isolates backward multi-core execution. Forward remains at
 `blockDim=1`, with only block 0 processing its rows serially. Backward restores
-the original round-robin task assignment with up to 20 blocks. The arithmetic,
-LSE DMA path and single numerical test are unchanged. This is not a performance
-implementation.
+the original round-robin task assignment with up to 20 blocks. The arithmetic
+and LSE DMA path are unchanged. The single numerical test now uses the original
+smallest failing random case. This is not a performance implementation.
 
 ## Native NPU build
 
@@ -125,34 +125,25 @@ This entrypoint requires a usable NPU and fails if none is available. It runs
 only `test_npu_correctness.py`, with logs and pytest cache in the result directory.
 It does not run benchmarks or profiler collection automatically.
 
-The entrypoint selects exactly one numerical case: three tokens, one query/KV
-head, head dimension 128, one prefix token and two separate one-token suffixes.
-For this case, forward uses one block and backward uses six blocks: blocks 0-2
-compute the three dQ rows, and blocks 3-5 compute the three dK/dV row pairs.
-Inputs are fixed BF16 values; all unlisted coordinates are zero:
+The entrypoint selects exactly one numerical case, the original smallest
+failing random case: 65 tokens, `Hq=Hkv=2`, head dimension 128,
+`prefix_lens=(1,)`, `suffix_lens=(1,63)`, `group_sizes=(2,)`. Forward uses one
+block and backward uses 20 blocks to process 130 dQ rows and 130 dK/dV row pairs.
 
-| Token | Q[:2] | K[:2] | V[0] | dOut[0] |
-| --- | --- | --- | --- | --- |
-| Prefix | [1, 0] | [1, 1] | 1 | 1 |
-| Suffix A | [1, 0] | [1, -1] | 3 | 1 |
-| Suffix B | [2, 0] | [1, 3] | -1 | 1 |
+The test preserves the original CPU RNG sequence: `torch.manual_seed(1234)`,
+then FP32 `randn` for Q, K and V in that order, each cast to BF16, followed by
+`randn_like(q_seed)` for the BF16 output gradient. Output and gradient references
+use the existing materialized FP32 CPU attention and autograd. The LSE reference
+uses FP32 masked scores over the same compact tokens; its mask is cross-checked
+by comparing the resulting attention output with the materialized reference.
 
-With `s = 1/sqrt(128)` computed in FP32, each suffix has two equal attention
-probabilities. The hand-derived values, in token order, are:
+The actual NPU autograd path runs once. Saved LSE is captured without replacing
+it or invoking a second forward. Before any numerical assertion, the JSON result
+prints actual/expected LSE in `[token, head]` order, output/gradient cosine and
+max absolute error, and the worst-error `[token, head, dimension]` index with
+its actual and expected values.
 
-- `out[:, 0, 0] = [1, 2, 0]`
-- `dQ[:, 0, 1] = [0, -s, -s]`
-- `dK[:, 0, 0] = [s/2, s/2, -s]`
-- `dV[:, 0, 0] = [2, 1/2, 1/2]`
-- `LSE[:, 0] = [s, s + ln(2), 2*s + ln(2)]`
-
-All other output and gradient coordinates are zero. The test first checks the
-hand-derived output/gradients against the existing materialized FP32 CPU
-reference, then runs the actual NPU autograd path once. It captures the saved
-LSE without replacing it or invoking a second forward. The JSON result includes
-actual/expected LSE, the first two coordinates of each output/gradient, cosine,
-max absolute error and the maximum magnitude in the remaining coordinates.
-It checks cosine >= 0.999 and every output/gradient element against the
-BF16-rounded analytical result with `rtol=0, atol=1e-5`; LSE uses
-`rtol=1e-5, atol=1e-6`. A passing tiny case does not validate other shapes or
-multi-core forward execution.
+The original random-case thresholds are retained: cosine >= 0.999 for output
+and gradients, output max absolute error <= 0.05, gradient max absolute error
+<= 0.1. LSE uses `rtol=1e-5, atol=1e-6`. No eight-case matrix or benchmark is run.
+A passing case does not validate other shapes or multi-core forward execution.
