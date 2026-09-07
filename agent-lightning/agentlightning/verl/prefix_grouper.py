@@ -142,14 +142,17 @@ def _npu_compact_attention(
     if dropout != 0.0:
         raise ValueError("The custom shared-prefix NPU operator requires attention dropout=0.")
     for name, tensor in (("query", query), ("key", key), ("value", value)):
-        if tensor.ndim != 4 or tensor.dtype != torch.bfloat16 or tensor.shape[-1] != 128:
-            raise ValueError(f"Custom NPU attention requires BF16 BNSD {name} with head_dim=128.")
+        if tensor.ndim != 4 or tensor.dtype != torch.bfloat16 or tensor.shape[-1] <= 0:
+            raise ValueError(f"Custom NPU attention requires BF16 BNSD {name} with positive head_dim.")
         if (tensor.shape[0], tensor.shape[2]) != tuple(prefix_grouper.x_shape):
             raise ValueError(f"{name} must match PrefixGrouper's grouped batch/sequence shape (no KV cache).")
         if tensor.device != query.device:
             raise ValueError("Custom NPU attention requires Q/K/V on the same device.")
     if key.shape != value.shape:
         raise ValueError("Custom NPU attention requires matching K/V shapes.")
+    if query.shape[-1] != key.shape[-1]:
+        raise ValueError("Custom NPU attention requires matching Q/K/V head dimensions.")
+    head_dim = query.shape[-1]
     if key.shape[1] == 0 or query.shape[1] == 0 or query.shape[1] % key.shape[1]:
         raise ValueError("Custom NPU attention requires positive Hq divisible by Hkv.")
 
@@ -167,14 +170,14 @@ def _npu_compact_attention(
     )
 
     def pack(tensor: torch.Tensor) -> torch.Tensor:
-        rows = tensor.transpose(1, 2).reshape(-1, tensor.shape[1], 128)
+        rows = tensor.transpose(1, 2).reshape(-1, tensor.shape[1], head_dim)
         return rows.index_select(0, compact_indices).contiguous()
 
     output = shared_prefix_attention(pack(query), pack(key), pack(value), plan, softmax_scale=scaling)
     # Padding gathers a separate zero row, so its gradient never reaches compact attention.
-    padded_output = torch.cat((output, output.new_zeros((1, query.shape[1], 128))), dim=0)
+    padded_output = torch.cat((output, output.new_zeros((1, query.shape[1], head_dim))), dim=0)
     return padded_output.index_select(0, restore_indices).reshape(
-        query.shape[0], query.shape[2], query.shape[1], 128
+        query.shape[0], query.shape[2], query.shape[1], head_dim
     )
 
 

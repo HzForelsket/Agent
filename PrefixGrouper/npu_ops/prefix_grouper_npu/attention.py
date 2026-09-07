@@ -12,7 +12,6 @@ from ._extension import load_extension
 
 _PLAN_CACHE: dict[tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], str], "SharedPrefixPlan"] = {}
 _PLAN_LOCK = Lock()
-_DEFAULT_SOFTMAX_SCALE = torch.tensor(128.0, dtype=torch.float32, device="cpu").rsqrt()
 
 
 def _positive_ints(values: Sequence[int] | torch.Tensor | Iterable[int], name: str) -> tuple[int, ...]:
@@ -37,6 +36,8 @@ class SharedPrefixPlan:
     prefix_start: torch.Tensor
     prefix_end: torch.Tensor
     sequence_start: torch.Tensor
+    sequence_end: torch.Tensor
+    group_end: torch.Tensor
     prefix_lens: tuple[int, ...]
     suffix_lens: tuple[int, ...]
     group_sizes: tuple[int, ...]
@@ -61,6 +62,8 @@ def build_shared_prefix_plan(
         raise ValueError("prefix_lens and group_sizes must have one entry per group")
     if sum(groups) != len(suffixes):
         raise ValueError("sum(group_sizes) must equal len(suffix_lens)")
+    if sum(prefixes) + sum(suffixes) > torch.iinfo(torch.int32).max:
+        raise ValueError("plan token offsets must fit int32")
 
     target_device = torch.device(device)
     key = (prefixes, suffixes, groups, str(target_device))
@@ -72,6 +75,8 @@ def build_shared_prefix_plan(
     prefix_start: list[int] = []
     prefix_end: list[int] = []
     sequence_start: list[int] = []
+    sequence_end: list[int] = []
+    group_end: list[int] = []
     token_offset = 0
     suffix_index = 0
     for prefix_len, group_size in zip(prefixes, groups, strict=True):
@@ -80,6 +85,7 @@ def build_shared_prefix_plan(
         prefix_start.extend([group_prefix_start] * prefix_len)
         prefix_end.extend([group_prefix_end] * prefix_len)
         sequence_start.extend([group_prefix_start] * prefix_len)
+        sequence_end.extend([group_prefix_end] * prefix_len)
         token_offset = group_prefix_end
         for _ in range(group_size):
             suffix_len = suffixes[suffix_index]
@@ -88,12 +94,16 @@ def build_shared_prefix_plan(
             prefix_start.extend([group_prefix_start] * suffix_len)
             prefix_end.extend([group_prefix_end] * suffix_len)
             sequence_start.extend([suffix_start] * suffix_len)
+            sequence_end.extend([suffix_start + suffix_len] * suffix_len)
             token_offset += suffix_len
+        group_end.extend([token_offset] * (token_offset - group_prefix_start))
 
     plan = SharedPrefixPlan(
         prefix_start=torch.tensor(prefix_start, dtype=torch.int32, device=target_device).contiguous(),
         prefix_end=torch.tensor(prefix_end, dtype=torch.int32, device=target_device).contiguous(),
         sequence_start=torch.tensor(sequence_start, dtype=torch.int32, device=target_device).contiguous(),
+        sequence_end=torch.tensor(sequence_end, dtype=torch.int32, device=target_device).contiguous(),
+        group_end=torch.tensor(group_end, dtype=torch.int32, device=target_device).contiguous(),
         prefix_lens=prefixes,
         suffix_lens=suffixes,
         group_sizes=groups,
@@ -115,19 +125,21 @@ def _validate(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, plan: SharedPre
     if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
         raise TypeError("q, k and v must have dtype torch.bfloat16")
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
-        raise ValueError("q, k and v must use compact [T, H, 128] TND layout")
+        raise ValueError("q, k and v must use compact [T, H, D] TND layout")
     if q.shape[0] == 0 or q.shape[0] != k.shape[0] or k.shape != v.shape:
         raise ValueError("q, k and v must have the same positive token count and matching k/v shapes")
-    if q.shape[2] != 128 or k.shape[2] != 128:
-        raise ValueError("only head_dim=128 is supported")
-    if k.shape[1] == 0 or q.shape[1] % k.shape[1] != 0:
+    if q.shape[2] <= 0 or q.shape[2] != k.shape[2]:
+        raise ValueError("q, k and v must have the same positive head_dim")
+    if q.shape[1] == 0 or k.shape[1] == 0 or q.shape[1] % k.shape[1] != 0:
         raise ValueError("Hq must be divisible by Hkv")
     if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
         raise ValueError("q, k and v must be contiguous")
     if q.shape[0] != plan.total_tokens:
         raise ValueError(f"plan expects {plan.total_tokens} tokens, got {q.shape[0]}")
-    for name in ("prefix_start", "prefix_end", "sequence_start"):
+    for name in ("prefix_start", "prefix_end", "sequence_start", "sequence_end", "group_end"):
         tensor = getattr(plan, name)
+        if tensor.device != q.device:
+            raise ValueError(f"plan.{name} must be on the same NPU as q")
         if tensor.dtype != torch.int32 or tensor.ndim != 1 or tensor.numel() != plan.total_tokens:
             raise ValueError(f"plan.{name} must be contiguous int32 [T]")
         if not tensor.is_contiguous():
@@ -144,23 +156,25 @@ class _SharedPrefixAttention(torch.autograd.Function):
         prefix_start: torch.Tensor,
         prefix_end: torch.Tensor,
         sequence_start: torch.Tensor,
+        sequence_end: torch.Tensor,
+        group_end: torch.Tensor,
         scale: float,
     ) -> torch.Tensor:
         out, lse = torch.ops.prefix_grouper_npu.shared_prefix_attention_forward(
-            q, k, v, prefix_start, prefix_end, sequence_start, scale
+            q, k, v, prefix_start, prefix_end, sequence_start, sequence_end, group_end, scale
         )
-        ctx.save_for_backward(q, k, v, out, lse, prefix_start, prefix_end, sequence_start)
+        ctx.save_for_backward(q, k, v, out, lse, prefix_start, prefix_end, sequence_start, sequence_end, group_end)
         ctx.scale = scale
         return out
 
     @staticmethod
     def backward(ctx: torch.autograd.function.FunctionCtx, grad_out: torch.Tensor):
-        q, k, v, out, lse, prefix_start, prefix_end, sequence_start = ctx.saved_tensors
+        q, k, v, out, lse, prefix_start, prefix_end, sequence_start, sequence_end, group_end = ctx.saved_tensors
         dq, dk, dv = torch.ops.prefix_grouper_npu.shared_prefix_attention_backward(
             grad_out.contiguous(), q, k, v, out, lse,
-            prefix_start, prefix_end, sequence_start, ctx.scale
+            prefix_start, prefix_end, sequence_start, sequence_end, group_end, ctx.scale
         )
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None
 
 
 def shared_prefix_attention(
@@ -172,7 +186,7 @@ def shared_prefix_attention(
 ) -> torch.Tensor:
     _validate(q, k, v, plan)
     scale_fp32 = (
-        _DEFAULT_SOFTMAX_SCALE
+        torch.tensor(q.shape[2], dtype=torch.float32, device="cpu").rsqrt()
         if softmax_scale is None
         else torch.tensor(softmax_scale, dtype=torch.float32, device="cpu")
     )
@@ -182,5 +196,5 @@ def shared_prefix_attention(
     scale = scale_fp32.item()
     load_extension()
     return _SharedPrefixAttention.apply(
-        q, k, v, plan.prefix_start, plan.prefix_end, plan.sequence_start, scale
+        q, k, v, plan.prefix_start, plan.prefix_end, plan.sequence_start, plan.sequence_end, plan.group_end, scale
     )

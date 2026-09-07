@@ -1,269 +1,86 @@
-#include "kernel_operator.h"
-#include "shared_prefix_attention_tiling.h"
-
-using namespace AscendC;
-
-namespace {
-constexpr uint32_t kHeadDim = 128;
-constexpr uint32_t kBf16Bytes = kHeadDim * sizeof(bfloat16_t);
-constexpr uint32_t kFp32Bytes = kHeadDim * sizeof(float);
-
-class SharedPrefixAttentionBackwardKernel {
-public:
-    __aicore__ inline void Init(
-        GM_ADDR grad_out, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR lse,
-        GM_ADDR prefix_start, GM_ADDR prefix_end, GM_ADDR sequence_start,
-        GM_ADDR dq, GM_ADDR dk, GM_ADDR dv,
-        const SharedPrefixAttentionTilingData& tiling)
-    {
-        totalTokens_ = tiling.total_tokens;
-        qHeads_ = tiling.q_heads;
-        kvHeads_ = tiling.kv_heads;
-        scale_ = tiling.scale;
-        groupRatio_ = qHeads_ / kvHeads_;
-
-        gradOutGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(grad_out));
-        qGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(q));
-        kGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(k));
-        vGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(v));
-        outGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(out));
-        lseGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(lse));
-        prefixStartGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(prefix_start));
-        prefixEndGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(prefix_end));
-        sequenceStartGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(sequence_start));
-        dqGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(dq));
-        dkGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(dk));
-        dvGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(dv));
-
-        pipe_.InitBuffer(loadBfBuf_, kBf16Bytes);
-        pipe_.InitBuffer(storeBfBuf_, kBf16Bytes);
-        pipe_.InitBuffer(fp0Buf_, kFp32Bytes);
-        pipe_.InitBuffer(fp1Buf_, kFp32Bytes);
-        pipe_.InitBuffer(fp2Buf_, kFp32Bytes);
-        pipe_.InitBuffer(fp3Buf_, kFp32Bytes);
-        pipe_.InitBuffer(fp4Buf_, kFp32Bytes);
-        pipe_.InitBuffer(acc0Buf_, kFp32Bytes);
-        pipe_.InitBuffer(acc1Buf_, kFp32Bytes);
-        pipe_.InitBuffer(tmpBuf_, kFp32Bytes);
-        pipe_.InitBuffer(workBuf_, kFp32Bytes);
-        pipe_.InitBuffer(scalarInBuf_, 32);
-        pipe_.InitBuffer(scalarOutBuf_, 32);
-        pipe_.InitBuffer(lseBuf_, 32);
-    }
-
-    __aicore__ inline void Process()
-    {
-        const uint32_t dqTasks = totalTokens_ * qHeads_;
-        const uint32_t dkvTasks = totalTokens_ * kvHeads_;
-        const uint32_t allTasks = dqTasks + dkvTasks;
-        for (uint32_t task = GetBlockIdx(); task < allTasks; task += GetBlockNum()) {
-            if (task < dqTasks) {
-                ComputeDq(task / qHeads_, task % qHeads_);
-            } else {
-                const uint32_t dkvTask = task - dqTasks;
-                ComputeDkv(dkvTask / kvHeads_, dkvTask % kvHeads_);
-            }
-        }
-    }
-
-private:
-    __aicore__ inline float LoadLse(uint64_t offset)
-    {
-        // Read through MTE2 instead of retaining GM values in the scalar data cache.
-        LocalTensor<float> lseLocal = lseBuf_.Get<float>();
-        const DataCopyExtParams copyParams{1, sizeof(float), 0, 0, 0};
-        const DataCopyPadExtParams<float> padParams{false, 0, 0, 0.0f};
-        DataCopyPad(lseLocal, lseGm_[offset], copyParams, padParams);
-        event_t ready = static_cast<event_t>(pipe_.FetchEventID(HardEvent::MTE2_S));
-        SetFlag<HardEvent::MTE2_S>(ready);
-        WaitFlag<HardEvent::MTE2_S>(ready);
-        const float lse = lseLocal.GetValue(0);
-        event_t finished = static_cast<event_t>(pipe_.FetchEventID(HardEvent::S_MTE2));
-        SetFlag<HardEvent::S_MTE2>(finished);
-        WaitFlag<HardEvent::S_MTE2>(finished);
-        return lse;
-    }
-
-    __aicore__ inline void Load(
-        GlobalTensor<bfloat16_t>& gm, uint64_t offset, LocalTensor<float>& fp)
-    {
-        LocalTensor<bfloat16_t> bf = loadBfBuf_.Get<bfloat16_t>();
-        DataCopy(bf, gm[offset], kHeadDim);
-        PipeBarrier<PIPE_ALL>();
-        Cast(fp, bf, RoundMode::CAST_NONE, kHeadDim);
-        PipeBarrier<PIPE_ALL>();
-    }
-
-    __aicore__ inline void Store(
-        GlobalTensor<bfloat16_t>& gm, uint64_t offset, LocalTensor<float>& fp)
-    {
-        LocalTensor<bfloat16_t> bf = storeBfBuf_.Get<bfloat16_t>();
-        Cast(bf, fp, RoundMode::CAST_RINT, kHeadDim);
-        PipeBarrier<PIPE_ALL>();
-        DataCopy(gm[offset], bf, kHeadDim);
-        PipeBarrier<PIPE_ALL>();
-    }
-
-    __aicore__ inline float Dot(LocalTensor<float>& a, LocalTensor<float>& b)
-    {
-        LocalTensor<float> tmp = tmpBuf_.Get<float>();
-        LocalTensor<float> work = workBuf_.Get<float>();
-        Mul(tmp, a, b, kHeadDim);
-        ReduceSum(work, tmp, work, kHeadDim);
-        event_t event = static_cast<event_t>(pipe_.FetchEventID(HardEvent::V_S));
-        SetFlag<HardEvent::V_S>(event);
-        WaitFlag<HardEvent::V_S>(event);
-        return work.GetValue(0);
-    }
-
-    __aicore__ inline float ExpScalar(float value)
-    {
-        LocalTensor<float> src = scalarInBuf_.Get<float>();
-        LocalTensor<float> dst = scalarOutBuf_.Get<float>();
-        Duplicate(src, value, 8);
-        Exp(dst, src, 8);
-        event_t event = static_cast<event_t>(pipe_.FetchEventID(HardEvent::V_S));
-        SetFlag<HardEvent::V_S>(event);
-        WaitFlag<HardEvent::V_S>(event);
-        return dst.GetValue(0);
-    }
-
-    __aicore__ inline bool KeyAllowed(uint32_t queryToken, uint32_t keyToken)
-    {
-        const int32_t prefixStart = prefixStartGm_.GetValue(queryToken);
-        const int32_t prefixEnd = prefixEndGm_.GetValue(queryToken);
-        const int32_t sequenceStart = sequenceStartGm_.GetValue(queryToken);
-        if (sequenceStart == prefixStart) {
-            return keyToken >= static_cast<uint32_t>(prefixStart) && keyToken <= queryToken;
-        }
-        const bool inPrefix = keyToken >= static_cast<uint32_t>(prefixStart) &&
-                              keyToken < static_cast<uint32_t>(prefixEnd);
-        const bool inSuffix = keyToken >= static_cast<uint32_t>(sequenceStart) && keyToken <= queryToken;
-        return inPrefix || inSuffix;
-    }
-
-    __aicore__ inline void AccumulateDqKey(
-        uint32_t queryToken, uint32_t queryHead, uint32_t keyToken,
-        LocalTensor<float>& qFp, LocalTensor<float>& gradFp,
-        LocalTensor<float>& accFp, float delta, float lse)
-    {
-        LocalTensor<float> kFp = fp2Buf_.Get<float>();
-        LocalTensor<float> vFp = fp3Buf_.Get<float>();
-        const uint32_t kvHead = queryHead / groupRatio_;
-        const uint64_t kvOffset = (static_cast<uint64_t>(keyToken) * kvHeads_ + kvHead) * kHeadDim;
-        Load(kGm_, kvOffset, kFp);
-        const float probability = ExpScalar(Dot(qFp, kFp) * scale_ - lse);
-        Load(vGm_, kvOffset, vFp);
-        const float ds = probability * (Dot(gradFp, vFp) - delta) * scale_;
-        LocalTensor<float> tmp = tmpBuf_.Get<float>();
-        Muls(tmp, kFp, ds, kHeadDim);
-        Add(accFp, accFp, tmp, kHeadDim);
-        PipeBarrier<PIPE_ALL>();
-    }
-
-    __aicore__ inline void ComputeDq(uint32_t queryToken, uint32_t queryHead)
-    {
-        LocalTensor<float> qFp = fp0Buf_.Get<float>();
-        LocalTensor<float> gradFp = fp1Buf_.Get<float>();
-        LocalTensor<float> outFp = fp2Buf_.Get<float>();
-        LocalTensor<float> accFp = acc0Buf_.Get<float>();
-        const uint64_t qOffset = (static_cast<uint64_t>(queryToken) * qHeads_ + queryHead) * kHeadDim;
-        Load(qGm_, qOffset, qFp);
-        Load(gradOutGm_, qOffset, gradFp);
-        Load(outGm_, qOffset, outFp);
-        const float delta = Dot(gradFp, outFp);
-        const float lse = LoadLse(static_cast<uint64_t>(queryToken) * qHeads_ + queryHead);
-        Duplicate(accFp, 0.0f, kHeadDim);
-        PipeBarrier<PIPE_ALL>();
-
-        const int32_t prefixStart = prefixStartGm_.GetValue(queryToken);
-        const int32_t prefixEnd = prefixEndGm_.GetValue(queryToken);
-        const int32_t sequenceStart = sequenceStartGm_.GetValue(queryToken);
-        if (sequenceStart == prefixStart) {
-            for (int32_t key = prefixStart; key <= static_cast<int32_t>(queryToken); ++key) {
-                AccumulateDqKey(queryToken, queryHead, static_cast<uint32_t>(key), qFp, gradFp, accFp, delta, lse);
-            }
-        } else {
-            for (int32_t key = prefixStart; key < prefixEnd; ++key) {
-                AccumulateDqKey(queryToken, queryHead, static_cast<uint32_t>(key), qFp, gradFp, accFp, delta, lse);
-            }
-            for (int32_t key = sequenceStart; key <= static_cast<int32_t>(queryToken); ++key) {
-                AccumulateDqKey(queryToken, queryHead, static_cast<uint32_t>(key), qFp, gradFp, accFp, delta, lse);
-            }
-        }
-        Store(dqGm_, qOffset, accFp);
-    }
-
-    __aicore__ inline void ComputeDkv(uint32_t keyToken, uint32_t kvHead)
-    {
-        LocalTensor<float> kFp = fp0Buf_.Get<float>();
-        LocalTensor<float> vFp = fp1Buf_.Get<float>();
-        LocalTensor<float> qFp = fp2Buf_.Get<float>();
-        LocalTensor<float> gradFp = fp3Buf_.Get<float>();
-        LocalTensor<float> outFp = fp4Buf_.Get<float>();
-        LocalTensor<float> dkFp = acc0Buf_.Get<float>();
-        LocalTensor<float> dvFp = acc1Buf_.Get<float>();
-        const uint64_t kvOffset = (static_cast<uint64_t>(keyToken) * kvHeads_ + kvHead) * kHeadDim;
-        Load(kGm_, kvOffset, kFp);
-        Load(vGm_, kvOffset, vFp);
-        Duplicate(dkFp, 0.0f, kHeadDim);
-        Duplicate(dvFp, 0.0f, kHeadDim);
-        PipeBarrier<PIPE_ALL>();
-
-        const uint32_t firstQHead = kvHead * groupRatio_;
-        const uint32_t lastQHead = firstQHead + groupRatio_;
-        for (uint32_t queryToken = 0; queryToken < totalTokens_; ++queryToken) {
-            if (!KeyAllowed(queryToken, keyToken)) {
-                continue;
-            }
-            for (uint32_t queryHead = firstQHead; queryHead < lastQHead; ++queryHead) {
-                const uint64_t qOffset = (static_cast<uint64_t>(queryToken) * qHeads_ + queryHead) * kHeadDim;
-                Load(qGm_, qOffset, qFp);
-                Load(gradOutGm_, qOffset, gradFp);
-                Load(outGm_, qOffset, outFp);
-                const float lse = LoadLse(static_cast<uint64_t>(queryToken) * qHeads_ + queryHead);
-                const float probability = ExpScalar(Dot(qFp, kFp) * scale_ - lse);
-                const float delta = Dot(gradFp, outFp);
-                const float ds = probability * (Dot(gradFp, vFp) - delta) * scale_;
-                LocalTensor<float> tmp = tmpBuf_.Get<float>();
-                Muls(tmp, qFp, ds, kHeadDim);
-                Add(dkFp, dkFp, tmp, kHeadDim);
-                Muls(tmp, gradFp, probability, kHeadDim);
-                Add(dvFp, dvFp, tmp, kHeadDim);
-                PipeBarrier<PIPE_ALL>();
-            }
-        }
-        Store(dkGm_, kvOffset, dkFp);
-        Store(dvGm_, kvOffset, dvFp);
-    }
-
-    TPipe pipe_;
-    TBuf<QuePosition::VECCALC> loadBfBuf_, storeBfBuf_;
-    TBuf<QuePosition::VECCALC> fp0Buf_, fp1Buf_, fp2Buf_, fp3Buf_, fp4Buf_;
-    TBuf<QuePosition::VECCALC> acc0Buf_, acc1Buf_, tmpBuf_, workBuf_;
-    TBuf<QuePosition::VECCALC> scalarInBuf_, scalarOutBuf_, lseBuf_;
-    GlobalTensor<bfloat16_t> gradOutGm_, qGm_, kGm_, vGm_, outGm_;
-    GlobalTensor<bfloat16_t> dqGm_, dkGm_, dvGm_;
-    GlobalTensor<int32_t> prefixStartGm_, prefixEndGm_, sequenceStartGm_;
-    GlobalTensor<float> lseGm_;
-    uint32_t totalTokens_ = 0;
-    uint32_t qHeads_ = 0;
-    uint32_t kvHeads_ = 0;
-    uint32_t groupRatio_ = 0;
-    float scale_ = 0.0f;
-};
-}
+#include "shared_prefix_attention_common.h"
+using namespace shared_prefix;
 
 extern "C" __global__ __aicore__ void shared_prefix_attention_backward(
-    GM_ADDR grad_out, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR lse,
-    GM_ADDR prefix_start, GM_ADDR prefix_end, GM_ADDR sequence_start,
-    GM_ADDR dq, GM_ADDR dk, GM_ADDR dv, GM_ADDR workspace, GM_ADDR tiling)
+    GM_ADDR grad_out, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR delta, GM_ADDR lse,
+    GM_ADDR prefix_start, GM_ADDR prefix_end, GM_ADDR sequence_start, GM_ADDR sequence_end,
+    GM_ADDR group_end, GM_ADDR dq, GM_ADDR dk, GM_ADDR dv, GM_ADDR workspace, GM_ADDR tiling)
 {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     REGISTER_TILING_DEFAULT(SharedPrefixAttentionTilingData);
-    GET_TILING_DATA(tilingData, tiling);
-    SharedPrefixAttentionBackwardKernel kernel;
-    kernel.Init(grad_out, q, k, v, out, lse, prefix_start, prefix_end, sequence_start,
-                dq, dk, dv, tilingData);
-    kernel.Process();
+    GET_TILING_DATA(t, tiling);
+    Attention a;
+    REGIST_MATMUL_OBJ(&a.pipe, GetSysWorkSpacePtr(), a.scoreMm, &t.score_mm,
+                      a.valueMm, &t.value_mm, a.transposeMm, &t.transpose_mm);
+    a.Init(t, GetUserWorkspace(workspace));
+    a.q.SetGlobalBuffer(reinterpret_cast<__gm__ Bf*>(q));
+    a.k.SetGlobalBuffer(reinterpret_cast<__gm__ Bf*>(k));
+    a.v.SetGlobalBuffer(reinterpret_cast<__gm__ Bf*>(v));
+    a.grad.SetGlobalBuffer(reinterpret_cast<__gm__ Bf*>(grad_out));
+    a.delta.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(delta));
+    a.lse.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(lse));
+    a.output.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(dq));
+    a.dk.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(dk));
+    a.dv.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(dv));
+    a.prefixStart.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(prefix_start));
+    a.prefixEnd.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(prefix_end));
+    a.sequenceStart.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(sequence_start));
+    a.sequenceEnd.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(sequence_end));
+    a.groupEnd.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(group_end));
+    const uint64_t qTasks = ((t.total_tokens + a.b - 1) / a.b) * t.q_heads;
+    for (uint64_t task = GetBlockIdx(); task < t.task_count; task += t.vector_cores) {
+        if (task < qTasks) {
+            const uint64_t qh = task % t.q_heads, kh = qh / (t.q_heads / t.kv_heads);
+            const uint64_t end = Min((task / t.q_heads + 1) * a.b, t.total_tokens);
+            for (uint64_t qt = task / t.q_heads * a.b; qt < end;) {
+                const uint64_t segmentEnd = Min(end, a.sequenceEnd.GetValue(qt));
+                const uint32_t qr = segmentEnd - qt;
+                a.LoadStats(qt, qh, qr);
+                bool first = true;
+                const uint64_t ps = a.prefixStart.GetValue(qt), pe = a.prefixEnd.GetValue(qt);
+                const uint64_t ss = a.sequenceStart.GetValue(qt);
+                for (uint32_t interval = 0; interval < (ss == ps ? 1U : 2U); ++interval) {
+                    const uint64_t begin = interval == 0 ? ps : ss;
+                    const uint64_t limit = ss == ps || interval == 1 ? segmentEnd : pe;
+                    for (uint64_t kt = begin; kt < limit; kt += a.b) {
+                        const uint32_t kr = Min(a.b, limit - kt);
+                        a.Dot(a.scores, a.q, a.k, qt, kt, qh, kh, qr, kr);
+                        a.Dot(a.dp, a.grad, a.v, qt, kt, qh, kh, qr, kr);
+                        a.GradientWeights(qt, kt, qr, kr);
+                        a.Apply(a.valueMm, 1, a.k, kt, kh, t.kv_heads, kr,
+                                a.output, qt, qh, t.q_heads, qr, first, false);
+                        first = false;
+                    }
+                }
+                qt = segmentEnd;
+            }
+        } else {
+            const uint64_t job = task - qTasks, kh = job % t.kv_heads;
+            const uint64_t end = Min((job / t.kv_heads + 1) * a.b, t.total_tokens);
+            for (uint64_t kt = job / t.kv_heads * a.b; kt < end;) {
+                const uint64_t segmentEnd = Min(end, a.sequenceEnd.GetValue(kt));
+                const uint32_t kr = segmentEnd - kt;
+                const bool prefix = a.prefixStart.GetValue(kt) == a.sequenceStart.GetValue(kt);
+                const uint64_t queryEnd = prefix ? a.groupEnd.GetValue(kt) : a.sequenceEnd.GetValue(kt);
+                bool first = true;
+                // One owner reduces all visible queries and GQA heads for this KV block.
+                for (uint64_t qt = kt; qt < queryEnd; qt += a.b) {
+                    const uint32_t qr = Min(a.b, queryEnd - qt);
+                    const uint64_t ratio = t.q_heads / t.kv_heads;
+                    for (uint64_t qh = kh * ratio; qh < (kh + 1) * ratio; ++qh) {
+                        a.LoadStats(qt, qh, qr);
+                        a.Dot(a.scores, a.q, a.k, qt, kt, qh, kh, qr, kr);
+                        a.Dot(a.dp, a.grad, a.v, qt, kt, qh, kh, qr, kr);
+                        a.GradientWeights(qt, kt, qr, kr);
+                        a.Apply(a.transposeMm, 1, a.q, qt, qh, t.q_heads, qr,
+                                a.dk, kt, kh, t.kv_heads, kr, first, true);
+                        a.Apply(a.transposeMm, 0, a.grad, qt, qh, t.q_heads, qr,
+                                a.dv, kt, kh, t.kv_heads, kr, first, true);
+                        first = false;
+                    }
+                }
+                kt = segmentEnd;
+            }
+        }
+    }
 }

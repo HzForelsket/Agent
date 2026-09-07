@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 
-def dense_lse_reference(q, k, prefix_lens, suffix_lens, group_sizes):
+def dense_lse_reference(q, k, prefix_lens, suffix_lens, group_sizes, scale=None):
     """Independent compact mask oracle for the small LSE/lifecycle cases."""
     total = q.shape[0]
     allowed = torch.zeros((total, total), dtype=torch.bool)
@@ -24,7 +24,8 @@ def dense_lse_reference(q, k, prefix_lens, suffix_lens, group_sizes):
             offset = end
     assert offset == total and suffix_index == len(suffix_lens)
     keys = k.float().repeat_interleave(q.shape[1] // k.shape[1], dim=1)
-    scale = torch.tensor(128.0, dtype=torch.float32).rsqrt()
+    scale = (torch.tensor(q.shape[-1], dtype=torch.float32).rsqrt() if scale is None
+             else torch.tensor(scale, dtype=torch.float32))
     scores = torch.einsum("thd,shd->hts", q.float(), keys) * scale
     return scores.masked_fill(~allowed.unsqueeze(0), float("-inf")).logsumexp(-1).T.contiguous()
 
@@ -49,7 +50,7 @@ def materialized_reference(
     scale: float | None = None,
 ) -> torch.Tensor:
     scale = (
-        torch.tensor(128.0, dtype=torch.float32, device="cpu").rsqrt().item()
+        torch.tensor(q.shape[-1], dtype=torch.float32, device="cpu").rsqrt().item()
         if scale is None
         else torch.tensor(scale, dtype=torch.float32, device="cpu").item()
     )

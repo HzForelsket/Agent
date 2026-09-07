@@ -1,8 +1,8 @@
 # prefix-grouper-npu
 
-`prefix-grouper-npu` 0.1.1 is an optional AscendC extension for compact shared-prefix
+`prefix-grouper-npu` 0.2.0 is an optional AscendC extension for compact shared-prefix
 attention on Atlas A2 / Ascend 910B. It targets CANN 9.0.0, PyTorch 2.10.0 and
-torch-npu 2.10.0, supports BF16 TND tensors with head dimension 128, and does
+torch-npu 2.10.0, supports BF16 TND tensors with a positive dynamic head dimension, and does
 not provide a CPU fallback.
 
 The package stores one prefix K/V per group. Each response suffix attends to
@@ -92,8 +92,11 @@ plan = build_shared_prefix_plan(
 out = shared_prefix_attention(q, k, v, plan)
 ```
 
-`q` has shape `[T, Hq, 128]`; `k` and `v` have shape `[T, Hkv, 128]`.
+`q` has shape `[T, Hq, D]`; `k` and `v` have shape `[T, Hkv, D]`.
 All tensors must be contiguous BF16 tensors on one NPU, and `Hq % Hkv == 0`.
+Heads and D must be positive. D need not be aligned and has no fixed 256 limit;
+the default scale is computed from the actual D. Token offsets must fit int32,
+and padded tensor/workspace sizes must fit the checked int64 address range.
 Scale computation and validation, softmax, and kernel accumulation use FP32.
 PyTorch and the generated CANN ACLNN scalar interfaces require a host `double`
 parameter; it only transports the FP32 scale and does not introduce FP64 tensor
@@ -105,6 +108,46 @@ prefix slice plus a causal slice over only its own suffix.
 There is no CPU implementation, FP16 mode, dropout, determinism guarantee or
 distributed communication. The Meta implementation only provides schema/shape
 inference and does not execute attention.
+
+## Kernel design
+
+The forward and backward operators use CANN's MIX_AIC_1_2 Matmul service:
+Cube computes matrix products and AIV performs FP32 softmax and accumulation.
+Host tiling selects an aligned square block from input size and actual UB,
+L1, L0 and core resources. Q, KV and D are split into blocks, including tails.
+The budget includes all live local tensors, queues and the three registered
+Matmul objects; the launch is no longer capped at 20 cores.
+
+Two GM operand/result slots per AIV separate producer and consumer lifetimes.
+The next operand block is copied while the current asynchronous Matmul runs;
+the next product is then launched before Vector consumes the previous result.
+This pipeline is used by D reductions and output-D block updates. Single-block
+workloads only execute startup/drain and have no steady-state D overlap.
+Input and result queues have two slots; dependency-specific events and Vector
+barriers replace whole-pipeline barriers. Scalar work remains for row statistics,
+causal tails and pack gather indices; the implementation is not fully scalar-free.
+
+Forward maintains online FP32 max/sum statistics and a padded FP32 output
+accumulator, converting local probabilities to BF16 for PV. Backward computes
+delta once with a Vector operator. Separate Q and KV block owners recompute
+local probabilities and reduce their entire gradients without global atomics.
+Sequence/group end metadata limits KV-gradient queries to the contributing
+sequence or group. Prefix K/V storage and GQA heads are never materialized.
+
+FP32 accumulators have D rounded to 16, so each row starts on a 64-byte boundary.
+A separate Vector pack operator assigns aligned compact output ranges to cores,
+gathers padded rows and writes BF16 tails safely. LSE uses independent padded
+FP32 rows, followed by the native strided-to-contiguous copy. Intermediate
+score/probability storage is bounded by block size, not sequence length squared.
+The linear FP32 accumulators and GM staging introduce extra memory/traffic;
+dynamic-D support does not imply a measured speed or memory improvement.
+
+The internal ACLNN forward/backward outputs are padded FP32 accumulators;
+the public PyTorch outputs remain compact BF16 with compact FP32 LSE.
+Plans add `sequence_end` and `group_end` int32 tensors. Rebuild/install the 0.2.0
+wheel and OPP together; there is no old-schema adapter or serial-kernel switch.
+The rewritten kernels require fresh hardware validation. Device-free compilation
+and schema checks cannot establish their numerical accuracy or pipeline overlap.
 
 ## Validation
 
@@ -126,8 +169,8 @@ prefix contribution back into the compact reference gradient. Completion
 requires cosine similarity at least 0.999, output max absolute error at most
 0.05, and gradient max absolute error at most 0.1 for every case.
 
-The hardware suite contains 14 tests: the original eight numerical cases and
-one input-contract test, plus:
+The hardware suite retains the eight numerical cases and input-contract checks,
+and covers:
 
 - Three LSE boundary cases with `T * Hq` equal to 15, 16 and 17. The test captures
   the actual FP32 LSE saved by the public autograd function, checks it against an
@@ -143,6 +186,10 @@ one input-contract test, plus:
   hidden-state gradients and all four projection-weight gradients. Cosine must
   be at least 0.999, output absolute error at most 0.02, gradient absolute error
   at most 0.01, and loss must satisfy `rtol=0.02`, `atol=0.001`.
+- Dynamic D values 1, 15, 16, 17, 127, 128, 129, 256, 257 and 513 with two groups,
+  GQA, actual saved LSE and all gradients; D=17 also uses an explicit scale.
+- Pipeline sequence boundaries 63, 64, 65 and 129 with unaligned D=17.
+  The A/B/A lifecycle case uses D=129 to cover padded rows and D tails.
 
 Attention inputs and projection weights originate as BF16 values; loss targets
 and CPU reference tensor computation are FP32. Metrics include the worst
@@ -181,7 +228,7 @@ padding gradients cannot reach the compact tokens. Actor and reference workers
 receive the same model setting. Calls without a PrefixGrouper still use the
 original attention implementation, including rollout and ungrouped batches.
 
-Custom mode requires BF16, head_dim=128, positive prefix/suffix lengths,
+Custom mode requires BF16, equal positive Q/K/V head dimensions, positive prefix/suffix lengths,
 Hq divisible by Hkv, zero attention dropout, and full causal attention without
 sliding windows, softcap or KV-cache decoding. Unsupported custom calls fail;
 there is no automatic fallback to fusion. Use FSDP/FSDP2 with Ulysses size 1.
@@ -222,11 +269,11 @@ output directory and this small, explicit workload:
 
 ```bash
 bash scripts/run_910b_benchmark.sh \
-  build/native/aarch64/performance-0.1.1 \
+  build/native/aarch64/performance-0.2.0 \
   --prefix 1 --suffixes 1 63 --hq 2 --hkv 2 --warmup 2 --iterations 10
 ```
 
-The wrapper configures the installed OPP automatically and runs all 14 hardware
+The wrapper configures the installed OPP automatically and runs the hardware
 tests in a separate Python process first. Any failure prevents timing. It then
 runs the existing benchmark in the active Python environment, without proot.
 For the requested workload, the benchmark also compares custom and materialized

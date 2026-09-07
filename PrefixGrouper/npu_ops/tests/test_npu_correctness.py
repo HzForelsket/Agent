@@ -91,21 +91,21 @@ def test_forward_backward_against_materialized_fp32_reference(
         assert metrics[name]["max_abs"] <= 0.1
 
 
-def _small_inputs(total, hq, hkv, seed):
+def _small_inputs(total, hq, hkv, seed, dim=128):
     rng = torch.Generator(device="cpu").manual_seed(seed)
-    q = torch.randn(total, hq, 128, generator=rng, dtype=torch.float32).to(torch.bfloat16)
-    k = torch.randn(total, hkv, 128, generator=rng, dtype=torch.float32).to(torch.bfloat16)
-    v = torch.randn(total, hkv, 128, generator=rng, dtype=torch.float32).to(torch.bfloat16)
+    q = torch.randn(total, hq, dim, generator=rng, dtype=torch.float32).to(torch.bfloat16)
+    k = torch.randn(total, hkv, dim, generator=rng, dtype=torch.float32).to(torch.bfloat16)
+    v = torch.randn(total, hkv, dim, generator=rng, dtype=torch.float32).to(torch.bfloat16)
     grad = torch.randn(q.shape, generator=rng, dtype=torch.bfloat16)
     return q, k, v, grad
 
 
-def _check_small_call(name, seeds, metadata, buffers):
+def _check_small_call(name, seeds, metadata, buffers, scale=None):
     q_seed, k_seed, v_seed, grad_seed = seeds
     q_ref, k_ref, v_ref = (tensor.float().requires_grad_(True) for tensor in seeds[:3])
-    out_ref = materialized_reference(q_ref, k_ref, v_ref, *metadata)
+    out_ref = materialized_reference(q_ref, k_ref, v_ref, *metadata, scale=scale)
     out_ref.backward(grad_seed.float())
-    lse_ref = dense_lse_reference(q_seed, k_seed, *metadata)
+    lse_ref = dense_lse_reference(q_seed, k_seed, *metadata, scale=scale)
     q, k, v = buffers
     with torch.no_grad():
         for target, source in zip(buffers, seeds[:3], strict=True):
@@ -122,7 +122,7 @@ def _check_small_call(name, seeds, metadata, buffers):
 
     # Observe the LSE saved by the real forward; do not substitute a reference or rerun it.
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
-        out = shared_prefix_attention(q, k, v, plan)
+        out = shared_prefix_attention(q, k, v, plan, softmax_scale=scale)
     out.backward(grad_seed.npu())
     torch.npu.synchronize()
     assert len(saved_lse) == 1
@@ -134,7 +134,7 @@ def _check_small_call(name, seeds, metadata, buffers):
     actual["lse"] = saved_lse[0].cpu().clone()
     metrics = {
         "case": {"name": name, "prefix_lens": metadata[0], "suffix_lens": metadata[1],
-                 "group_sizes": metadata[2], "hq": q.shape[1], "hkv": k.shape[1]},
+                 "group_sizes": metadata[2], "hq": q.shape[1], "hkv": k.shape[1], "head_dim": q.shape[-1], "scale": scale},
         **{key: _metric(actual[key], expected[key]) for key in expected},
         "lse": _metric(actual["lse"], lse_ref),
     }
@@ -154,8 +154,8 @@ def test_lse_block_boundaries(total):
 
 
 def test_same_process_a_b_a_reuses_buffers_and_plans():
-    a = _small_inputs(17, 2, 1, 1234)
-    b = _small_inputs(17, 2, 1, 5678)
+    a = _small_inputs(17, 2, 1, 1234, 129)
+    b = _small_inputs(17, 2, 1, 5678, 129)
     buffers = tuple(torch.empty_like(tensor, device="npu", requires_grad=True) for tensor in a[:3])
     metadata_a = ((1,), (1, 15), (2,))
     metadata_b = ((2,), (3, 12), (2,))
@@ -220,8 +220,10 @@ def test_invalid_tensor_contracts() -> None:
     k = torch.empty((3, 1, 128), device="npu", dtype=torch.bfloat16)
     with pytest.raises(TypeError, match="bfloat16"):
         shared_prefix_attention(q.float(), k, k, plan)
-    with pytest.raises(ValueError, match="head_dim=128"):
-        shared_prefix_attention(q[:, :, :64].contiguous(), k[:, :, :64].contiguous(), k[:, :, :64].contiguous(), plan)
+    with pytest.raises(ValueError, match="same positive head_dim"):
+        shared_prefix_attention(q[:, :, :64].contiguous(), k, k, plan)
+    with pytest.raises(ValueError, match="same positive head_dim"):
+        shared_prefix_attention(q[:, :, :0].contiguous(), k[:, :, :0].contiguous(), k[:, :, :0].contiguous(), plan)
     noncontiguous_q = q.transpose(0, 1).contiguous().transpose(0, 1)
     with pytest.raises(ValueError, match="contiguous"):
         shared_prefix_attention(noncontiguous_q, k, k, plan)
@@ -229,3 +231,19 @@ def test_invalid_tensor_contracts() -> None:
     with pytest.raises(ValueError, match="divisible"):
         shared_prefix_attention(bad_heads, torch.empty((3, 2, 128), device="npu", dtype=torch.bfloat16),
                                 torch.empty((3, 2, 128), device="npu", dtype=torch.bfloat16), plan)
+
+
+@pytest.mark.parametrize("dim", [1, 15, 16, 17, 127, 128, 129, 256, 257, 513])
+def test_dynamic_head_dimension_forward_lse_and_gradients(dim):
+    metadata = ((2, 1), (2, 1, 3), (2, 1))
+    seeds = _small_inputs(9, 3, 1, 2468, dim)
+    buffers = tuple(torch.empty_like(tensor, device="npu", requires_grad=True) for tensor in seeds[:3])
+    _check_small_call(f"dynamic_d_{dim}", seeds, metadata, buffers, scale=0.125 if dim == 17 else None)
+
+
+@pytest.mark.parametrize("length", [63, 64, 65, 129])
+def test_pipeline_boundaries_with_unaligned_dimension(length):
+    metadata = ((1,), (length, 1), (2,))
+    seeds = _small_inputs(length + 2, 2, 1, 1357, 17)
+    buffers = tuple(torch.empty_like(tensor, device="npu", requires_grad=True) for tensor in seeds[:3])
+    _check_small_call(f"pipeline_{length}", seeds, metadata, buffers)

@@ -10,6 +10,8 @@ def test_plan_encodes_shared_prefix_and_suffix_ranges() -> None:
     assert plan.prefix_start.tolist() == [0, 0, 0, 0, 0]
     assert plan.prefix_end.tolist() == [2, 2, 2, 2, 2]
     assert plan.sequence_start.tolist() == [0, 0, 2, 2, 4]
+    assert plan.sequence_end.tolist() == [2, 2, 4, 4, 5]
+    assert plan.group_end.tolist() == [5] * 5
     assert build_shared_prefix_plan([2], [2, 1], [2], device="cpu") is plan
 
 
@@ -19,6 +21,8 @@ def test_plan_is_group_isolated() -> None:
     assert plan.prefix_start.tolist() == [0, 0, 2, 2, 2, 2, 2]
     assert plan.prefix_end.tolist() == [1, 1, 4, 4, 4, 4, 4]
     assert plan.sequence_start.tolist() == [0, 1, 2, 2, 4, 4, 6]
+    assert plan.sequence_end.tolist() == [1, 2, 4, 4, 6, 6, 7]
+    assert plan.group_end.tolist() == [2, 2, 7, 7, 7, 7, 7]
 
 
 @pytest.mark.parametrize(
@@ -30,6 +34,7 @@ def test_plan_is_group_isolated() -> None:
         ([1, 1], [1], [1], "one entry per group"),
         ([1], [1, 1], [1], r"sum\(group_sizes\)"),
         ([1.5], [1], [1], "integer sequence"),
+        ([2**31 - 1], [1], [1], "int32"),
     ],
 )
 def test_invalid_plan_metadata_is_rejected(prefix_lens, suffix_lens, group_sizes, match) -> None:
