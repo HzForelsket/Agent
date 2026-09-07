@@ -53,13 +53,10 @@ public:
 
     __aicore__ inline void Process()
     {
-        if (GetBlockIdx() != 0) {
-            return;
-        }
         const uint32_t dqTasks = totalTokens_ * qHeads_;
         const uint32_t dkvTasks = totalTokens_ * kvHeads_;
         const uint32_t allTasks = dqTasks + dkvTasks;
-        for (uint32_t task = 0; task < allTasks; ++task) {
+        for (uint32_t task = GetBlockIdx(); task < allTasks; task += GetBlockNum()) {
             if (task < dqTasks) {
                 ComputeDq(task / qHeads_, task % qHeads_);
             } else {

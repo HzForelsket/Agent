@@ -10,9 +10,11 @@ the shared prefix and its own causal suffix range. The backward kernel writes
 each compact K/V gradient once and accumulates all response contributions to a
 shared prefix.
 
-This branch is a single-core correctness isolation build. Both operators set
-`blockDim=1`, and only block 0 processes all rows serially. The arithmetic and
-LSE DMA path are unchanged. This is not a performance implementation.
+This branch isolates backward multi-core execution. Forward remains at
+`blockDim=1`, with only block 0 processing its rows serially. Backward restores
+the original round-robin task assignment with up to 20 blocks. The arithmetic,
+LSE DMA path and single numerical test are unchanged. This is not a performance
+implementation.
 
 ## Native NPU build
 
@@ -125,6 +127,8 @@ It does not run benchmarks or profiler collection automatically.
 
 The entrypoint selects exactly one numerical case: three tokens, one query/KV
 head, head dimension 128, one prefix token and two separate one-token suffixes.
+For this case, forward uses one block and backward uses six blocks: blocks 0-2
+compute the three dQ rows, and blocks 3-5 compute the three dK/dV row pairs.
 Inputs are fixed BF16 values; all unlisted coordinates are zero:
 
 | Token | Q[:2] | K[:2] | V[0] | dOut[0] |
@@ -151,4 +155,4 @@ max absolute error and the maximum magnitude in the remaining coordinates.
 It checks cosine >= 0.999 and every output/gradient element against the
 BF16-rounded analytical result with `rtol=0, atol=1e-5`; LSE uses
 `rtol=1e-5, atol=1e-6`. A passing tiny case does not validate other shapes or
-multi-core execution.
+multi-core forward execution.
