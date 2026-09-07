@@ -20,12 +20,15 @@ source "${ROOT_DIR}/scripts/activate.sh"
 import torch
 import torch_npu
 import prefix_grouper_npu
+import platform
 import sys
 
 print("python:", sys.executable)
 print("torch:", torch.__version__)
 print("torch_npu:", torch_npu.__version__)
 print("prefix_grouper_npu:", prefix_grouper_npu.__version__)
+print("package_path:", prefix_grouper_npu.__file__)
+print("architecture:", platform.machine())
 print("npu_available:", torch.npu.is_available())
 if not torch.npu.is_available():
     raise RuntimeError("A real Ascend NPU is required; use run_cpu_dev.sh check for device-free checks.")

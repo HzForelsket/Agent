@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import platform
 import statistics
 import sys
 import time
@@ -9,6 +11,7 @@ from pathlib import Path
 
 import torch
 import torch_npu
+import prefix_grouper_npu
 
 from prefix_grouper_npu import build_shared_prefix_plan, shared_prefix_attention
 
@@ -35,16 +38,29 @@ def _baseline_inputs(q, k, v, prefix_lens, suffix_lens, group_sizes):
     return (torch.cat(q_parts), torch.cat(k_parts), torch.cat(v_parts), q_cumulative, kv_cumulative)
 
 
-def _measure(fn, warmup: int, iterations: int):
+def _measure(fn, warmup: int, iterations: int, record, save):
     for _ in range(warmup): fn()
     torch.npu.synchronize()
-    samples = []
     torch.npu.reset_peak_memory_stats()
     for _ in range(iterations):
         start = time.perf_counter(); fn(); torch.npu.synchronize()
-        samples.append((time.perf_counter() - start) * 1000)
-    return {"median_ms": statistics.median(samples), "samples_ms": samples,
-            "peak_bytes": torch.npu.max_memory_allocated()}
+        record["samples_ms"].append((time.perf_counter() - start) * 1000)
+        record["median_ms"] = statistics.median(record["samples_ms"])
+        record["peak_bytes"] = torch.npu.max_memory_allocated()
+        save()
+    record["status"] = "complete"
+    save()
+
+
+def _check_outputs(custom, baseline):
+    actual = custom().detach().float().cpu()
+    expected = baseline().detach().float().cpu()
+    if actual.shape != expected.shape or not torch.isfinite(actual).all() or not torch.isfinite(expected).all():
+        raise RuntimeError("benchmark output shape/finite check failed")
+    return {
+        "cosine": torch.nn.functional.cosine_similarity(actual.flatten(), expected.flatten(), dim=0).item(),
+        "max_abs": (actual - expected).abs().max().item(),
+    }
 
 
 def main() -> None:
@@ -58,8 +74,49 @@ def main() -> None:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--trace-dir", type=Path)
     args = parser.parse_args()
+    if args.prefix <= 0 or any(length <= 0 for length in args.suffixes):
+        parser.error("prefix and suffix lengths must be positive")
+    if args.hkv <= 0 or args.hq <= 0 or args.hq % args.hkv:
+        parser.error("hq and hkv must be positive, and hq must be divisible by hkv")
+    if args.warmup < 0 or args.iterations <= 0:
+        parser.error("warmup must be nonnegative and iterations must be positive")
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        if args.output.exists():
+            parser.error("output already exists; use a fresh result path")
+        print(f"Benchmark output: {args.output.resolve()}", flush=True)
+    result = {
+        "benchmark_id": "pg-ascend-shared-prefix-attention",
+        "status": "initializing",
+        "command": sys.argv,
+        "python": sys.executable,
+        "architecture": platform.machine(),
+        "torch": torch.__version__,
+        "torch_npu": torch_npu.__version__,
+        "prefix_grouper_npu": prefix_grouper_npu.__version__,
+        "package_path": prefix_grouper_npu.__file__,
+        "ascend_home_path": os.environ.get("ASCEND_HOME_PATH"),
+        "custom_opp_path": os.environ.get("ASCEND_CUSTOM_OPP_PATH"),
+        "input": {key: str(value) if isinstance(value, Path) else value
+                  for key, value in vars(args).items()},
+        "measurement": "forward only; synchronized host wall time; prebuilt inputs and plan",
+        "comparison": "raw operator measurements, not an Agent Lightning baseline or end-to-end speedup",
+    }
+
+    def save():
+        if args.output:
+            temporary = args.output.with_suffix(args.output.suffix + ".tmp")
+            temporary.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            temporary.replace(args.output)
+
+    save()
     if not torch.npu.is_available():
         raise RuntimeError("benchmark requires a real Ascend 910B")
+    result["device"] = torch.npu.get_device_name(0)
+    torch.manual_seed(1234)
+    torch.npu.manual_seed_all(1234)
+    result["seed"] = 1234
+    save()
 
     total = args.prefix + sum(args.suffixes)
     q = torch.randn(total, args.hq, 128, device="npu", dtype=torch.bfloat16)
@@ -78,19 +135,27 @@ def main() -> None:
         sparse_mode=3,
     )[0]
 
-    result = {
-        "command": sys.argv,
-        "device": torch.npu.get_device_name(0),
-        "torch": torch.__version__,
-        "torch_npu": torch_npu.__version__,
-        "cann": "9.0.0",
-        "input": vars(args) | {"output": str(args.output) if args.output else None},
+    result.update({
         "compact_input_bytes": compact_storage,
         "materialized_baseline_input_bytes": (bq.numel() + bk.numel() + bv.numel()) * bq.element_size(),
-        "shared_prefix_attention": _measure(custom, args.warmup, args.iterations),
-        "npu_fusion_attention_materialized": _measure(baseline, args.warmup, args.iterations),
-    }
+    })
+    result["status"] = "checking_outputs"
+    save()
+    result["correctness"] = _check_outputs(custom, baseline)
+    save()
+    if result["correctness"]["cosine"] < 0.999 or result["correctness"]["max_abs"] > 0.05:
+        result["status"] = "failed_correctness"
+        save()
+        raise RuntimeError(f"benchmark outputs disagree: {result['correctness']}")
+    for name, fn in (("shared_prefix_attention", custom), ("npu_fusion_attention_materialized", baseline)):
+        result["status"] = name
+        record = {"status": "running", "samples_ms": []}
+        result[name] = record
+        save()
+        _measure(fn, args.warmup, args.iterations, record, save)
     if args.trace_dir:
+        result["status"] = "profiling"
+        save()
         args.trace_dir.mkdir(parents=True, exist_ok=True)
         for name, fn in (("shared_prefix", custom), ("materialized_fusion_attention", baseline)):
             with torch_npu.profiler.profile(
@@ -107,10 +172,10 @@ def main() -> None:
                 fn()
                 torch.npu.synchronize()
         result["trace_dir"] = str(args.trace_dir)
+    result["status"] = "complete"
+    save()
     payload = json.dumps(result, indent=2, sort_keys=True)
     print(payload)
-    if args.output:
-        args.output.write_text(payload + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

@@ -70,8 +70,9 @@ bash scripts/run_cpu_dev.sh build
 bash scripts/run_cpu_dev.sh check
 ```
 
-`build` builds and installs the wheel inside proot. `check` runs only the existing
-plan and schema/Meta tests. It never runs hardware correctness or benchmarks.
+`build` builds and installs the wheel inside proot. `check` runs the plan,
+schema/Meta tests and one small analytical reference check. It never runs
+hardware correctness or benchmarks.
 The fixed project proot wrapper, its rootfs and the project path inside that
 rootfs must already be available. It does not install development dependencies.
 
@@ -124,3 +125,66 @@ the prefix into every suffix K/V sequence. Autograd therefore sums each copied
 prefix contribution back into the compact reference gradient. Completion
 requires cosine similarity at least 0.999, output max absolute error at most
 0.05, and gradient max absolute error at most 0.1 for every case.
+
+The hardware suite contains 14 tests: the original eight numerical cases and
+one input-contract test, plus:
+
+- Three LSE boundary cases with `T * Hq` equal to 15, 16 and 17. The test captures
+  the actual FP32 LSE saved by the public autograd function, checks it against an
+  independent dense masked CPU oracle (`rtol=1e-5`, `atol=1e-6`), and checks the
+  BF16 output and all three gradients using the original thresholds.
+- One same-process A/B/A case. It explicitly overwrites the same Q/K/V buffers,
+  resets leaf gradients between calls, switches input values and plan metadata
+  for B, and returns to A's cached plan. Each call independently checks output,
+  LSE and gradients against the CPU reference. A1/A2 differences are recorded;
+  bitwise determinism is not required.
+- One public-API autograd integration case: Q/K/V projections, GQA attention,
+  output projection, residual and FP32 loss. It uses two prefix groups and checks
+  hidden-state gradients and all four projection-weight gradients. Cosine must
+  be at least 0.999, output absolute error at most 0.02, gradient absolute error
+  at most 0.01, and loss must satisfy `rtol=0.02`, `atol=0.001`.
+
+Attention inputs and projection weights originate as BF16 values; loss targets
+and CPU reference tensor computation are FP32. Metrics include the worst
+token/head/component index and its actual and
+expected values. The analytical CPU reference check verifies uniform attention,
+LSE and shared-prefix gradient accumulation; it is not NPU execution evidence.
+
+The integration case covers composition with PyTorch autograd, not a model
+training step. Agent Lightning/VERL currently calls `npu_fusion_attention` and
+does not route through this package, so its model benchmarks cannot establish
+this custom operator's integration correctness or performance.
+
+## Small Native Performance Run
+
+`pg-ascend-shared-prefix-attention` (Ascend shared-prefix attention operator
+microbenchmark) remains a forward-only benchmark. On a real 910B, use a fresh
+output directory and this small, explicit workload:
+
+```bash
+bash scripts/run_910b_benchmark.sh \
+  build/native/aarch64/performance-0.1.1 \
+  --prefix 1 --suffixes 1 63 --hq 2 --hkv 2 --warmup 2 --iterations 10
+```
+
+The wrapper configures the installed OPP automatically and runs all 14 hardware
+tests in a separate Python process first. Any failure prevents timing. It then
+runs the existing benchmark in the active Python environment, without proot.
+For the requested workload, the benchmark also compares custom and materialized
+fusion-attention outputs before timing (cosine at least 0.999, max absolute
+error at most 0.05).
+The directory must not already exist. `validation/` contains environment and
+correctness logs; `benchmark.log` captures errors; `benchmark.json` records
+configuration before input allocation and is updated after each timed sample.
+Only `status=complete` indicates that all requested stages finished. A partial
+file retains completed measurements but is not a completed comparison.
+
+The measurements are synchronized host wall-clock forward latency samples and
+their median, process-wide peak allocated NPU memory, and input storage sizes.
+Input materialization and plan construction are outside the timing window;
+both compact and materialized inputs remain resident for both measurements.
+Peak memory is therefore not an isolated per-operator allocation comparison.
+The `npu_fusion_attention_materialized` entry is an operator-level comparator,
+not Agent Lightning without PrefixGrouper. Report raw measurements only, not
+end-to-end speedup, backward performance, or production throughput. No benchmark
+is run by `run_cpu_dev.sh` or by the correctness-only validation entrypoint.

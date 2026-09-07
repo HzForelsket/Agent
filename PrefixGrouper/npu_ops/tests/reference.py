@@ -3,6 +3,32 @@ from __future__ import annotations
 import torch
 
 
+def dense_lse_reference(q, k, prefix_lens, suffix_lens, group_sizes):
+    """Independent compact mask oracle for the small LSE/lifecycle cases."""
+    total = q.shape[0]
+    allowed = torch.zeros((total, total), dtype=torch.bool)
+    offset = suffix_index = 0
+    for prefix_len, group_size in zip(prefix_lens, group_sizes, strict=True):
+        prefix_start = offset
+        prefix_end = offset + prefix_len
+        allowed[offset:prefix_end, offset:prefix_end] = torch.ones(
+            (prefix_len, prefix_len), dtype=torch.bool
+        ).tril()
+        offset = prefix_end
+        for _ in range(group_size):
+            length = suffix_lens[suffix_index]
+            suffix_index += 1
+            end = offset + length
+            allowed[offset:end, prefix_start:prefix_end] = True
+            allowed[offset:end, offset:end] = torch.ones((length, length), dtype=torch.bool).tril()
+            offset = end
+    assert offset == total and suffix_index == len(suffix_lens)
+    keys = k.float().repeat_interleave(q.shape[1] // k.shape[1], dim=1)
+    scale = torch.tensor(128.0, dtype=torch.float32).rsqrt()
+    scores = torch.einsum("thd,shd->hts", q.float(), keys) * scale
+    return scores.masked_fill(~allowed.unsqueeze(0), float("-inf")).logsumexp(-1).T.contiguous()
+
+
 def _attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor, scale: float) -> torch.Tensor:
     ratio = q.shape[1] // k.shape[1]
     k_heads = k.repeat_interleave(ratio, dim=1)
