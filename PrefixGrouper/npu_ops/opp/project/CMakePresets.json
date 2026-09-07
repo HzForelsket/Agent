@@ -13,8 +13,7 @@
         "ASCEND_COMPUTE_UNIT": {"type": "STRING", "value": "ascend910b"},
         "ENABLE_TEST": {"type": "BOOL", "value": "False"},
         "vendor_name": {"type": "STRING", "value": "prefix_grouper_npu"},
-        "ASCEND_CANN_PACKAGE_PATH": {"type": "PATH", "value": "/usr/local/Ascend/cann-9.0.0"},
-        "ASCEND_PYTHON_EXECUTABLE": {"type": "STRING", "value": "/usr/bin/python3"},
+        "ASCEND_CANN_PACKAGE_PATH": {"type": "PATH", "value": "$env{ASCEND_HOME_PATH}"},
         "CMAKE_INSTALL_PREFIX": {"type": "PATH", "value": "${sourceDir}/build_out"},
         "ENABLE_CROSS_COMPILE": {"type": "BOOL", "value": "False"},
         "ASCEND_PACK_SHARED_LIBRARY": {"type": "BOOL", "value": "False"}

@@ -28,7 +28,7 @@ if not match:
 version_macro = f"-DCURRENT_VERSION=V{match.group(1)}R{match.group(2)}"
 torch_npu_root = pathlib.Path(torch_npu.__file__).resolve().parent
 op_api = VENDOR / "op_api"
-cann_root = pathlib.Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/cann-9.0.0"))
+cann_root = pathlib.Path(os.environ["ASCEND_HOME_PATH"])
 
 
 class build_py(_build_py):

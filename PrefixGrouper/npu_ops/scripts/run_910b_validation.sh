@@ -5,15 +5,12 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULT_DIR="${1:?usage: run_910b_validation.sh RESULT_DIR}"
 mkdir -p "${RESULT_DIR}"
 
-source /opt/agent-npu-cpu-dev/bin/activate
-set +u
-source /usr/local/Ascend/cann-9.0.0/bin/setenv.bash
-set -u
-export SOC_VERSION=ascend910b1
+source "${ROOT_DIR}/scripts/activate.sh"
 
 {
     echo "command: $0 ${RESULT_DIR}"
     date --iso-8601=seconds
+    echo "ASCEND_HOME_PATH: ${ASCEND_HOME_PATH}"
     python - <<'PY'
 import torch
 import torch_npu

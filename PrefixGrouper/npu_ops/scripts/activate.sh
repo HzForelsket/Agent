@@ -1,13 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -z "${VIRTUAL_ENV:-}" || "${VIRTUAL_ENV}" != "/opt/agent-npu-cpu-dev" ]]; then
-    source /opt/agent-npu-cpu-dev/bin/activate
-fi
-set +u
-source /usr/local/Ascend/cann-9.0.0/bin/setenv.bash
-set -u
-export SOC_VERSION=ascend910b1
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cann_env.sh"
 
 PREFIX_GROUPER_NPU_VENDOR_ROOT="$(python - <<'PY'
 from pathlib import Path

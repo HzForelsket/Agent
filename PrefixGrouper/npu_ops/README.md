@@ -23,6 +23,21 @@ Import, schema discovery and Meta shape inference can be checked without an
 NPU. Numerical correctness and performance results require a real 910B with a
 matching driver and are never inferred from device-free checks.
 
+The scripts use the active Python environment; activate the environment with
+PyTorch 2.10.0 and torch-npu 2.10.0 before invoking them. CANN is selected by
+`ASCEND_HOME_PATH`, or discovered under `~/Ascend` before the local proot's
+`/usr/local/Ascend/cann-9.0.0` installation. The compiler's `version.info` must
+report exactly 9.0.0. For an explicit installation path, use:
+
+```bash
+export ASCEND_HOME_PATH="$HOME/Ascend/cann-9.0.0"
+source scripts/activate.sh
+```
+
+Set the path to the actual toolkit directory containing `compiler/version.info`.
+`activate.sh` requires the installed operator wheel; `build_wheel.sh` loads CANN
+without importing the operator package. The build currently targets x86_64.
+
 ## Interface
 
 ```python
