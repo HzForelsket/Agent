@@ -10,13 +10,16 @@ the shared prefix and its own causal suffix range. The backward kernel writes
 each compact K/V gradient once and accumulates all response contributions to a
 shared prefix.
 
-Build only inside the project Ubuntu 22.04 proot:
+## Native NPU build
+
+On the NPU server, activate its Python 3.10 environment with PyTorch 2.10.0
+and torch-npu 2.10.0, then build and install locally:
 
 ```bash
-source /opt/agent-npu-cpu-dev/bin/activate
 cd /home/huangzhong/Agent/PrefixGrouper/npu_ops
-./scripts/build_wheel.sh
-python -m pip install --no-deps --force-reinstall dist/prefix_grouper_npu-*.whl
+export ASCEND_HOME_PATH="$HOME/Ascend/cann-9.0.0"
+bash scripts/build_wheel.sh
+python -m pip install --no-deps --force-reinstall build/native/dist/prefix_grouper_npu-*.whl
 ```
 
 Import, schema discovery and Meta shape inference can be checked without an
@@ -25,8 +28,8 @@ matching driver and are never inferred from device-free checks.
 
 The scripts use the active Python environment; activate the environment with
 PyTorch 2.10.0 and torch-npu 2.10.0 before invoking them. CANN is selected by
-`ASCEND_HOME_PATH`, or discovered under `~/Ascend` before the local proot's
-`/usr/local/Ascend/cann-9.0.0` installation. The compiler's `version.info` must
+`ASCEND_HOME_PATH`, or discovered under `~/Ascend`. Native scripts never activate
+the CPU development environment or enter proot. The compiler's `version.info` must
 report exactly 9.0.0. For an explicit installation path, use:
 
 ```bash
@@ -37,6 +40,27 @@ source scripts/activate.sh
 Set the path to the actual toolkit directory containing `compiler/version.info`.
 `activate.sh` requires the installed operator wheel; `build_wheel.sh` loads CANN
 without importing the operator package. The build currently targets x86_64.
+
+## CPU proot development
+
+Only this entrypoint selects the local Ubuntu 22.04 proot, its
+`/opt/agent-npu-cpu-dev` Python environment and its CANN installation:
+
+```bash
+cd /home/huangzhong/Agent/PrefixGrouper/npu_ops
+bash scripts/run_cpu_dev.sh build
+bash scripts/run_cpu_dev.sh check
+```
+
+`build` builds and installs the wheel inside proot. `check` runs only the existing
+plan and schema/Meta tests. It never runs hardware correctness or benchmarks.
+The fixed project proot wrapper, its rootfs and the project path inside that
+rootfs must already be available. It does not install development dependencies.
+
+Native build outputs are under `build/native`; proot outputs are under
+`build/proot`. Each has separate CMake, staged Python sources, setuptools and
+wheel directories. Do not install the proot wheel on the NPU server; build there
+using its own environment. No hardware validation is performed on this CPU host.
 
 ## Interface
 
@@ -61,22 +85,17 @@ inference and does not execute attention.
 
 ## Validation
 
-Device-free checks:
+On a matching Atlas A2 / 910B, after the native build and installation, capture
+the environment log and correctness results with:
 
 ```bash
-cd /root
-python -m pytest -q \
-  /home/huangzhong/Agent/PrefixGrouper/npu_ops/tests/test_plan.py \
-  /home/huangzhong/Agent/PrefixGrouper/npu_ops/tests/test_schema.py
-```
-
-On a matching Atlas A2 / 910B, capture the version log, full correctness matrix,
-benchmark measurements and profiler traces with:
-
-```bash
-/home/huangzhong/Agent/PrefixGrouper/npu_ops/scripts/run_910b_validation.sh \
+bash /home/huangzhong/Agent/PrefixGrouper/npu_ops/scripts/run_910b_validation.sh \
   /path/to/result-directory
 ```
+
+This entrypoint requires a usable NPU and fails if none is available. It runs
+only `test_npu_correctness.py`, with logs and pytest cache in the result directory.
+It does not run benchmarks or profiler collection automatically.
 
 The correctness test uses an FP32 CPU reference that physically concatenates
 the prefix into every suffix K/V sequence. Autograd therefore sums each copied

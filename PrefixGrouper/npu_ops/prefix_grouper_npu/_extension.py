@@ -27,7 +27,7 @@ def load_extension() -> None:
         if not op_api.is_file() or extension is None:
             raise RuntimeError(
                 "prefix-grouper-npu native artifacts are missing; build and install the wheel "
-                "with scripts/build_wheel.sh inside the project Ubuntu 22.04 proot"
+                "with scripts/build_wheel.sh in the target NPU Python/CANN environment"
             )
         current = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
         entries = [entry for entry in current.split(":") if entry]

@@ -9,8 +9,7 @@ _prefix_grouper_load_cann() {
             "$HOME/Ascend/cann-9.0.0" \
             "$HOME/Ascend/ascend-toolkit/9.0.0" \
             "$HOME/Ascend/ascend-toolkit/latest" \
-            "$HOME/Ascend" \
-            /usr/local/Ascend/cann-9.0.0; do
+            "$HOME/Ascend"; do
             if [[ -f "${candidate}/compiler/version.info" ]]; then
                 root="${candidate}"
                 break
