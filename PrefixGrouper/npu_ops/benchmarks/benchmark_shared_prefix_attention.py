@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
 import json
 import os
 import platform
@@ -138,6 +140,93 @@ def _check_gradients(custom, baseline, inputs, grad_output):
     }
 
 
+def _profile(operators, modes, grad_output, args, result, save, profiler):
+    """Capture isolated calls after timing; backward preparation stays untraced."""
+    info = result["profiling"]
+    info["status"] = "running"
+    result["status"] = "profiling"
+    save()
+    metrics = (profiler.AiCMetrics.AiCoreNone if args.profile_aic_metrics == "None"
+               else getattr(profiler.AiCMetrics, args.profile_aic_metrics))
+    try:
+        for mode in modes:
+            for name, fn, inputs in operators:
+                for index in range(args.profile_steps):
+                    capture_dir = args.trace_dir / mode / name / f"step_{index:03d}"
+                    capture_dir.mkdir(parents=True, exist_ok=False)
+                    capture = {
+                        "mode": mode, "operator": name, "step": index,
+                        "directory": str(capture_dir), "status": "warming_up", "artifacts": {},
+                    }
+                    info["captures"].append(capture)
+                    print(f"NPU profile: {capture_dir}", flush=True)
+                    save()
+                    # Exporting a previous capture can take time. Warm both
+                    # operators by the same count immediately before each capture.
+                    for _ in range(args.warmup):
+                        step = _prepare_step(fn, inputs, grad_output, mode)
+                        output = step()
+                        torch.npu.synchronize()
+                        del output, step
+                    step = _prepare_step(fn, inputs, grad_output, mode)
+                    torch.npu.synchronize()
+                    capture["status"] = "collecting"
+                    save()
+                    with profiler.profile(
+                        activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
+                        on_trace_ready=profiler.tensorboard_trace_handler(
+                            str(capture_dir), analyse_flag=True, async_mode=False,
+                        ),
+                        record_shapes=True,
+                        profile_memory=True,
+                        with_stack=args.profile_with_stack,
+                        experimental_config=profiler._ExperimentalConfig(
+                            profiler_level=profiler.ProfilerLevel.Level1,
+                            aic_metrics=metrics,
+                            export_type=profiler.ExportType.Text,
+                            data_simplification=False,
+                        ),
+                    ) as prof:
+                        prof.add_metadata_json("benchmark", json.dumps({
+                            "benchmark_id": result["benchmark_id"],
+                            "script_sha256": result["script_sha256"],
+                            "input": result["input"],
+                            "mode": mode, "operator": name, "step": index,
+                            "scope": result["timing_scope"][mode],
+                        }))
+                        with torch.profiler.record_function(f"pg_attention/{name}/{mode}/step_{index:03d}"):
+                            output = step()
+                            with torch.profiler.record_function("pg_attention/device_synchronize"):
+                                torch.npu.synchronize()
+                    del output, step
+                    capture["status"] = "checking_export"
+                    # torch-npu catches some collection/export exceptions itself.
+                    # Do not report successful profiling just because the context exited.
+                    for filename in ("trace_view.json", "kernel_details.csv", "operator_details.csv"):
+                        paths = list(capture_dir.rglob(filename))
+                        if len(paths) != 1 or paths[0].stat().st_size == 0:
+                            raise RuntimeError(f"Missing or ambiguous profiler export {filename} under {capture_dir}")
+                        capture["artifacts"][filename] = str(paths[0])
+                    with Path(capture["artifacts"]["kernel_details.csv"]).open(encoding="utf-8-sig", newline="") as stream:
+                        kernels = csv.DictReader(stream)
+                        capture["kernel_columns"] = kernels.fieldnames
+                        capture["kernel_count"] = sum(1 for _ in kernels)
+                    if not capture["kernel_count"]:
+                        raise RuntimeError(f"Profiler exported no NPU kernel records under {capture_dir}")
+                    capture["status"] = "complete"
+                    save()
+    except Exception as exc:
+        info["status"] = "failed"
+        info["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        if info["captures"] and info["captures"][-1]["status"] != "complete":
+            info["captures"][-1]["status"] = "failed"
+        result["status"] = "failed_profiling"
+        save()
+        raise
+    info["status"] = "complete"
+    save()
+
+
 def _markdown_report(result):
     inputs = result["input"]
     status = result["status"]
@@ -200,6 +289,31 @@ def _markdown_report(result):
         "- 输出/梯度保留到计时结束；报告写入在每对采样结束后，profiler 在所有采样结束后运行。",
         "- 未完成的运行仅保留已有采样，不能作为完整对比结果。", "",
     ])
+    profiling = result.get("profiling")
+    if profiling:
+        lines.extend([
+            "## NPU Profile", "",
+            f"采集状态：`{profiling['status']}`；Level1；请求的 AI Core 指标：`{profiling['aic_metrics']}`。",
+            f"每条路径采集 {profiling['steps']} 次，每次采集前额外预热 {inputs['warmup']} 次。", "",
+            "- CPU/NPU 时间线、输入形状和内存分配均开启；堆栈采集："
+            f"{'开启' if profiling['with_stack'] else '关闭'}。",
+            "- 反向建图在采集外完成；时间线中的 pg_attention 范围标识路径及模式。",
+            "- Profile 包含采集开销，只用于定位瓶颈；上方耗时来自未开启 profiler 的采样。",
+            "- trace_view.json 查看调度与重叠；kernel_details.csv 查看设备任务耗时及可用硬件指标；"
+            "operator_details.csv 查看框架算子与设备耗时关联。",
+            "- 硬件指标以实机导出列为准；分配记录不能直接说明内核内部 GM/UB 搬运量。", "",
+            "| 模式 | 算子 | 采样 | 设备任务数 | 状态 | 文件 |",
+            "|---|---|---:|---:|---|---|",
+        ])
+        for capture in profiling["captures"]:
+            links = " · ".join(f"[{name}](<{path}>)" for name, path in capture["artifacts"].items())
+            lines.append(
+                f"| {labels[capture['mode']]} | {capture['operator']} | {capture['step']} | "
+                f"{capture.get('kernel_count', '—')} | {capture['status']} | {links or capture['directory']} |"
+            )
+        if "error" in profiling:
+            lines.extend(["", f"采集失败：{profiling['error']['type']}：{profiling['error']['message']}"])
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -238,7 +352,14 @@ def main() -> None:
         "--output-markdown", type=Path,
         help="Markdown report path; defaults to the --output path with a .md suffix",
     )
-    parser.add_argument("--trace-dir", type=Path)
+    parser.add_argument("--trace-dir", type=Path, help="new directory for CPU/NPU profiles collected after timing")
+    parser.add_argument("--profile-steps", type=int, default=1,
+                        help="isolated profile captures per operator and mode; requires --trace-dir")
+    parser.add_argument("--profile-aic-metrics", default="PipeUtilization",
+                        choices=["None", "PipeUtilization", "Memory", "MemoryL0", "MemoryUB", "ResourceConflictRatio"],
+                        help="one AI Core metric group per run; requires --trace-dir")
+    parser.add_argument("--profile-with-stack", action="store_true",
+                        help="include Python stacks in the profile; requires --trace-dir")
     args = parser.parse_args()
     if args.prefix <= 0 or any(length <= 0 for length in args.suffixes):
         parser.error("prefix and suffix lengths must be positive")
@@ -246,6 +367,17 @@ def main() -> None:
         parser.error("hq and hkv must be positive, and hq must be divisible by hkv")
     if args.warmup < 0 or args.iterations <= 0:
         parser.error("warmup must be nonnegative and iterations must be positive")
+    if args.profile_steps <= 0:
+        parser.error("profile-steps must be positive")
+    if not args.trace_dir and (args.profile_steps != 1 or args.profile_aic_metrics != "PipeUtilization"
+                               or args.profile_with_stack):
+        parser.error("profile options require --trace-dir")
+    if args.trace_dir:
+        args.trace_dir = args.trace_dir.resolve()
+        if args.trace_dir.exists():
+            parser.error(f"trace directory already exists: {args.trace_dir}; use a fresh path")
+        if args.output is None:
+            args.output = args.trace_dir / "benchmark.json"
     if args.output_markdown is None and args.output:
         args.output_markdown = args.output.with_suffix(".md")
     if args.output and args.output_markdown and args.output.resolve() == args.output_markdown.resolve():
@@ -253,6 +385,11 @@ def main() -> None:
     for path in (args.output, args.output_markdown):
         if path and path.exists():
             parser.error(f"output already exists: {path}; use a fresh result path")
+        if path and args.trace_dir and (path.resolve() == args.trace_dir or path.resolve() in args.trace_dir.parents):
+            parser.error("an output file cannot be the trace directory or its parent")
+    if args.trace_dir:
+        args.trace_dir.mkdir(parents=True, exist_ok=False)
+        print(f"NPU profile output: {args.trace_dir}", flush=True)
     for path in (args.output, args.output_markdown):
         if path:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -267,6 +404,8 @@ def main() -> None:
         "benchmark_id": "pg-ascend-shared-prefix-attention",
         "status": "initializing",
         "command": sys.argv,
+        "script_path": str(Path(__file__).resolve()),
+        "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "python": sys.executable,
         "architecture": platform.machine(),
         "torch": torch.__version__,
@@ -292,6 +431,13 @@ def main() -> None:
         },
         "comparison": "equivalent compact-input attention paths, not an Agent Lightning baseline or end-to-end speedup",
     }
+    if args.trace_dir:
+        result["profiling"] = {
+            "status": "pending", "directory": str(args.trace_dir), "steps": args.profile_steps,
+            "level": "Level1", "aic_metrics": args.profile_aic_metrics,
+            "with_stack": args.profile_with_stack, "record_shapes": True, "profile_memory": True,
+            "captures": [],
+        }
 
     def save():
         _save_results(result, args.output, args.output_markdown)
@@ -376,28 +522,7 @@ def main() -> None:
             save()
             raise
     if args.trace_dir:
-        result["status"] = "profiling"
-        save()
-        args.trace_dir.mkdir(parents=True, exist_ok=True)
-        for mode in modes:
-            for name, fn, inputs in operators:
-                trace_name = "shared_prefix" if name == "shared_prefix_attention" else "compact_fusion_attention"
-                trace_root = args.trace_dir if mode == "forward" else args.trace_dir / mode
-                step = _prepare_step(fn, inputs, grad_output, mode)
-                torch.npu.synchronize()
-                with torch_npu.profiler.profile(
-                    activities=[
-                        torch_npu.profiler.ProfilerActivity.CPU,
-                        torch_npu.profiler.ProfilerActivity.NPU,
-                    ],
-                    on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(trace_root / trace_name)),
-                    record_shapes=True,
-                    profile_memory=True,
-                ):
-                    output = step()
-                    torch.npu.synchronize()
-                del output, step
-        result["trace_dir"] = str(args.trace_dir)
+        _profile(operators, modes, grad_output, args, result, save, torch_npu.profiler)
     result["status"] = "complete"
     save()
     payload = json.dumps(result, indent=2, sort_keys=True)
