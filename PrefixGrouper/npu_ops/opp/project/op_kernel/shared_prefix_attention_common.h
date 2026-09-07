@@ -116,7 +116,8 @@ public:
         mm.SetSingleShape(b, b, b);
         mm.SetTensorA(aSlot[slot], ta);
         mm.SetTensorB(bSlot[slot], tb);
-        mm.template IterateAll<false>(cSlot[slot]);
+        // Async GM output must request the completion event consumed by WaitIterateAll.
+        mm.template IterateAll<false>(cSlot[slot], 0, false, true);
     }
     template <class MM> __aicore__ inline void Wait(MM& mm)
     {
