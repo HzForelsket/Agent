@@ -24,6 +24,6 @@ exec "$HOME/.codex/skills/proot-ubuntu2204/scripts/proot_ubuntu2204.sh" -- \
             source "${root_dir}/scripts/activate.sh"
             python -m pytest -q -o cache_dir="${root_dir}/build/proot/pytest-cache" \
                 "${root_dir}/tests/test_plan.py" "${root_dir}/tests/test_schema.py" \
-                "${root_dir}/tests/test_reference.py"
+                "${root_dir}/tests/test_reference.py" "${root_dir}/tests/test_benchmark.py"
         fi
     ' bash "${ROOT_DIR}" "${ACTION}"

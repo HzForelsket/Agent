@@ -217,13 +217,15 @@ Do not change the pinned dependencies or globally suppress warnings to hide it.
 ## Small Native Performance Run
 
 `pg-ascend-shared-prefix-attention` (Ascend shared-prefix attention operator
-microbenchmark) remains a forward-only benchmark. On a real 910B, use a fresh
-output directory and this small, explicit workload:
+microbenchmark) runs without loading a model. By default it measures forward
+only; add `--backward` to also measure backward and forward+backward. On a real
+910B, use a fresh output directory and this small, explicit workload:
 
 ```bash
 bash scripts/run_910b_benchmark.sh \
   build/native/aarch64/performance-0.1.1 \
-  --prefix 1 --suffixes 1 63 --hq 2 --hkv 2 --warmup 2 --iterations 10
+  --prefix 1 --suffixes 1 63 --hq 2 --hkv 2 --warmup 2 --iterations 10 \
+  --backward
 ```
 
 The wrapper configures the installed OPP automatically and runs all 14 hardware
@@ -231,19 +233,49 @@ tests in a separate Python process first. Any failure prevents timing. It then
 runs the existing benchmark in the active Python environment, without proot.
 For the requested workload, the benchmark also compares custom and materialized
 fusion-attention outputs before timing (cosine at least 0.999, max absolute
-error at most 0.05).
+error at most 0.05). With `--backward`, it also checks dQ/dK/dV using the same
+random output gradient for both operators (cosine at least 0.999, max absolute
+error at most 0.1). Fusion gradients for duplicated prefix K/V rows are summed
+back into compact token positions on CPU before comparison. A failed gradient
+check prevents all timing; details are saved under `gradient_correctness`.
 The directory must not already exist. `validation/` contains environment and
 correctness logs; `benchmark.log` captures errors; `benchmark.json` records
 configuration before input allocation and is updated after each timed sample.
+The same saves also generate `benchmark.md`, with the workload, per-mode median
+latencies, sample counts, process-wide memory peaks, correctness checks, and
+measurement scope. Incomplete runs are explicitly marked as incomplete in both
+reports. Report writing is outside the timing window.
+When invoking the Python benchmark directly, `--output results.json` also writes
+`results.md`; use `--output-markdown PATH` to choose a different Markdown path
+or request a Markdown report without a JSON file. Both output paths must be new
+and must differ from each other.
 Only `status=complete` indicates that all requested stages finished. A partial
 file retains completed measurements but is not a completed comparison.
 
-The measurements are synchronized host wall-clock forward latency samples and
-their median, process-wide peak allocated NPU memory, and input storage sizes.
+The measurements are synchronized host wall-clock latency samples and their
+median, process-wide peak allocated NPU memory, and input storage sizes.
+The existing top-level `shared_prefix_attention` and
+`npu_fusion_attention_materialized` records remain no-grad forward measurements.
+With `--backward`, the `backward` and `forward_backward` objects each contain
+the same two operator records, including `samples_ms`, `median_ms`, and `status`.
+`--no-backward` preserves the forward-only behavior.
+
+Backward-only timing rebuilds a fresh forward graph before each sample and
+synchronizes before starting the clock, so forward is excluded. Forward+backward
+times a fresh forward and its gradient computation together. Both modes use
+`torch.autograd.grad` without retaining graphs or accumulating leaf `.grad`
+buffers. Optional `--trace-dir` profiling covers every selected mode; backward
+and forward+backward traces are under `backward/` and `forward_backward/`.
+
 Input materialization and plan construction are outside the timing window;
 both compact and materialized inputs remain resident for both measurements.
 Peak memory is therefore not an isolated per-operator allocation comparison.
+Custom backward returns gradients for compact Q/K/V, including shared-prefix
+accumulation. Fusion backward returns gradients for its expanded Q/K/V; summing
+those prefix copies back into compact gradients is **excluded from timing** and
+done only for correctness. These are raw operator timings with different input
+layouts, not a full comparison of the permute/gather/scatter and custom paths.
 The `npu_fusion_attention_materialized` entry is an operator-level comparator,
 not Agent Lightning without PrefixGrouper. Report raw measurements only, not
-end-to-end speedup, backward performance, or production throughput. No benchmark
+end-to-end speedup or production throughput. No benchmark
 is run by `run_cpu_dev.sh` or by the correctness-only validation entrypoint.
