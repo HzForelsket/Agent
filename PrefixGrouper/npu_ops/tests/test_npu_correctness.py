@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
-import os
 
 import pytest
 import torch
@@ -17,87 +15,84 @@ from reference import materialized_reference
 pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="requires a real Ascend 910B")
 
 
-CASES = [
-    ((1,), (1, 63), (2,), 2, 2),
-    ((127,), (64, 65, 1, 63), (4,), 6, 2),
-    ((128,), (65,) * 8, (8,), 3, 1),
-    ((129,), (1, 64), (2,), 4, 4),
-    ((1024,), (63, 65, 64, 1), (4,), 3, 1),
-    ((1536,), (1, 63), (2,), 2, 1),
-    ((127, 129), (1, 63, 64, 65), (2, 2), 6, 2),
-    ((1, 128), (65, 1, 63, 64, 1, 65), (2, 4), 3, 1),
-]
-
-
-def _metric(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
-    actual = actual.detach().float().cpu().flatten()
-    expected = expected.detach().float().cpu().flatten()
+def _metric(actual: torch.Tensor, expected: torch.Tensor) -> dict:
     return {
-        "cosine": float(F.cosine_similarity(actual, expected, dim=0)),
-        "max_abs": float((actual - expected).abs().max()),
+        "cosine": F.cosine_similarity(actual.flatten(), expected.flatten(), dim=0).item(),
+        "max_abs": (actual - expected).abs().max().item(),
+        "actual_first_two": actual[:, 0, :2].tolist(),
+        "expected_first_two": expected[:, 0, :2].tolist(),
+        "actual_tail_max_abs": actual[:, :, 2:].abs().max().item(),
     }
 
 
-@pytest.mark.parametrize("prefix_lens,suffix_lens,group_sizes,hq,hkv", CASES)
-def test_forward_backward_against_materialized_fp32_reference(
-    prefix_lens, suffix_lens, group_sizes, hq, hkv, capsys
-) -> None:
-    torch.manual_seed(1234)
-    total_tokens = sum(prefix_lens) + sum(suffix_lens)
-    q_seed = torch.randn(total_tokens, hq, 128).to(torch.bfloat16)
-    k_seed = torch.randn(total_tokens, hkv, 128).to(torch.bfloat16)
-    v_seed = torch.randn(total_tokens, hkv, 128).to(torch.bfloat16)
-    grad_seed = torch.randn_like(q_seed)
+def test_single_core_minimal_forward_backward() -> None:
+    prefix_lens, suffix_lens, group_sizes = (1,), (1, 1), (2,)
+    q_seed = torch.zeros((3, 1, 128), dtype=torch.bfloat16)
+    k_seed = torch.zeros_like(q_seed)
+    v_seed = torch.zeros_like(q_seed)
+    grad_seed = torch.zeros_like(q_seed)
+    q_seed[:, 0, 0] = torch.tensor([1, 1, 2], dtype=torch.bfloat16)
+    k_seed[:, 0, :2] = torch.tensor([[1, 1], [1, -1], [1, 3]], dtype=torch.bfloat16)
+    v_seed[:, 0, 0] = torch.tensor([1, 3, -1], dtype=torch.bfloat16)
+    grad_seed[:, 0, 0] = 1
+
+    # Allowed keys are {0}, {0, 1}, {0, 2}; each suffix has probabilities (1/2, 1/2).
+    scale = torch.tensor(128.0, dtype=torch.float32).rsqrt()
+    expected = {name: torch.zeros((3, 1, 128), dtype=torch.float32)
+                for name in ("out", "dq", "dk", "dv")}
+    expected["out"][:, 0, 0] = torch.tensor([1, 2, 0], dtype=torch.float32)
+    expected["dq"][:, 0, 1] = scale * torch.tensor([0, -1, -1], dtype=torch.float32)
+    expected["dk"][:, 0, 0] = scale * torch.tensor([0.5, 0.5, -1], dtype=torch.float32)
+    expected["dv"][:, 0, 0] = torch.tensor([2, 0.5, 0.5], dtype=torch.float32)
+    expected_lse = (scale * torch.tensor([1, 1, 2], dtype=torch.float32)
+                    + torch.tensor([1, 2, 2], dtype=torch.float32).log()).reshape(3, 1)
 
     q_ref = q_seed.float().requires_grad_(True)
     k_ref = k_seed.float().requires_grad_(True)
     v_ref = v_seed.float().requires_grad_(True)
-    out_ref = materialized_reference(
-        q_ref, k_ref, v_ref, prefix_lens, suffix_lens, group_sizes
-    )
+    out_ref = materialized_reference(q_ref, k_ref, v_ref, prefix_lens, suffix_lens, group_sizes)
     out_ref.backward(grad_seed.float())
+    for name, value in {"out": out_ref, "dq": q_ref.grad, "dk": k_ref.grad, "dv": v_ref.grad}.items():
+        torch.testing.assert_close(value, expected[name], rtol=1e-6, atol=1e-7)
 
     q = q_seed.npu().requires_grad_(True)
     k = k_seed.npu().requires_grad_(True)
     v = v_seed.npu().requires_grad_(True)
     plan = build_shared_prefix_plan(prefix_lens, suffix_lens, group_sizes, device=q.device)
-    out = shared_prefix_attention(q, k, v, plan)
+    saved_lse: list[torch.Tensor] = []
+
+    def pack_saved(tensor: torch.Tensor) -> torch.Tensor:
+        saved = tensor.detach()
+        if saved.dtype == torch.float32 and saved.shape == (3, 1):
+            saved_lse.append(saved)
+        return saved
+
+    # Observe the actual autograd-saved LSE without a second forward or replacement values.
+    with torch.autograd.graph.saved_tensors_hooks(pack_saved, lambda tensor: tensor):
+        out = shared_prefix_attention(q, k, v, plan)
     out.backward(grad_seed.npu())
     torch.npu.synchronize()
 
+    assert len(saved_lse) == 1
+    actual_lse = saved_lse[0].float().cpu()
+    tensors = {"out": out, "dq": q.grad, "dk": k.grad, "dv": v.grad}
+    actual = {name: tensor.detach().float().cpu() for name, tensor in tensors.items()}
     metrics = {
-        "case": {
-            "prefix_lens": prefix_lens,
-            "suffix_lens": suffix_lens,
-            "group_sizes": group_sizes,
-            "hq": hq,
-            "hkv": hkv,
-        },
-        "out": _metric(out, out_ref),
-        "dq": _metric(q.grad, q_ref.grad),
-        "dk": _metric(k.grad, k_ref.grad),
-        "dv": _metric(v.grad, v_ref.grad),
+        "case": {"name": "single_core_minimal", "prefix_lens": prefix_lens,
+                 "suffix_lens": suffix_lens, "group_sizes": group_sizes,
+                 "hq": 1, "hkv": 1, "head_dim": 128, "scale": scale.item()},
+        "lse": {"actual": actual_lse.flatten().tolist(),
+                "expected": expected_lse.flatten().tolist(),
+                "max_abs": (actual_lse - expected_lse).abs().max().item()},
+        **{name: _metric(actual[name], expected[name]) for name in expected},
     }
-    print("PREFIX_GROUPER_NPU_RESULT=" + json.dumps(metrics, sort_keys=True))
-    assert metrics["out"]["cosine"] >= 0.999
-    assert metrics["out"]["max_abs"] <= 0.05
-    for name in ("dq", "dk", "dv"):
-        assert metrics[name]["cosine"] >= 0.999
-        assert metrics[name]["max_abs"] <= 0.1
+    print("PREFIX_GROUPER_NPU_RESULT=" + json.dumps(metrics, sort_keys=True), flush=True)
 
-
-def test_invalid_tensor_contracts() -> None:
-    plan = build_shared_prefix_plan([1], [1, 1], [2], device="npu")
-    q = torch.empty((3, 2, 128), device="npu", dtype=torch.bfloat16)
-    k = torch.empty((3, 1, 128), device="npu", dtype=torch.bfloat16)
-    with pytest.raises(TypeError, match="bfloat16"):
-        shared_prefix_attention(q.float(), k, k, plan)
-    with pytest.raises(ValueError, match="head_dim=128"):
-        shared_prefix_attention(q[:, :, :64].contiguous(), k[:, :, :64].contiguous(), k[:, :, :64].contiguous(), plan)
-    noncontiguous_q = q.transpose(0, 1).contiguous().transpose(0, 1)
-    with pytest.raises(ValueError, match="contiguous"):
-        shared_prefix_attention(noncontiguous_q, k, k, plan)
-    bad_heads = torch.empty((3, 3, 128), device="npu", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="divisible"):
-        shared_prefix_attention(bad_heads, torch.empty((3, 2, 128), device="npu", dtype=torch.bfloat16),
-                                torch.empty((3, 2, 128), device="npu", dtype=torch.bfloat16), plan)
+    for name, tensor in tensors.items():
+        assert tensor.dtype == torch.bfloat16, name
+    torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-5, atol=1e-6)
+    for name in expected:
+        assert metrics[name]["cosine"] >= 0.999, name
+        # Account only for the final BF16 rounding, including every nominally zero element.
+        rounded = expected[name].to(torch.bfloat16).float()
+        torch.testing.assert_close(actual[name], rounded, rtol=0, atol=1e-5, msg=name)

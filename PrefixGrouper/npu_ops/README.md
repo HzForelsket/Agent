@@ -10,6 +10,10 @@ the shared prefix and its own causal suffix range. The backward kernel writes
 each compact K/V gradient once and accumulates all response contributions to a
 shared prefix.
 
+This branch is a single-core correctness isolation build. Both operators set
+`blockDim=1`, and only block 0 processes all rows serially. The arithmetic and
+LSE DMA path are unchanged. This is not a performance implementation.
+
 ## Native NPU build
 
 On the NPU server, activate its Python 3.10 environment with PyTorch 2.10.0
@@ -119,8 +123,32 @@ This entrypoint requires a usable NPU and fails if none is available. It runs
 only `test_npu_correctness.py`, with logs and pytest cache in the result directory.
 It does not run benchmarks or profiler collection automatically.
 
-The correctness test uses an FP32 CPU reference that physically concatenates
-the prefix into every suffix K/V sequence. Autograd therefore sums each copied
-prefix contribution back into the compact reference gradient. Completion
-requires cosine similarity at least 0.999, output max absolute error at most
-0.05, and gradient max absolute error at most 0.1 for every case.
+The entrypoint selects exactly one numerical case: three tokens, one query/KV
+head, head dimension 128, one prefix token and two separate one-token suffixes.
+Inputs are fixed BF16 values; all unlisted coordinates are zero:
+
+| Token | Q[:2] | K[:2] | V[0] | dOut[0] |
+| --- | --- | --- | --- | --- |
+| Prefix | [1, 0] | [1, 1] | 1 | 1 |
+| Suffix A | [1, 0] | [1, -1] | 3 | 1 |
+| Suffix B | [2, 0] | [1, 3] | -1 | 1 |
+
+With `s = 1/sqrt(128)` computed in FP32, each suffix has two equal attention
+probabilities. The hand-derived values, in token order, are:
+
+- `out[:, 0, 0] = [1, 2, 0]`
+- `dQ[:, 0, 1] = [0, -s, -s]`
+- `dK[:, 0, 0] = [s/2, s/2, -s]`
+- `dV[:, 0, 0] = [2, 1/2, 1/2]`
+- `LSE[:, 0] = [s, s + ln(2), 2*s + ln(2)]`
+
+All other output and gradient coordinates are zero. The test first checks the
+hand-derived output/gradients against the existing materialized FP32 CPU
+reference, then runs the actual NPU autograd path once. It captures the saved
+LSE without replacing it or invoking a second forward. The JSON result includes
+actual/expected LSE, the first two coordinates of each output/gradient, cosine,
+max absolute error and the maximum magnitude in the remaining coordinates.
+It checks cosine >= 0.999 and every output/gradient element against the
+BF16-rounded analytical result with `rtol=0, atol=1e-5`; LSE uses
+`rtol=1e-5, atol=1e-6`. A passing tiny case does not validate other shapes or
+multi-core execution.

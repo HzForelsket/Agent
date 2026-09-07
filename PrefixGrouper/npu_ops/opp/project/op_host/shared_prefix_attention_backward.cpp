@@ -1,7 +1,6 @@
 #include "../op_kernel/shared_prefix_attention_tiling.h"
 #include "register/op_def_registry.h"
 
-#include <algorithm>
 #include <cstdint>
 
 namespace optiling {
@@ -26,7 +25,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
         return ge::GRAPH_FAILED;
     }
     tiling->scale = *scale;
-    context->SetBlockDim(std::min<uint32_t>(20, std::max<uint32_t>(1, tiling->task_count)));
+    context->SetBlockDim(1);
     size_t* workspace = context->GetWorkspaceSizes(1);
     workspace[0] = 0;
     return ge::GRAPH_SUCCESS;
