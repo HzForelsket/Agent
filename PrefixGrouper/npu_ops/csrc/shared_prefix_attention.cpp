@@ -20,11 +20,11 @@ int64_t padded_dim(int64_t dim)
 }
 void check_shapes(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v)
 {
-    TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3, "q, k and v must use rank-3 compact TND tensors");
-    TORCH_CHECK(q.size(0) > 0 && q.size(0) <= INT32_MAX && q.size(0) == k.size(0) && k.sizes() == v.sizes(),
+    TORCH_CHECK_VALUE(q.dim() == 3 && k.dim() == 3 && v.dim() == 3, "q, k and v must use rank-3 compact TND tensors");
+    TORCH_CHECK_VALUE(q.size(0) > 0 && q.size(0) <= INT32_MAX && q.size(0) == k.size(0) && k.sizes() == v.sizes(),
                 "q, k and v must have the same positive token count fitting int32 and matching k/v shapes");
-    TORCH_CHECK(q.size(2) > 0 && q.size(2) == k.size(2), "q, k and v must have the same positive head_dim");
-    TORCH_CHECK(q.size(1) > 0 && k.size(1) > 0 && q.size(1) % k.size(1) == 0,
+    TORCH_CHECK_VALUE(q.size(2) > 0 && q.size(2) == k.size(2), "q, k and v must have the same positive head_dim");
+    TORCH_CHECK_VALUE(q.size(1) > 0 && k.size(1) > 0 && q.size(1) % k.size(1) == 0,
                 "positive Hq must be divisible by positive Hkv");
     const int64_t padded = padded_dim(q.size(2));
     TORCH_CHECK(q.size(1) <= INT64_MAX / q.size(0) &&
@@ -33,8 +33,8 @@ void check_shapes(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v)
 }
 void check_metadata(const at::Tensor& tensor, const at::Tensor& q, const char* name)
 {
-    TORCH_CHECK(tensor.device() == q.device(), name, " must be on the same NPU as q");
-    TORCH_CHECK(tensor.scalar_type() == at::kInt && tensor.dim() == 1 && tensor.size(0) == q.size(0) && tensor.is_contiguous(),
+    TORCH_CHECK_VALUE(tensor.device() == q.device(), name, " must be on the same NPU as q");
+    TORCH_CHECK_VALUE(tensor.scalar_type() == at::kInt && tensor.dim() == 1 && tensor.size(0) == q.size(0) && tensor.is_contiguous(),
                 name, " must be contiguous int32 [T]");
 }
 void check_inputs(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
@@ -42,12 +42,12 @@ void check_inputs(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     const at::Tensor& se, const at::Tensor& ge, float scale)
 {
     TORCH_CHECK(q.device().type() == c10::DeviceType::PrivateUse1, "shared_prefix_attention is NPU-only and has no CPU fallback");
-    TORCH_CHECK(k.device() == q.device() && v.device() == q.device(), "q, k and v must be on the same NPU");
-    TORCH_CHECK(q.scalar_type() == at::kBFloat16 && k.scalar_type() == at::kBFloat16 && v.scalar_type() == at::kBFloat16,
+    TORCH_CHECK_VALUE(k.device() == q.device() && v.device() == q.device(), "q, k and v must be on the same NPU");
+    TORCH_CHECK_TYPE(q.scalar_type() == at::kBFloat16 && k.scalar_type() == at::kBFloat16 && v.scalar_type() == at::kBFloat16,
                 "q, k and v must have dtype torch.bfloat16");
     check_shapes(q, k, v);
-    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(), "q, k and v must be contiguous");
-    TORCH_CHECK(std::isfinite(scale) && scale > 0.0f, "softmax scale must be finite and positive");
+    TORCH_CHECK_VALUE(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(), "q, k and v must be contiguous");
+    TORCH_CHECK_VALUE(std::isfinite(scale) && scale > 0.0f, "softmax scale must be finite and positive");
     check_metadata(ps, q, "prefix_start"); check_metadata(pe, q, "prefix_end");
     check_metadata(ss, q, "sequence_start"); check_metadata(se, q, "sequence_end"); check_metadata(ge, q, "group_end");
 }
@@ -67,27 +67,15 @@ std::tuple<at::Tensor, at::Tensor> forward_npu(const at::Tensor& q, const at::Te
     }
     scale = static_cast<double>(fp_scale);
     const c10::OptionalDeviceGuard guard(device_of(q));
-    at::Tensor acc, lse_rows, out, lse;
+    at::Tensor out, lse;
     {
         RECORD_USER_SCOPE("pg_host/custom/allocate");
-        acc = accumulator(q);
-        lse_rows = at::empty({q.size(0), q.size(1), kRowAlignment}, q.options().dtype(at::kFloat));
         out = at::empty_like(q);
+        lse = at::empty({q.size(0), q.size(1)}, q.options().dtype(at::kFloat));
     }
     {
         RECORD_USER_SCOPE("pg_host/custom/attention_bridge");
-        EXEC_NPU_CMD_EXT(aclnnSharedPrefixAttentionForward, q, k, v, ps, pe, ss, se, ge, scale, prefixes, suffixes, groups, acc, lse_rows);
-    }
-    const int64_t dim = q.size(2);
-    {
-        RECORD_USER_SCOPE("pg_host/custom/pack_bridge");
-        EXEC_NPU_CMD_EXT(aclnnSharedPrefixAttentionPack, acc, dim, out);
-    }
-    // Native strided-to-contiguous copy has independent aligned output ownership.
-    // The attention kernel never makes concurrent scalar stores to adjacent LSE values.
-    {
-        RECORD_USER_SCOPE("pg_host/custom/lse_compact");
-        lse = lse_rows.select(2, 0).contiguous();
+        EXEC_NPU_CMD_EXT(aclnnSharedPrefixAttentionForward, q, k, v, ps, pe, ss, se, ge, scale, prefixes, suffixes, groups, out, lse);
     }
     return {out, lse};
 }

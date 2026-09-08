@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numbers
 from dataclasses import dataclass
+from functools import lru_cache
 from threading import Lock
 from typing import Iterable, Sequence
 
@@ -114,37 +115,22 @@ def build_shared_prefix_plan(
         return _PLAN_CACHE.setdefault(key, plan)
 
 
-def _is_npu(device: torch.device) -> bool:
-    return device.type in {"npu", "privateuseone"}
-
-
-def _validate(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, plan: SharedPrefixPlan) -> None:
-    if not _is_npu(q.device):
+def _validate(q: torch.Tensor, plan: SharedPrefixPlan) -> None:
+    # Only checks needed before dispatch/scale resolution belong in Python.
+    # Tensor dtype, shape, layout and metadata checks are owned by C++.
+    if q.device.type not in {"npu", "privateuseone"}:
         raise ValueError("shared_prefix_attention is NPU-only and has no CPU fallback")
-    if q.device != k.device or q.device != v.device or plan.device != q.device:
-        raise ValueError("q, k, v and plan metadata must be on the same NPU")
-    if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
-        raise TypeError("q, k and v must have dtype torch.bfloat16")
-    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+    if q.ndim != 3:
         raise ValueError("q, k and v must use compact [T, H, D] TND layout")
-    if q.shape[0] == 0 or q.shape[0] != k.shape[0] or k.shape != v.shape:
-        raise ValueError("q, k and v must have the same positive token count and matching k/v shapes")
-    if q.shape[2] <= 0 or q.shape[2] != k.shape[2]:
-        raise ValueError("q, k and v must have the same positive head_dim")
-    if q.shape[1] == 0 or k.shape[1] == 0 or q.shape[1] % k.shape[1] != 0:
-        raise ValueError("Hq must be divisible by Hkv")
-    if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
-        raise ValueError("q, k and v must be contiguous")
     if q.shape[0] != plan.total_tokens:
         raise ValueError(f"plan expects {plan.total_tokens} tokens, got {q.shape[0]}")
-    for name in ("prefix_start", "prefix_end", "sequence_start", "sequence_end", "group_end"):
-        tensor = getattr(plan, name)
-        if tensor.device != q.device:
-            raise ValueError(f"plan.{name} must be on the same NPU as q")
-        if tensor.dtype != torch.int32 or tensor.ndim != 1 or tensor.numel() != plan.total_tokens:
-            raise ValueError(f"plan.{name} must be contiguous int32 [T]")
-        if not tensor.is_contiguous():
-            raise ValueError(f"plan.{name} must be contiguous int32 [T]")
+
+
+@lru_cache(maxsize=128)
+def _default_scale(head_dim: int) -> float:
+    # Preserve the existing FP32 rsqrt result, including its rounding, once per D.
+    # Warm calls only look up a Python float; no per-call CPU tensor operations.
+    return torch.tensor(head_dim, dtype=torch.float32, device="cpu").rsqrt().item()
 
 
 class _SharedPrefixAttention(torch.autograd.Function):
@@ -190,17 +176,10 @@ def shared_prefix_attention(
     softmax_scale: float | None = None,
 ) -> torch.Tensor:
     with host_stage("pg_host/custom/python_validate"):
-        _validate(q, k, v, plan)
+        _validate(q, plan)
     with host_stage("pg_host/custom/python_scale"):
-        scale_fp32 = (
-            torch.tensor(q.shape[2], dtype=torch.float32, device="cpu").rsqrt()
-            if softmax_scale is None
-            else torch.tensor(softmax_scale, dtype=torch.float32, device="cpu")
-        )
-        if not torch.isfinite(scale_fp32).item() or not (scale_fp32 > 0).item():
-            raise ValueError("softmax_scale must be finite and positive")
-        # Python/PyTorch transport scalars as doubles; computed in FP32.
-        scale = scale_fp32.item()
+        # C++ converts to FP32 and validates the scalar at the dispatch boundary.
+        scale = _default_scale(q.shape[2]) if softmax_scale is None else float(softmax_scale)
     with host_stage("pg_host/custom/load_extension"):
         load_extension()
     with host_stage("pg_host/custom/autograd_apply"):

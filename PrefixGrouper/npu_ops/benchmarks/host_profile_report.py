@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 CUSTOM_CPP_STAGES = (
-    "cpp_validate", "allocate", "attention_bridge", "pack_bridge", "lse_compact",
+    "cpp_validate", "allocate", "attention_bridge",
 )
 CUSTOM_PYTHON_STAGES = ("python_validate", "python_scale", "load_extension", "autograd_apply")
 FUSION_STAGES = ("gather_k", "gather_v", "attention_bridge")
@@ -122,12 +122,12 @@ def host_profile_markdown(result):
     for (operator, name), values in across.items():
         lines.append(f"| {operator} | `{name}` | {len(values)} | {statistics.median(values):.3f} | "
                      f"{min(values):.3f} | {max(values):.3f} |")
-    lines += ["", "## 5. 需要回传的文件和补充指标", "",
-              "- 本文件、benchmark.json、benchmark.md、构建日志。",
-              "- 两条路径各次 capture 的 operator_details.csv、kernel_details.csv、api_statistic.csv（若有）。",
-              "- 两条路径至少各一个 trace_view.json，优先选择耗时接近该路径中位数的 capture。",
-              "- 若只回传数值：第 3/4 节表格，以及 Attention/Pack/LSE/gather 的设备任务名称、次数、耗时和间隙。",
-              "- 从时间线补充：Attention/Pack/fusion 的 GetWorkspaceSize、Tiling、Launch 的名称、线程、次数和耗时；",
+    lines += ["", "## 5. 需要回传的关键数值", "",
+              "- 隔离机器无需上传文件、路径或环境细节；按第 2/3 节手工告知关键数值即可。",
+              "- 优先提供两条路径的正常计时 median、外层 Total、最后同步，以及 custom validate/scale/allocate/attention_bridge。",
+              "- 前向 BF16 转换和紧凑 LSE 写回已合入 Attention，pack_bridge/lse_compact 不再是独立事件。",
+              "- 若只回传数值：第 3/4 节表格，以及 Attention/gather 的设备任务名称、次数、耗时和间隙。",
+              "- 从时间线补充：Attention/fusion 的 GetWorkspaceSize、Tiling、Launch 的名称、线程、次数和耗时；",
               "  未导出就填“未观测”，缓存命中未经直接证据确认就填“未知”。",
               "- 不把 API 汇总、父子事件或不同线程的耗时直接相加；Launch 接近不能证明整个桥接成本接近。", ""]
     return "\n".join(lines)

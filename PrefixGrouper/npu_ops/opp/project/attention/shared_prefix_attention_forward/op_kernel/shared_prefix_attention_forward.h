@@ -23,7 +23,7 @@ public:
         q.SetGlobalBuffer(reinterpret_cast<__gm__ Bf*>(qAddr));
         k.SetGlobalBuffer(reinterpret_cast<__gm__ Bf*>(kAddr));
         v.SetGlobalBuffer(reinterpret_cast<__gm__ Bf*>(vAddr));
-        output.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(outAddr));
+        output.SetGlobalBuffer(reinterpret_cast<__gm__ Bf*>(outAddr));
         lse.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(lseAddr));
         prefixStart.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(prefixStartAddr));
         prefixEnd.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(prefixEndAddr));
@@ -47,7 +47,7 @@ public:
         part = outputBuf.Get<float>();
         old = part[t.q_tile * outputChunk];
         CreateVecIndex(indices, 0.0f, indexCount);
-        const uint64_t slotBytes = t.core_workspace_bytes / 3;
+        const uint64_t slotBytes = t.q_tile * (t.kv_tile * 6ULL + t.padded_dim * 4ULL);
         auto* base = reinterpret_cast<__gm__ uint8_t*>(GetUserWorkspace(workspaceAddr)) +
                      GetBlockIdx() * t.core_workspace_bytes;
         for (uint32_t s = 0; s < 3; ++s) {
@@ -207,14 +207,17 @@ private:
             DataCopyPad(dst[r * outputChunk], src[r * stride], cp, pad);
         }
     }
-    __aicore__ inline void WriteRows(GlobalTensor<float> dst, LocalTensor<float> src,
+    template <class T>
+    __aicore__ inline void WriteRows(GlobalTensor<T> dst, LocalTensor<T> src,
                                      uint32_t rows, uint32_t width, uint64_t stride,
                                      uint32_t localStride)
     {
-        const uint32_t batch = stride - width <= UINT32_MAX / 4 ? rows : 1;
+        constexpr uint32_t bytes = sizeof(T), perBlock = 32 / bytes;
+        const uint32_t batch = stride - width <= UINT32_MAX / bytes ? rows : 1;
         for (uint32_t r = 0; r < rows; r += batch) {
-            DataCopyExtParams cp{static_cast<uint16_t>(batch), width * 4, (localStride - width) / 8,
-                                 batch > 1 ? static_cast<uint32_t>((stride - width) * 4) : 0, 0};
+            // UB rounds each block to 32 bytes; GM writes only width elements.
+            DataCopyExtParams cp{static_cast<uint16_t>(batch), width * bytes, (localStride - width) / perBlock,
+                                 batch > 1 ? static_cast<uint32_t>((stride - width) * bytes) : 0, 0};
             DataCopyPad(dst[r * stride], src[r * localStride], cp);
         }
     }
@@ -222,7 +225,7 @@ private:
     {
         const auto& c = contexts[s];
         auto alpha = Alpha(s), sum = Sum(s), maximum = Max(s);
-        const uint64_t stride = t.q_heads * t.padded_dim;
+        const uint64_t stride = t.q_heads * t.head_dim;
         // Like FA's Vec2, broadcast an eight-float statistic block per row.
         BinaryRepeatParams rescale;
         rescale.src0BlkStride = 0;
@@ -237,11 +240,13 @@ private:
         for (uint64_t d = 0; d < t.padded_dim; d += outputChunk) {
             const uint32_t n = Min(outputChunk, t.padded_dim - d);
             const uint32_t valid = d < t.head_dim ? Min(n, t.head_dim - d) : 0;
-            const uint64_t off = (c.qt * t.q_heads + c.qh) * t.padded_dim + d;
+            const uint64_t off = (c.qt * t.q_heads + c.qh) * t.head_dim + d;
             Duplicate(part, 0.0f, c.qr * outputChunk);
             Fence<HardEvent::V_MTE2>();
             if (valid) ReadRows(part, valueGm[s][d], c.qr, valid, t.padded_dim);
-            if (!c.first) ReadRows(old, output[off], c.qr, n, stride);
+            // At Vec2(s), BMM2 is writing s+1. The previous accumulator in
+            // s-1 is read before BMM2 reuses that slot on the next iteration.
+            if (!c.first) ReadRows(old, valueGm[(s + 2) % 3][d], c.qr, n, t.padded_dim);
             Fence<HardEvent::MTE2_V>();
             if (!c.first) {
                 Mul(old, alpha, old, n, c.qr, rescale);
@@ -250,9 +255,19 @@ private:
                     {1, 1, 1, outputChunk / 8, outputChunk / 8, outputChunk / 8});
                 PipeBarrier<PIPE_V>();
             }
-            if (c.last) Div(part, part, sum, n, c.qr, normalize);
-            Fence<HardEvent::V_MTE3>();
-            WriteRows(output[off], part, c.qr, n, stride, outputChunk);
+            if (c.last) {
+                Div(part, part, sum, n, c.qr, normalize);
+                PipeBarrier<PIPE_V>();
+                // The old FP32 values are dead after Add. Reuse their UB for
+                // the final BF16 rows, without reserving another cast buffer.
+                auto packed = old.ReinterpretCast<Bf>();
+                Cast(packed, part, RoundMode::CAST_RINT, c.qr * outputChunk);
+                Fence<HardEvent::V_MTE3>();
+                WriteRows(output[off], packed, c.qr, valid, stride, outputChunk);
+            } else {
+                Fence<HardEvent::V_MTE3>();
+                WriteRows(valueGm[s][d], part, c.qr, n, t.padded_dim, outputChunk);
+            }
             Fence<HardEvent::MTE3_V>();
             Fence<HardEvent::MTE3_MTE2>();
         }
@@ -262,7 +277,9 @@ private:
             PipeBarrier<PIPE_V>();
             Add(sum, sum, maximum, c.qr * 8);
             Fence<HardEvent::V_MTE3>();
-            WriteRows(lse[(c.qt * t.q_heads + c.qh) * 16], sum, c.qr, 8, t.q_heads * 16, 8);
+            // Narrow DMA writes, not cached scalar GM stores: exactly one
+            // FP32 value per owned (query, head), including interleaved heads.
+            WriteRows(lse[c.qt * t.q_heads + c.qh], sum, c.qr, 1, t.q_heads, 8);
             Fence<HardEvent::MTE3_V>();
         }
     }
@@ -270,8 +287,8 @@ private:
     SharedPrefixAttentionForwardTilingData t;
     uint64_t issued = 0;
     uint32_t elements = 0, statsSize = 0;
-    GlobalTensor<Bf> q, k, v, probGm[3];
-    GlobalTensor<float> output, lse, scoreGm[3], valueGm[3];
+    GlobalTensor<Bf> q, k, v, output, probGm[3];
+    GlobalTensor<float> lse, scoreGm[3], valueGm[3];
     GlobalTensor<int32_t> prefixStart, prefixEnd, sequenceStart, sequenceEnd;
     TBuf<QuePosition::VECCALC> scoreBuf, probBuf, statsBuf, softmaxBuf, indexBuf, maskBuf, outputBuf;
     LocalTensor<float> scores, stats, indices, part, old;

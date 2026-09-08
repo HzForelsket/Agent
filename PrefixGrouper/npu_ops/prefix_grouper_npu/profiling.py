@@ -5,7 +5,7 @@ from contextvars import ContextVar
 import torch
 
 _ENABLED = ContextVar("prefix_grouper_host_profile", default=False)
-HOST_PROBE_VERSION = 1
+HOST_PROBE_VERSION = 2
 
 
 @contextmanager

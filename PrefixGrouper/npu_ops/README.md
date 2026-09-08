@@ -102,7 +102,11 @@ Heads and D must be positive. D need not be aligned and has no fixed 256 limit;
 the default scale is computed from the actual D. Token offsets must fit int32,
 padded tensor/workspace sizes must fit the checked int64 address range, and
 forward Matmul row strides (`Hq * D`, `Hkv * D`) and padded D must fit int32.
-Scale computation and validation, softmax, and kernel accumulation use FP32.
+The default FP32 scale is cached by D (bounded to 128 entries); warm calls do not
+create CPU tensors for scale computation. Explicit scales are rounded to FP32
+and validated in C++, which also owns dtype/layout/metadata checks. Python only
+checks the NPU dispatch, Q rank and plan token count before scale resolution.
+Softmax and kernel accumulation use FP32.
 PyTorch and the generated CANN ACLNN scalar interfaces require a host `double`
 parameter; it only transports the FP32 scale and does not introduce FP64 tensor
 computation. BF16 inputs, outputs and gradients are retained.
@@ -180,16 +184,20 @@ local probabilities and reduce their entire gradients without global atomics.
 Sequence/group end metadata limits KV-gradient queries to the contributing
 sequence or group. Prefix K/V storage and GQA heads are never materialized.
 
-FP32 accumulators have D rounded to 16, so each row starts on a 64-byte boundary.
-A separate Vector pack operator assigns aligned compact output ranges to cores,
-gathers padded rows and writes BF16 tails safely. LSE uses independent padded
-FP32 rows, followed by the native strided-to-contiguous copy. Intermediate
-score/probability storage is bounded by block size, not sequence length squared.
-The linear FP32 accumulators and GM staging introduce extra memory/traffic;
-dynamic-D support does not imply a measured speed or memory improvement.
+Forward FP32 accumulators have D rounded to 16 and reuse the consumed PV slots
+in per-AIV workspace. Vec2 reads the preceding slot before the next BMM2 can
+reuse it, then replaces its own consumed PV with the updated accumulator. The final
+Vec2 normalizes and casts to BF16 using the old-value UB buffer, then writes
+compact output and one FP32 LSE per (query, head) with exact-length DataCopyPad
+DMA. There is no forward Pack launch or LSE contiguous copy, and the C++ forward
+allocates only final BF16 output and compact FP32 LSE. Intermediate score,
+probability and output-accumulator storage is bounded by per-core tiling.
+Backward retains padded FP32 gradient accumulators and the separate Vector Pack.
+Dynamic-D support does not imply a measured speed or memory improvement.
 
-The internal ACLNN forward/backward outputs are padded FP32 accumulators;
-the public PyTorch outputs remain compact BF16 with compact FP32 LSE.
+The internal ACLNN forward outputs are now compact BF16 `[T,Hq,D]` and FP32
+`[T,Hq]`; backward still produces padded FP32 accumulators. The public output
+contract is unchanged.
 Plans add `sequence_end` and `group_end` int32 tensors. Rebuild/install the 0.2.0
 wheel and OPP together; there is no old-schema adapter or serial-kernel switch.
 The rewritten kernels require fresh hardware validation. Device-free compilation

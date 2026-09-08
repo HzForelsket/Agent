@@ -99,6 +99,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
         static_cast<const int64_t*>(suffixes->GetData()), suffixes->GetSize(),
         static_cast<const int64_t*>(groups->GetData()), groups->GetSize(),
         std::min(platform.GetCoreNumAic(), platform.GetCoreNumAiv() / 2), *t)) return ge::GRAPH_FAILED;
+    // Vec2 replaces consumed PV with the FP32 accumulator in the same slot.
     t->core_workspace_bytes = 3ULL * qm * (kn * 6ULL + t->padded_dim * 4ULL);
     uint64_t workspace;
     if (!Multiply(t->core_workspace_bytes, t->vector_cores, workspace) ||

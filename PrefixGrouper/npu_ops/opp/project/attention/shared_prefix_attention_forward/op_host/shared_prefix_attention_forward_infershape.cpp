@@ -11,17 +11,15 @@ static ge::graphStatus InferShape(gert::InferShapeContext* context)
     }
     if (q_shape->GetDim(2) <= 0 || q_shape->GetDim(2) > INT64_MAX - 15) return GRAPH_FAILED;
     *out_shape = *q_shape;
-    out_shape->SetDim(2, shared_prefix_host::Align(q_shape->GetDim(2)));
-    lse_shape->SetDimNum(3);
+    lse_shape->SetDimNum(2);
     lse_shape->SetDim(0, q_shape->GetDim(0));
     lse_shape->SetDim(1, q_shape->GetDim(1));
-    lse_shape->SetDim(2, kSharedPrefixRowAlignment);
     return GRAPH_SUCCESS;
 }
 
 static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
 {
-    context->SetOutputDataType(0, ge::DT_FLOAT);
+    context->SetOutputDataType(0, ge::DT_BF16);
     context->SetOutputDataType(1, ge::DT_FLOAT);
     return ge::GRAPH_SUCCESS;
 }
