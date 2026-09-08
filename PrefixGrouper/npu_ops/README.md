@@ -111,6 +111,31 @@ inference and does not execute attention.
 
 ## Kernel design
 
+The OPP project follows the per-operator organization in the
+[official CANN 9.0.0 development guide](https://gitcode.com/cann/ops-nn/blob/9.0.0/docs/zh/develop/aicore_develop_guide.md):
+
+```text
+opp/project/
+  cmake/operators.cmake
+  attention/
+    common/
+      op_host/          # shared shape helpers and compiled tiling implementations
+      op_kernel/        # shared tiling data and bounded Matmul/staging primitives
+    shared_prefix_attention_forward/
+    shared_prefix_attention_backward/
+    shared_prefix_attention_delta/
+    shared_prefix_attention_pack/
+```
+
+Each operator owns a `CMakeLists.txt`, `op_host/*_def.cpp`,
+`op_host/*_infershape.cpp`, `op_host/*_tiling.cpp`, and an `op_kernel/*.cpp`
+entrypoint with an `op_kernel/*.h` implementation exposing `Init` and `Process`.
+Shape inference and tiling use separate CANN implementation registrations.
+Forward owns online softmax and normalization; backward owns probability/gradient
+reconstruction. Their shared base owns DMA queues, Matmul slots and accumulation.
+Matmul registration stays in the kernel entrypoint because its cross-core client
+must remain alive throughout `Process` and its AIC branch returns from the kernel.
+
 The forward and backward operators use CANN's MIX_AIC_1_2 Matmul service:
 Cube computes matrix products and AIV performs FP32 softmax and accumulation.
 Host tiling selects an aligned square block from input size and actual UB,
@@ -126,6 +151,13 @@ workloads only execute startup/drain and have no steady-state D overlap.
 Input and result queues have two slots; dependency-specific events and Vector
 barriers replace whole-pipeline barriers. Scalar work remains for row statistics,
 causal tails and pack gather indices; the implementation is not fully scalar-free.
+
+Forward packs Q/K/V with strided multi-row `DataCopyPad` transfers, retaining
+zero padding for partial rows and D tails. Copies are split at the DMA block-count
+and stride limits. During PV, Matmul reads the saved BF16 probability tile directly
+from GM across all output-D blocks; only V is staged into the alternating operand
+slots. The final Matmul completion wait precedes reuse of that probability tile.
+These staging changes apply to forward; backward retains its existing staging.
 
 Forward maintains online FP32 max/sum statistics and a padded FP32 output
 accumulator, converting local probabilities to BF16 for PV. Backward computes

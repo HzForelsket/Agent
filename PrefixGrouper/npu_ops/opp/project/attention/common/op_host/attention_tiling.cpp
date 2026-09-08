@@ -1,34 +1,14 @@
-#ifndef PREFIX_GROUPER_NPU_SHARED_PREFIX_ATTENTION_HOST_H
-#define PREFIX_GROUPER_NPU_SHARED_PREFIX_ATTENTION_HOST_H
-
-#include "../op_kernel/shared_prefix_attention_tiling.h"
-#include "register/op_def_registry.h"
+#include "attention_tiling.h"
+#include "shape_utils.h"
 #include "tiling/tiling_api.h"
 #include "tiling/platform/platform_ascendc.h"
 #include <algorithm>
 #include <cmath>
-#include <limits>
 
 namespace shared_prefix_host {
-inline bool Multiply(uint64_t a, uint64_t b, uint64_t& result)
-{
-    if (b && a > static_cast<uint64_t>(INT64_MAX) / b) return false;
-    result = a * b;
-    return true;
-}
-inline uint64_t Align(uint64_t n, uint64_t alignment = kSharedPrefixRowAlignment)
-{
-    return (n + alignment - 1) / alignment * alignment;
-}
-inline bool Shape(const gert::Shape& q, const gert::Shape& k)
-{
-    return q.GetDimNum() == 3 && k.GetDimNum() == 3 && q.GetDim(0) > 0 &&
-        q.GetDim(0) <= INT32_MAX && q.GetDim(0) == k.GetDim(0) &&
-        q.GetDim(1) > 0 && k.GetDim(1) > 0 && q.GetDim(1) % k.GetDim(1) == 0 &&
-        q.GetDim(2) > 0 && q.GetDim(2) <= INT64_MAX - 15 && q.GetDim(2) == k.GetDim(2);
-}
-inline bool Matmul(platform_ascendc::PlatformAscendC& platform, uint32_t tile,
-                   bool transA, bool transB, AscendC::tiling::TCubeTiling& result)
+namespace {
+bool Matmul(platform_ascendc::PlatformAscendC& platform, uint32_t tile,
+            bool transA, bool transB, AscendC::tiling::TCubeTiling& result)
 {
     matmul_tiling::MatmulApiTiling mm(platform);
     mm.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
@@ -50,7 +30,9 @@ inline bool Matmul(platform_ascendc::PlatformAscendC& platform, uint32_t tile,
     mm.SetBufferSpace(l1 / 3, l0c / 3, (ub - liveUb - 4096) / 3);
     return mm.GetTiling(result) == 0;
 }
-inline ge::graphStatus AttentionTiling(gert::TilingContext* context, bool backward)
+} // namespace
+
+ge::graphStatus AttentionTiling(gert::TilingContext* context, bool backward)
 {
     const uint32_t qi = backward ? 1 : 0, ki = qi + 1;
     auto* q = context->GetInputShape(qi);
@@ -128,5 +110,4 @@ inline ge::graphStatus AttentionTiling(gert::TilingContext* context, bool backwa
     context->GetWorkspaceSizes(1)[0] = workspace + platform.GetLibApiWorkSpaceSize();
     return ge::GRAPH_SUCCESS;
 }
-}
-#endif
+} // namespace shared_prefix_host

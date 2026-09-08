@@ -9,5 +9,6 @@ npu_op_package(${package_name}
     CONFIG INSTALL_PATH ${CMAKE_BINARY_DIR}/
 )
 
-add_subdirectory(op_host)
-add_subdirectory(op_kernel)
+include(cmake/operators.cmake)
+add_subdirectory(attention)
+prefix_grouper_build_ops()

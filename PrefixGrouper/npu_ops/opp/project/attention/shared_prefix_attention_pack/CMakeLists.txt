@@ -1,0 +1,1 @@
+prefix_grouper_add_op(SharedPrefixAttentionPack shared_prefix_attention_pack)

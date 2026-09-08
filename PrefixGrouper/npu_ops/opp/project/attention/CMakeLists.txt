@@ -1,0 +1,4 @@
+add_subdirectory(shared_prefix_attention_forward)
+add_subdirectory(shared_prefix_attention_backward)
+add_subdirectory(shared_prefix_attention_delta)
+add_subdirectory(shared_prefix_attention_pack)

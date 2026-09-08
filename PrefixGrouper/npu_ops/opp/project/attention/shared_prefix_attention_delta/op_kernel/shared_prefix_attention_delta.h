@@ -1,8 +1,10 @@
+#ifndef PREFIX_GROUPER_SHARED_PREFIX_ATTENTION_DELTA_H
+#define PREFIX_GROUPER_SHARED_PREFIX_ATTENTION_DELTA_H
 #include "kernel_operator.h"
-#include "shared_prefix_attention_tiling.h"
+#include "../../common/op_kernel/shared_prefix_attention_tiling_data.h"
 using namespace AscendC;
-namespace {
-class Delta {
+namespace shared_prefix {
+class SharedPrefixAttentionDeltaKernel {
 public:
     __aicore__ inline void Init(GM_ADDR out, GM_ADDR grad, GM_ADDR delta, const SharedPrefixVectorTilingData& data)
     {
@@ -72,13 +74,4 @@ private:
     SharedPrefixVectorTilingData t;
 };
 }
-extern "C" __global__ __aicore__ void shared_prefix_attention_delta(
-    GM_ADDR out, GM_ADDR grad, GM_ADDR delta, GM_ADDR workspace, GM_ADDR tiling)
-{
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    REGISTER_TILING_DEFAULT(SharedPrefixVectorTilingData);
-    GET_TILING_DATA(t, tiling);
-    Delta kernel;
-    kernel.Init(out, grad, delta, t);
-    kernel.Process();
-}
+#endif
