@@ -7,11 +7,11 @@ extern "C" __global__ __aicore__ void shared_prefix_attention_forward(
     GM_ADDR out, GM_ADDR lse, GM_ADDR workspace, GM_ADDR tiling)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
-    REGISTER_TILING_DEFAULT(SharedPrefixAttentionTilingData);
+    REGISTER_TILING_DEFAULT(SharedPrefixAttentionForwardTilingData);
     GET_TILING_DATA(t, tiling);
     SharedPrefixAttentionForwardKernel op;
     REGIST_MATMUL_OBJ(&op.pipe, GetSysWorkSpacePtr(), op.scoreMm, &t.score_mm,
-                      op.valueMm, &t.value_mm, op.transposeMm, &t.transpose_mm);
+                      op.valueMm, &t.value_mm);
     op.Init(q, k, v, prefix_start, prefix_end, sequence_start, sequence_end, group_end, out, lse, workspace, t);
     op.Process();
 }

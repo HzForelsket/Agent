@@ -16,6 +16,9 @@ public:
         this->Output("out").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND}).UnknownShapeFormat({ge::FORMAT_ND});
         this->Output("lse").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND}).UnknownShapeFormat({ge::FORMAT_ND});
         this->Attr("scale").Float();
+        this->Attr("prefix_lens").ListInt();
+        this->Attr("suffix_lens").ListInt();
+        this->Attr("group_sizes").ListInt();
         this->AICore().AddConfig("ascend910b");
     }
 };

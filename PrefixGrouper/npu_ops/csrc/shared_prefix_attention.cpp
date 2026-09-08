@@ -56,7 +56,8 @@ at::Tensor accumulator(const at::Tensor& like)
 }
 std::tuple<at::Tensor, at::Tensor> forward_npu(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     const at::Tensor& ps, const at::Tensor& pe, const at::Tensor& ss,
-    const at::Tensor& se, const at::Tensor& ge, double scale)
+    const at::Tensor& se, const at::Tensor& ge, double scale,
+    at::IntArrayRef prefixes, at::IntArrayRef suffixes, at::IntArrayRef groups)
 {
     const float fp_scale = static_cast<float>(scale);
     check_inputs(q, k, v, ps, pe, ss, se, ge, fp_scale);
@@ -65,7 +66,7 @@ std::tuple<at::Tensor, at::Tensor> forward_npu(const at::Tensor& q, const at::Te
     auto acc = accumulator(q);
     auto lse_rows = at::empty({q.size(0), q.size(1), kRowAlignment}, q.options().dtype(at::kFloat));
     auto out = at::empty_like(q);
-    EXEC_NPU_CMD_EXT(aclnnSharedPrefixAttentionForward, q, k, v, ps, pe, ss, se, ge, scale, acc, lse_rows);
+    EXEC_NPU_CMD_EXT(aclnnSharedPrefixAttentionForward, q, k, v, ps, pe, ss, se, ge, scale, prefixes, suffixes, groups, acc, lse_rows);
     const int64_t dim = q.size(2);
     EXEC_NPU_CMD_EXT(aclnnSharedPrefixAttentionPack, acc, dim, out);
     // Native strided-to-contiguous copy has independent aligned output ownership.
@@ -100,7 +101,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> backward_npu(
     return {dq, dk, dv};
 }
 std::tuple<at::Tensor, at::Tensor> forward_meta(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
-    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, double)
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, double,
+    at::IntArrayRef, at::IntArrayRef, at::IntArrayRef)
 {
     check_shapes(q, k, v);
     return {at::empty_like(q), at::empty({q.size(0), q.size(1)}, q.options().dtype(at::kFloat))};
@@ -116,7 +118,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> backward_meta(
 }
 TORCH_LIBRARY(prefix_grouper_npu, m) {
     m.def("shared_prefix_attention_forward(Tensor q, Tensor k, Tensor v, Tensor prefix_start, Tensor prefix_end, "
-          "Tensor sequence_start, Tensor sequence_end, Tensor group_end, float scale) -> (Tensor, Tensor)");
+          "Tensor sequence_start, Tensor sequence_end, Tensor group_end, float scale, "
+          "int[] prefix_lens, int[] suffix_lens, int[] group_sizes) -> (Tensor, Tensor)");
     m.def("shared_prefix_attention_backward(Tensor grad_out, Tensor q, Tensor k, Tensor v, Tensor out, Tensor lse, "
           "Tensor prefix_start, Tensor prefix_end, Tensor sequence_start, Tensor sequence_end, Tensor group_end, "
           "float scale) -> (Tensor, Tensor, Tensor)");

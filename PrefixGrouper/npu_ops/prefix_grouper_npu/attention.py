@@ -159,9 +159,13 @@ class _SharedPrefixAttention(torch.autograd.Function):
         sequence_end: torch.Tensor,
         group_end: torch.Tensor,
         scale: float,
+        prefix_lens: tuple[int, ...],
+        suffix_lens: tuple[int, ...],
+        group_sizes: tuple[int, ...],
     ) -> torch.Tensor:
         out, lse = torch.ops.prefix_grouper_npu.shared_prefix_attention_forward(
-            q, k, v, prefix_start, prefix_end, sequence_start, sequence_end, group_end, scale
+            q, k, v, prefix_start, prefix_end, sequence_start, sequence_end, group_end, scale,
+            prefix_lens, suffix_lens, group_sizes
         )
         ctx.save_for_backward(q, k, v, out, lse, prefix_start, prefix_end, sequence_start, sequence_end, group_end)
         ctx.scale = scale
@@ -174,7 +178,7 @@ class _SharedPrefixAttention(torch.autograd.Function):
             grad_out.contiguous(), q, k, v, out, lse,
             prefix_start, prefix_end, sequence_start, sequence_end, group_end, ctx.scale
         )
-        return dq, dk, dv, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None
 
 
 def shared_prefix_attention(
@@ -196,5 +200,6 @@ def shared_prefix_attention(
     scale = scale_fp32.item()
     load_extension()
     return _SharedPrefixAttention.apply(
-        q, k, v, plan.prefix_start, plan.prefix_end, plan.sequence_start, plan.sequence_end, plan.group_end, scale
+        q, k, v, plan.prefix_start, plan.prefix_end, plan.sequence_start, plan.sequence_end, plan.group_end, scale,
+        plan.prefix_lens, plan.suffix_lens, plan.group_sizes
     )

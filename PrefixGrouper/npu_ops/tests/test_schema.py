@@ -12,7 +12,7 @@ def test_schema_and_meta_shape_inference(dim) -> None:
     metadata = torch.empty((17,), device="meta", dtype=torch.int32)
     scale = torch.tensor(dim, dtype=torch.float32, device="cpu").rsqrt().item()
     out, lse = torch.ops.prefix_grouper_npu.shared_prefix_attention_forward(
-        q, k, k, metadata, metadata, metadata, metadata, metadata, scale
+        q, k, k, metadata, metadata, metadata, metadata, metadata, scale, [8], [9], [1]
     )
     assert out.shape == q.shape
     assert out.dtype == torch.bfloat16

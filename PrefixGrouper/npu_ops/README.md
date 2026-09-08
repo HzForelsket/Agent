@@ -96,7 +96,8 @@ out = shared_prefix_attention(q, k, v, plan)
 All tensors must be contiguous BF16 tensors on one NPU, and `Hq % Hkv == 0`.
 Heads and D must be positive. D need not be aligned and has no fixed 256 limit;
 the default scale is computed from the actual D. Token offsets must fit int32,
-and padded tensor/workspace sizes must fit the checked int64 address range.
+padded tensor/workspace sizes must fit the checked int64 address range, and
+forward Matmul row strides (`Hq * D`, `Hkv * D`) and padded D must fit int32.
 Scale computation and validation, softmax, and kernel accumulation use FP32.
 PyTorch and the generated CANN ACLNN scalar interfaces require a host `double`
 parameter; it only transports the FP32 scale and does not introduce FP64 tensor
@@ -131,33 +132,42 @@ Each operator owns a `CMakeLists.txt`, `op_host/*_def.cpp`,
 `op_host/*_infershape.cpp`, `op_host/*_tiling.cpp`, and an `op_kernel/*.cpp`
 entrypoint with an `op_kernel/*.h` implementation exposing `Init` and `Process`.
 Shape inference and tiling use separate CANN implementation registrations.
-Forward owns online softmax and normalization; backward owns probability/gradient
-reconstruction. Their shared base owns DMA queues, Matmul slots and accumulation.
+Forward owns its tiling data, online softmax and cross-block scheduler. Backward
+uses the bounded square Matmul/staging primitives in the common directory.
 Matmul registration stays in the kernel entrypoint because its cross-core client
 must remain alive throughout `Process` and its AIC branch returns from the kernel.
 
-The forward and backward operators use CANN's MIX_AIC_1_2 Matmul service:
-Cube computes matrix products and AIV performs FP32 softmax and accumulation.
-Host tiling selects an aligned square block from input size and actual UB,
-L1, L0 and core resources. Q, KV and D are split into blocks, including tails.
-The budget includes all live local tensors, queues and the three registered
-Matmul objects; the launch is no longer capped at 20 cores.
+Both operators use CANN's MIX_AIC_1_2 Matmul service. Forward follows the CANN
+9.0.0 FA four-stage scheduling order: BMM1(i), Vec1(i-1), BMM2(i-1), Vec2(i-2).
+Three contexts span KV blocks, the prefix/suffix boundary, and successive query
+tasks. Each owns separate score, probability and PV result slots plus its FP32
+max/sum/rescale state. Startup and drain issue only real matrix products.
 
-Two GM operand/result slots per AIV separate producer and consumer lifetimes.
-The next operand block is copied while the current asynchronous Matmul runs;
-the next product is then launched before Vector consumes the previous result.
-This pipeline is used by D reductions and output-D block updates. Single-block
-workloads only execute startup/drain and have no steady-state D overlap.
-Input and result queues have two slots; dependency-specific events and Vector
-barriers replace whole-pipeline barriers. Scalar work remains for row statistics,
-causal tails and pack gather indices; the implementation is not fully scalar-free.
+Forward tiling selects independent Q and KV block sizes with live UB/API buffer
+budgets. Matmul consumes compact TND Q/K/V using independent row strides, handles
+GQA head offsets, and reduces/iterates the full D dimension internally. AIV no
+longer packs Q/K/V back to GM or accumulates separate QK products per D tile.
+`SoftmaxFlashV2` processes score blocks with explicit shape information; vector
+comparison/selection applies causal masks, with comparison extents rounded to
+910B's 256-byte instruction repeat. Softmax uses the live Q/KV tail dimensions
+and the remaining UB scratch budget. Output updates use row-batched DMA and
+Vector broadcasts of alpha/sum; normalization is folded into the final KV block.
+The earlier block's stored alpha remains valid after a later block advances
+softmax state.
 
-Forward packs Q/K/V with strided multi-row `DataCopyPad` transfers, retaining
-zero padding for partial rows and D tails. Copies are split at the DMA block-count
-and stride limits. During PV, Matmul reads the saved BF16 probability tile directly
-from GM across all output-D blocks; only V is staged into the alternating operand
-slots. The final Matmul completion wait precedes reuse of that probability tile.
-These staging changes apply to forward; backward retains its existing staging.
+This is an independent shared-prefix implementation informed by CANN 9.0.0's
+`FlashAttentionVarLenScore::Process` and `FlashAttentionScoreS1s2Bn2gs1` Vector
+stages; it does not copy or wrap the official FA kernel. Intermediate P/PV and
+padded FP32 output accumulation still use GM. Mask construction retains row-level
+control. Host tiling builds Q blocks within each sequence from the plan's CPU
+lengths, partitions their estimated KV-service and padded-matrix work into
+contiguous ranges, then pairs heavier/lighter ranges across the two AIV clients
+sharing each Cube. Each worker receives only its starting token/head and task
+count, and processes its own range without global scanning or atomic scheduling.
+The cost estimate guides load distribution; it is not a hardware latency model.
+It does not implement the official NZ intermediate layout, L1-carry/reuse
+variants, or the official complete tiling policy. Backward retains its
+D-block staging and accumulation pipeline.
 
 Forward maintains online FP32 max/sum statistics and a padded FP32 output
 accumulator, converting local probabilities to BF16 for PV. Backward computes
