@@ -14,6 +14,8 @@ from pathlib import Path
 
 import torch
 
+from host_profile_report import host_profile_markdown, read_host_metrics
+
 
 def _baseline_layout(prefix_lens, suffix_lens, group_sizes, device):
     """Prepare reusable metadata only; K/V gathering stays inside the timed call."""
@@ -142,6 +144,7 @@ def _check_gradients(custom, baseline, inputs, grad_output):
 
 def _profile(operators, modes, grad_output, args, result, save, profiler):
     """Capture isolated calls after timing; backward preparation stays untraced."""
+    from prefix_grouper_npu.profiling import profile_host_stages
     info = result["profiling"]
     info["status"] = "running"
     result["status"] = "profiling"
@@ -150,12 +153,14 @@ def _profile(operators, modes, grad_output, args, result, save, profiler):
                else getattr(profiler.AiCMetrics, args.profile_aic_metrics))
     try:
         for mode in modes:
-            for name, fn, inputs in operators:
-                for index in range(args.profile_steps):
+            for index in range(args.profile_steps):
+                order = operators if index % 2 == 0 else operators[::-1]
+                for position, (name, fn, inputs) in enumerate(order):
                     capture_dir = args.trace_dir / mode / name / f"step_{index:03d}"
                     capture_dir.mkdir(parents=True, exist_ok=False)
                     capture = {
                         "mode": mode, "operator": name, "step": index,
+                        "position": position,
                         "directory": str(capture_dir), "status": "warming_up", "artifacts": {},
                     }
                     info["captures"].append(capture)
@@ -194,7 +199,7 @@ def _profile(operators, modes, grad_output, args, result, save, profiler):
                             "mode": mode, "operator": name, "step": index,
                             "scope": result["timing_scope"][mode],
                         }))
-                        with torch.profiler.record_function(f"pg_attention/{name}/{mode}/step_{index:03d}"):
+                        with profile_host_stages(), torch.profiler.record_function(f"pg_attention/{name}/{mode}/step_{index:03d}"):
                             output = step()
                             with torch.profiler.record_function("pg_attention/device_synchronize"):
                                 torch.npu.synchronize()
@@ -213,6 +218,21 @@ def _profile(operators, modes, grad_output, args, result, save, profiler):
                         capture["kernel_count"] = sum(1 for _ in kernels)
                     if not capture["kernel_count"]:
                         raise RuntimeError(f"Profiler exported no NPU kernel records under {capture_dir}")
+                    capture["host_metrics"] = read_host_metrics(
+                        capture["artifacts"]["operator_details.csv"], name, mode, index,
+                    )
+                    capture["api_statistics"] = []
+                    for path in sorted(capture_dir.rglob("api_statistic.csv")):
+                        with path.open(encoding="utf-8-sig", newline="") as stream:
+                            reader = csv.DictReader(stream)
+                            rows = list(reader)
+                            columns = reader.fieldnames or []
+                        rows.sort(key=lambda row: (row.get("Level", ""), -float(row.get("Time(us)", 0))))
+                        capture["api_statistics"].append({"path": str(path), "columns": columns, "rows": rows})
+                    if capture["host_metrics"]["missing_events"]:
+                        save()
+                        raise RuntimeError("Host profile probes missing; rebuild/install the current wheel: " +
+                                           ", ".join(capture["host_metrics"]["missing_events"]))
                     capture["status"] = "complete"
                     save()
     except Exception as exc:
@@ -293,6 +313,7 @@ def _markdown_report(result):
     if profiling:
         lines.extend([
             "## NPU Profile", "",
+            f"Host 分段统计与回传清单：[host_profile.md](<{profiling['host_report_path']}>)。", "",
             f"采集状态：`{profiling['status']}`；Level1；请求的 AI Core 指标：`{profiling['aic_metrics']}`。",
             f"每条路径采集 {profiling['steps']} 次，每次采集前额外预热 {inputs['warmup']} 次。", "",
             "- CPU/NPU 时间线、输入形状和内存分配均开启；堆栈采集："
@@ -323,6 +344,8 @@ def _save_results(result, json_path, markdown_path):
         reports.append((json_path, json.dumps(result, indent=2, sort_keys=True) + "\n"))
     if markdown_path:
         reports.append((markdown_path, _markdown_report(result)))
+    if result.get("profiling"):
+        reports.append((Path(result["profiling"]["host_report_path"]), host_profile_markdown(result)))
     for path, contents in reports:
         with tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", dir=path.parent, prefix=path.name + ".", suffix=".tmp", delete=False,
@@ -398,6 +421,7 @@ def main() -> None:
     import torch_npu
     import prefix_grouper_npu
     from prefix_grouper_npu import build_shared_prefix_plan, shared_prefix_attention
+    from prefix_grouper_npu.profiling import HOST_PROBE_VERSION, host_stage
 
     modes = ["forward", "backward", "forward_backward"] if args.backward else ["forward"]
     result = {
@@ -414,6 +438,9 @@ def main() -> None:
         "package_path": prefix_grouper_npu.__file__,
         "ascend_home_path": os.environ.get("ASCEND_HOME_PATH"),
         "custom_opp_path": os.environ.get("ASCEND_CUSTOM_OPP_PATH"),
+        "runtime_environment": {key: os.environ.get(key) for key in (
+            "TASK_QUEUE_ENABLE", "ASCEND_LAUNCH_BLOCKING", "ASCEND_OPP_PATH", "LD_LIBRARY_PATH",
+        )},
         "input": {key: str(value) if isinstance(value, Path) else value
                   for key, value in vars(args).items()},
         "schema_version": 2,
@@ -436,7 +463,17 @@ def main() -> None:
             "status": "pending", "directory": str(args.trace_dir), "steps": args.profile_steps,
             "level": "Level1", "aic_metrics": args.profile_aic_metrics,
             "with_stack": args.profile_with_stack, "record_shapes": True, "profile_memory": True,
+            "host_probe_version": HOST_PROBE_VERSION,
+            "host_report_path": str(args.trace_dir / "host_profile.md"),
             "captures": [],
+        }
+        package_dir = Path(prefix_grouper_npu.__file__).resolve().parent
+        artifacts = set(package_dir.glob("*.py")) | set(package_dir.glob("_C*.so"))
+        artifacts.update(package_dir.glob("_opp/**/*.so"))
+        artifacts.update(package_dir.glob("_opp/**/*.o"))
+        result["artifact_sha256"] = {
+            str(path.relative_to(package_dir)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(artifacts) if path.is_file()
         }
 
     def save():
@@ -462,12 +499,18 @@ def main() -> None:
     causal = torch.triu(torch.ones((2048, 2048), device="npu", dtype=torch.bool), diagonal=1)
     scale = torch.tensor(128.0, dtype=torch.float32, device="cpu").rsqrt().item()
     custom = lambda: shared_prefix_attention(q, k, v, plan)
-    baseline = lambda: torch_npu.npu_fusion_attention(
-        q, k.index_select(0, kv_rows), v.index_select(0, kv_rows),
-        head_num=args.hq, input_layout="TND", atten_mask=causal,
-        scale=scale, keep_prob=1.0, actual_seq_qlen=qlens, actual_seq_kvlen=kvlens,
-        sparse_mode=3,
-    )[0]
+    def baseline():
+        with host_stage("pg_host/fusion/gather_k"):
+            expanded_k = k.index_select(0, kv_rows)
+        with host_stage("pg_host/fusion/gather_v"):
+            expanded_v = v.index_select(0, kv_rows)
+        with host_stage("pg_host/fusion/attention_bridge"):
+            return torch_npu.npu_fusion_attention(
+                q, expanded_k, expanded_v,
+                head_num=args.hq, input_layout="TND", atten_mask=causal,
+                scale=scale, keep_prob=1.0, actual_seq_qlen=qlens, actual_seq_kvlen=kvlens,
+                sparse_mode=3,
+            )[0]
 
     result.update({
         "compact_input_bytes": compact_storage,

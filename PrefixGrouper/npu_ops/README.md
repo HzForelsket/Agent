@@ -12,6 +12,10 @@ shared prefix.
 
 ## Native NPU build
 
+前向 Host 耗时分析、探针名称、实机命令和回传清单见
+[HOST_PROFILE_PLAN.md](HOST_PROFILE_PLAN.md)。开启 `--trace-dir` 后自动生成
+`host_profile.md` 分段统计；需要重新构建并安装包含 C++ 探针的 wheel。
+
 On the NPU server, activate its Python 3.10 environment with PyTorch 2.10.0
 and torch-npu 2.10.0, then build and install locally:
 

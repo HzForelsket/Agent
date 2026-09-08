@@ -8,6 +8,7 @@ from typing import Iterable, Sequence
 import torch
 
 from ._extension import load_extension
+from .profiling import host_stage
 
 
 _PLAN_CACHE: dict[tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], str], "SharedPrefixPlan"] = {}
@@ -188,18 +189,22 @@ def shared_prefix_attention(
     plan: SharedPrefixPlan,
     softmax_scale: float | None = None,
 ) -> torch.Tensor:
-    _validate(q, k, v, plan)
-    scale_fp32 = (
-        torch.tensor(q.shape[2], dtype=torch.float32, device="cpu").rsqrt()
-        if softmax_scale is None
-        else torch.tensor(softmax_scale, dtype=torch.float32, device="cpu")
-    )
-    if not torch.isfinite(scale_fp32).item() or not (scale_fp32 > 0).item():
-        raise ValueError("softmax_scale must be finite and positive")
-    # Python/PyTorch transport scalars as doubles; the value is computed in FP32.
-    scale = scale_fp32.item()
-    load_extension()
-    return _SharedPrefixAttention.apply(
-        q, k, v, plan.prefix_start, plan.prefix_end, plan.sequence_start, plan.sequence_end, plan.group_end, scale,
-        plan.prefix_lens, plan.suffix_lens, plan.group_sizes
-    )
+    with host_stage("pg_host/custom/python_validate"):
+        _validate(q, k, v, plan)
+    with host_stage("pg_host/custom/python_scale"):
+        scale_fp32 = (
+            torch.tensor(q.shape[2], dtype=torch.float32, device="cpu").rsqrt()
+            if softmax_scale is None
+            else torch.tensor(softmax_scale, dtype=torch.float32, device="cpu")
+        )
+        if not torch.isfinite(scale_fp32).item() or not (scale_fp32 > 0).item():
+            raise ValueError("softmax_scale must be finite and positive")
+        # Python/PyTorch transport scalars as doubles; computed in FP32.
+        scale = scale_fp32.item()
+    with host_stage("pg_host/custom/load_extension"):
+        load_extension()
+    with host_stage("pg_host/custom/autograd_apply"):
+        return _SharedPrefixAttention.apply(
+            q, k, v, plan.prefix_start, plan.prefix_end, plan.sequence_start, plan.sequence_end, plan.group_end, scale,
+            plan.prefix_lens, plan.suffix_lens, plan.group_sizes
+        )

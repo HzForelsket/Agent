@@ -1,4 +1,5 @@
 #include <ATen/DeviceGuard.h>
+#include <ATen/record_function.h>
 #include <torch/extension.h>
 #include <torch/library.h>
 #include "npu_cpp_extension.h"
@@ -60,18 +61,34 @@ std::tuple<at::Tensor, at::Tensor> forward_npu(const at::Tensor& q, const at::Te
     at::IntArrayRef prefixes, at::IntArrayRef suffixes, at::IntArrayRef groups)
 {
     const float fp_scale = static_cast<float>(scale);
-    check_inputs(q, k, v, ps, pe, ss, se, ge, fp_scale);
+    {
+        RECORD_USER_SCOPE("pg_host/custom/cpp_validate");
+        check_inputs(q, k, v, ps, pe, ss, se, ge, fp_scale);
+    }
     scale = static_cast<double>(fp_scale);
     const c10::OptionalDeviceGuard guard(device_of(q));
-    auto acc = accumulator(q);
-    auto lse_rows = at::empty({q.size(0), q.size(1), kRowAlignment}, q.options().dtype(at::kFloat));
-    auto out = at::empty_like(q);
-    EXEC_NPU_CMD_EXT(aclnnSharedPrefixAttentionForward, q, k, v, ps, pe, ss, se, ge, scale, prefixes, suffixes, groups, acc, lse_rows);
+    at::Tensor acc, lse_rows, out, lse;
+    {
+        RECORD_USER_SCOPE("pg_host/custom/allocate");
+        acc = accumulator(q);
+        lse_rows = at::empty({q.size(0), q.size(1), kRowAlignment}, q.options().dtype(at::kFloat));
+        out = at::empty_like(q);
+    }
+    {
+        RECORD_USER_SCOPE("pg_host/custom/attention_bridge");
+        EXEC_NPU_CMD_EXT(aclnnSharedPrefixAttentionForward, q, k, v, ps, pe, ss, se, ge, scale, prefixes, suffixes, groups, acc, lse_rows);
+    }
     const int64_t dim = q.size(2);
-    EXEC_NPU_CMD_EXT(aclnnSharedPrefixAttentionPack, acc, dim, out);
+    {
+        RECORD_USER_SCOPE("pg_host/custom/pack_bridge");
+        EXEC_NPU_CMD_EXT(aclnnSharedPrefixAttentionPack, acc, dim, out);
+    }
     // Native strided-to-contiguous copy has independent aligned output ownership.
     // The attention kernel never makes concurrent scalar stores to adjacent LSE values.
-    auto lse = lse_rows.select(2, 0).contiguous();
+    {
+        RECORD_USER_SCOPE("pg_host/custom/lse_compact");
+        lse = lse_rows.select(2, 0).contiguous();
+    }
     return {out, lse};
 }
 std::tuple<at::Tensor, at::Tensor, at::Tensor> backward_npu(

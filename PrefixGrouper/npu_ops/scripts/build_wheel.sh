@@ -21,6 +21,16 @@ if [[ "$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_in
     exit 2
 fi
 
+# Regenerate OPP schemas, metadata and kernels together. CANN's generated
+# ops-info JSON build rule does not track changes to its source INI.
+if [[ -L "${BUILD_DIR}" ]]; then
+    echo "Refusing to clean a symlinked OPP build directory: ${BUILD_DIR}" >&2
+    exit 2
+fi
+if [[ -d "${BUILD_DIR}" ]]; then
+    chmod -R u+w "${BUILD_DIR}"
+    rm -rf -- "${BUILD_DIR}"
+fi
 cmake --preset default -S "${PROJECT_DIR}" -B "${BUILD_DIR}" \
     -DCMAKE_INSTALL_PREFIX="${BUILD_DIR}" \
     -DASCEND_CANN_PACKAGE_PATH="${ASCEND_HOME_PATH}" \
