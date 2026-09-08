@@ -7,27 +7,31 @@
 ## 已知数据与未知项
 
 用户最近提供的数据（μs）：prefix=16、suffixes=[8,8]、Hq=12、Hkv=2、D=128，warmup=5。
-下面是优化前基线，本轮尚未实机复测：
+下面是完成 scale 缓存和 Pack/LSE 合并后的基线；本轮入口优化尚未实机复测：
 
 | 事件 | custom | fusion/permute | 口径 |
 |---|---:|---:|---|
-| 未开启 profiler 的 median | 807.66 | 288.93 | 正常前向耗时 |
-| 外层 forward | 2240.84 | 1345.55 | Host Total，含最后同步 |
-| 最后同步 | 215.16 | 171.82 | Host Total |
-| python_validate | 200.87 | 不适用 | Host Total |
-| python_scale | 480.31 | 不适用 | Host Total |
-| load_extension | 51.59 | 不适用 | Host Total |
-| autograd_apply | 1050.58 | 不适用 | Host Total，Self=131.02 |
-| PyTorch C++ 算子事件 | 823.12 | 256.41 | Host Total，内部工作不同 |
-| PyTorch C++ 算子 Self | 38.19 | 146.55 | Host Self |
-| allocate | 136.32 | 无独立标记 | Host Total |
-| attention_bridge | 364.09 | 393.61 | Host Total，标记处层级不同 |
-| pack_bridge | 155.12 | 不适用 | 优化前独立阶段 |
-| lse_compact | 125.00 | 不适用 | 优化前独立阶段 |
-| gather_k / gather_v | 不适用 | 389.92 / 144.86 | Host Total |
+| 未开启 profiler 的 median | 555.645 | 312.305 | 正常前向耗时 |
+| 外层 forward | 1768.72 | 1380.79 | Host Total，含最后同步 |
+| 最后同步 | 217.05 | 172.84 | Host Total |
+| python_validate | 207.68 | 不适用 | Host Total |
+| python_scale | 49.81 | 不适用 | Host Total |
+| load_extension | 40.73 | 不适用 | 旧入口的加载状态检查 |
+| autograd_apply | 974.91 | 不适用 | 旧入口 Total，Self=159.09 |
+| PyTorch C++ 算子事件 | 616.33 | 未提供 | Host Total |
+| PyTorch C++ 算子 Self | 26.68 | 未提供 | Host Self |
+| allocate | 181.13 | 无独立标记 | Host Total |
+| attention_bridge | 403.48 | 376.39 | Host Total，标记处层级不同 |
+| attention_bridge Self | 385.02 | 151.07 | Host Self，子事件覆盖不同 |
+| gather_k + gather_v | 不适用 | 574.19 | 按外层 Total/Self、同步及桥接推算 |
 
 Launch 总时间接近，不能证明参数准备、缓存行为、执行队列或设备计算耗时相同。
-本轮缓存默认 scale、集中 C++ 检查，并将最终 BF16/LSE 写回融合到 Attention 的 Vec2。
+旧入口中 autograd_apply 内、C++ 算子外的区间为 974.91−616.33=358.58 μs。
+本轮使用 torch.library.register_autograd 注册梯度，前向直接调用缓存的算子 overload。
+PyTorch 在 no-grad 或没有输入需要梯度时跳过 Function.apply 和 setup_context；
+需要梯度时保存同样的状态，继续调用原有反向算子。没有为 benchmark 单独绕过梯度的实现。
+输出仍是两个独立张量，改用 torch-npu 的 apply_tensor_without_format 分配；
+未开启探针时复用无状态 nullcontext，减少 Python 临时对象。
 正常计时的收益必须实机重测，不能把上述 profile 阶段耗时直接当成可节省的时间。
 
 ## 分析顺序
@@ -48,10 +52,9 @@ Launch 总时间接近，不能证明参数准备、缓存行为、执行队列�
 |---|---|---|
 | `pg_host/custom/python_validate` | NPU dispatch、Q rank、plan token 数 | Total |
 | `pg_host/custom/python_scale` | 默认 FP32 scale 的缓存查询／显式标量转换 | Total |
-| `pg_host/custom/load_extension` | 扩展加载检查；预热后通常已加载 | Total |
-| `pg_host/custom/autograd_apply` | autograd 包装与 C++ 算子 | Self 与 Total，不能加到子阶段上 |
+| `pg_host/custom/dispatch` | 缓存入口查询与已注册算子调用 | Self 与 Total，不能加到子阶段上 |
 | `pg_host/custom/cpp_validate` | C++ 参数检查 | Total |
-| `pg_host/custom/allocate` | 仅最终 out、lse 两个张量分配 | Total 与内部 aten 子事件 |
+| `pg_host/custom/allocate` | 通过 torch-npu 原生接口分配最终 out、lse | Total 与内部子事件 |
 | `pg_host/custom/attention_bridge` | 整次 EXEC_NPU_CMD_EXT 前向调用 | Total 与对应 CANN/工作线程 |
 | `pg_host/fusion/gather_k` | K index_select | Total 与设备任务 |
 | `pg_host/fusion/gather_v` | V index_select | Total 与设备任务 |
@@ -67,9 +70,12 @@ workspace 准备和执行放到工作线程，具体取决于配置。不能把�
 需要查看关联线程。此轮没有复制/替换 torch-npu 调度宏，也未修改 CANN 或官方算子。
 缓存命中次数和 tiling 次数不由这些粗粒度探针直接推断。
 
-探针版本已升为 2，前向 pack_bridge/lse_compact 不再存在，报告不会要求这些旧事件。
+探针版本为 3。load_extension/autograd_apply 被 dispatch 替代，
+前向 pack_bridge/lse_compact 仍不存在，报告不要求这些旧事件。
+dispatch 包含首次入口解析；预热后的入口缓存命中，不再执行 load_extension。
 父 Self 变小本身不代表优化成功。报告中的 `cpp_outside_stages_us` 是 C++ Total
 减去三个直接阶段 Total；`before_final_sync_us` 是外层 Total 减最后同步 Total。
+`dispatch_outside_cpp_us` 是 dispatch Total 减 C++ 算子 Total，直接观察入口包装的剩余范围。
 这些数值仍是墙钟区间，可能包含等待。
 
 ## 实机操作
@@ -91,7 +97,10 @@ bash scripts/run_910b_benchmark.sh /ABS/PATH/new_host_profile_run \
 
 将 `/ABS/PATH/...` 替换为新的绝对结果路径。输入参数必须替换成产生问题的原始输入；
 上面使用最近提供的输入。iterations 和 profile 配置也应与优化前一致。
-此示例关闭额外 AI Core 指标，聚焦 Host，shape/memory 采集仍开启。
+此示例关闭额外 AI Core 指标，聚焦 Host。默认 shape/memory/stack 采集均关闭；
+需要复现之前的采集配置时添加 `--profile-record-shapes --profile-memory`。
+两种配置保留同样的普通计时，只改变后续诊断采集。不要把默认轻量采集与上表
+旧 shape/memory 采集的 Host 时间直接比较，也不要把关闭采集选项的变化算作算子提速。
 `run_910b_benchmark.sh` 目前会先运行原有正确性门禁，其中包含梯度检查；
 `--no-backward` 限制的是测速与 profile，不会跳过该门禁。
 三个 profile capture 都在预热后单独采集，两条路径按 AB/BA 交替顺序采集，
@@ -113,8 +122,8 @@ Count，汇总同名范围在多个 capture 中的 Total 中位数/最小/最大
 |---|---|---|
 | 未开启 profiler 的 mean / median | 待填 | 待填 |
 | 外层 forward Total / 最后同步 Total | 待填 | 待填 |
-| Python validate / scale / load Total | 待填 | 不适用 |
-| 自定义 autograd_apply Self / Total | 待填 | 不适用 |
+| Python validate / scale Total | 待填 | 不适用 |
+| 自定义 dispatch Self / Total | 待填 | 不适用 |
 | C++ 算子 Self / Total | 待填 | 待填 |
 | cpp_validate / allocate Total | 待填 | 无同名独立探针 |
 | attention_bridge Self / Total | 待填 | 待填 |

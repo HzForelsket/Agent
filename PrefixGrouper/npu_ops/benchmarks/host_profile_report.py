@@ -10,7 +10,7 @@ from pathlib import Path
 CUSTOM_CPP_STAGES = (
     "cpp_validate", "allocate", "attention_bridge",
 )
-CUSTOM_PYTHON_STAGES = ("python_validate", "python_scale", "load_extension", "autograd_apply")
+CUSTOM_PYTHON_STAGES = ("python_validate", "python_scale", "dispatch")
 FUSION_STAGES = ("gather_k", "gather_v", "attention_bridge")
 
 
@@ -25,7 +25,7 @@ def read_host_metrics(operator_csv, operator, mode, step):
         for row in reader:
             name = row["Name"]
             if not (name.startswith(("pg_host/", "pg_attention/", "prefix_grouper_npu::")) or
-                    name in {"_SharedPrefixAttention", "npu::npu_fusion_attention"}):
+                    name == "npu::npu_fusion_attention"):
                 continue
             self_us = float(row["Host Self Duration(us)"])
             total_us = float(row["Host Total Duration(us)"])
@@ -53,6 +53,9 @@ def read_host_metrics(operator_csv, operator, mode, step):
         derived["cpp_outside_stages_us"] = events[cpp]["total_us"] - sum(
             events[f"pg_host/custom/{name}"]["total_us"] for name in CUSTOM_CPP_STAGES
         )
+        derived["dispatch_outside_cpp_us"] = (
+            events["pg_host/custom/dispatch"]["total_us"] - events[cpp]["total_us"]
+        )
     return {"events": events, "missing_events": missing, "derived": derived}
 
 
@@ -75,6 +78,9 @@ def host_profile_markdown(result):
     ]
     for name, digest in result.get("artifact_sha256", {}).items():
         lines.append(f"| {name} | `{digest}` |")
+    lines += ["", f"采集选项：record_shapes={info.get('record_shapes')}，"
+              f"profile_memory={info.get('profile_memory')}，with_stack={info.get('with_stack')}。",
+              "不同采集选项的 Host 时间不可直接比较；提速仍以关闭 profiler 的计时为准。"]
     lines += ["", "## 2. 未开启 profiler 的前向速度", "",
               "| 路径 | Mean (μs) | Median (μs) | 次数 |", "|---|---:|---:|---:|"]
     for operator, record in result.get("timings", {}).get("forward", {}).items():
@@ -102,6 +108,7 @@ def host_profile_markdown(result):
             lines.append(f"| `{name}` | {values['count']} | {values['self_us']:.3f} | {values['total_us']:.3f} |")
             key = name.rsplit("/step_", 1)[0]
             across.setdefault((operator, key), []).append(values["total_us"])
+        lines.append("")
         for name, value in metrics["derived"].items():
             lines += [f"- `{name}`：{value:.3f} μs。"]
         lines += ["", "CANN API 汇总：同层按 Time 降序查看；不能与上表相加。"]
@@ -124,7 +131,8 @@ def host_profile_markdown(result):
                      f"{min(values):.3f} | {max(values):.3f} |")
     lines += ["", "## 5. 需要回传的关键数值", "",
               "- 隔离机器无需上传文件、路径或环境细节；按第 2/3 节手工告知关键数值即可。",
-              "- 优先提供两条路径的正常计时 median、外层 Total、最后同步，以及 custom validate/scale/allocate/attention_bridge。",
+              "- 优先提供两条路径的正常计时 median、外层 Total、最后同步，以及 custom validate/scale/dispatch/allocate/attention_bridge。",
+              "- dispatch 包含缓存入口查询及已注册算子调用；不再存在手工 autograd_apply 或每次 load_extension 探针。",
               "- 前向 BF16 转换和紧凑 LSE 写回已合入 Attention，pack_bridge/lse_compact 不再是独立事件。",
               "- 若只回传数值：第 3/4 节表格，以及 Attention/gather 的设备任务名称、次数、耗时和间隙。",
               "- 从时间线补充：Attention/fusion 的 GetWorkspaceSize、Tiling、Launch 的名称、线程、次数和耗时；",

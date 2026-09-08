@@ -3,6 +3,7 @@
 #include <torch/extension.h>
 #include <torch/library.h>
 #include "npu_cpp_extension.h"
+#include "torch_npu/csrc/framework/utils/OpPreparation.h"
 #include "aclnn_shared_prefix_attention_backward.h"
 #include "aclnn_shared_prefix_attention_forward.h"
 #include "aclnn_shared_prefix_attention_pack.h"
@@ -70,8 +71,11 @@ std::tuple<at::Tensor, at::Tensor> forward_npu(const at::Tensor& q, const at::Te
     at::Tensor out, lse;
     {
         RECORD_USER_SCOPE("pg_host/custom/allocate");
-        out = at::empty_like(q);
-        lse = at::empty({q.size(0), q.size(1)}, q.options().dtype(at::kFloat));
+        // Allocate ND outputs through torch-npu's native operator factory.
+        // Keep independent storage for each returned tensor and each invocation.
+        out = at_npu::native::OpPreparation::apply_tensor_without_format(q);
+        lse = at_npu::native::OpPreparation::apply_tensor_without_format(
+            {q.size(0), q.size(1)}, q.options().dtype(at::kFloat));
     }
     {
         RECORD_USER_SCOPE("pg_host/custom/attention_bridge");

@@ -106,6 +106,14 @@ The default FP32 scale is cached by D (bounded to 128 entries); warm calls do no
 create CPU tensors for scale computation. Explicit scales are rounded to FP32
 and validated in C++, which also owns dtype/layout/metadata checks. Python only
 checks the NPU dispatch, Q rank and plan token count before scale resolution.
+The native forward overload is resolved and cached once. Gradients are registered
+with `torch.library.register_autograd`; the public call no longer enters a manual
+Python `autograd.Function.apply`. PyTorch skips backward-context setup for
+no-grad calls or when no input requires gradients. Training saves the same tensors
+and calls the existing NPU backward; the compact LSE output is non-differentiable
+saved state. Native output allocation uses torch-npu's
+`OpPreparation::apply_tensor_without_format`, with independent output storage for
+every call.
 Softmax and kernel accumulation use FP32.
 PyTorch and the generated CANN ACLNN scalar interfaces require a host `double`
 parameter; it only transports the FP32 scale and does not introduce FP64 tensor
@@ -227,7 +235,7 @@ The hardware suite retains the eight numerical cases and input-contract checks,
 and covers:
 
 - Three LSE boundary cases with `T * Hq` equal to 15, 16 and 17. The test captures
-  the actual FP32 LSE saved by the public autograd function, checks it against an
+  the actual FP32 LSE saved by the registered autograd context, checks it against an
   independent dense masked CPU oracle (`rtol=1e-5`, `atol=1e-6`), and checks the
   BF16 output and all three gradients using the original thresholds.
 - One same-process A/B/A case. It explicitly overwrites the same Q/K/V buffers,
@@ -312,7 +320,7 @@ Inductor, then `torch.fx.experimental.optimization`, then `torch.utils.mkldnn`.
 The latter uses `torch.jit.script_method` and emits its deprecation warning.
 This happens before the custom operator is loaded and is not an operator
 correctness failure. No project code uses `script_method`; the warning does
-not require replacing this package's autograd function with `torch.compile`.
+not require compiling this package's registered autograd formula with `torch.compile`.
 Do not change the pinned dependencies or globally suppress warnings to hide it.
 
 ## Small Native Performance Run
@@ -410,14 +418,18 @@ exist. If `--output` is omitted, JSON and Markdown reports are created as
 `benchmark.json` and `benchmark.md` inside the trace directory. Existing
 correctness gates still run before any timing or profiling.
 
-Profiling records CPU and NPU activities, input shapes and memory allocations
-at Level1, requesting `PipeUtilization` hardware counters by default.
+Profiling records CPU and NPU activities at Level1, requesting `PipeUtilization`
+hardware counters by default. Shape, allocation and stack recording are off by
+default to reduce Host profiling overhead. Add `--profile-record-shapes` and
+`--profile-memory` when those records are needed; these flags affect only the
+diagnostic capture, not normal timing or the existing peak-memory measurements.
 `--profile-aic-metrics` selects one group: `PipeUtilization`, `Memory`,
 `MemoryL0`, `MemoryUB`, `ResourceConflictRatio`, or `None` for no AI Core
 counters. These groups are alternatives, not an automatic sweep. Actual
 available counters are determined by the real device and exported CSV columns.
 Add `--profile-with-stack` to collect Python stacks. Profiling perturbs execution;
-use the unprofiled timing records for latency comparisons.
+use the unprofiled timing records for latency comparisons. Do not compare Host
+durations across different recording options as evidence of operator speedup.
 
 `--profile-steps` defaults to one isolated capture per operator and selected
 mode. Each capture repeats the requested `--warmup` outside the profiler, then
@@ -435,8 +447,8 @@ Artifacts are organized under
 - `kernel_details.csv`: device task durations and available AI Core counters.
 - `operator_details.csv`: framework operator timings and associated device work.
 
-Other native memory reports and raw collection data are retained by the
-profiler. Allocation records describe tensor memory, not internal GM/UB traffic;
+When requested, native memory reports and raw collection data are retained by
+the profiler. Allocation records describe tensor memory, not internal GM/UB traffic;
 for backward-only profiles, forward allocations predate the capture.
 
 The benchmark's `profiling` object records configuration, per-capture status,

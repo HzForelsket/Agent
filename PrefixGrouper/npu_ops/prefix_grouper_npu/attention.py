@@ -8,7 +8,7 @@ from typing import Iterable, Sequence
 
 import torch
 
-from ._extension import load_extension
+from ._extension import get_forward_op
 from .profiling import host_stage
 
 
@@ -133,41 +133,6 @@ def _default_scale(head_dim: int) -> float:
     return torch.tensor(head_dim, dtype=torch.float32, device="cpu").rsqrt().item()
 
 
-class _SharedPrefixAttention(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx: torch.autograd.function.FunctionCtx,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        prefix_start: torch.Tensor,
-        prefix_end: torch.Tensor,
-        sequence_start: torch.Tensor,
-        sequence_end: torch.Tensor,
-        group_end: torch.Tensor,
-        scale: float,
-        prefix_lens: tuple[int, ...],
-        suffix_lens: tuple[int, ...],
-        group_sizes: tuple[int, ...],
-    ) -> torch.Tensor:
-        out, lse = torch.ops.prefix_grouper_npu.shared_prefix_attention_forward(
-            q, k, v, prefix_start, prefix_end, sequence_start, sequence_end, group_end, scale,
-            prefix_lens, suffix_lens, group_sizes
-        )
-        ctx.save_for_backward(q, k, v, out, lse, prefix_start, prefix_end, sequence_start, sequence_end, group_end)
-        ctx.scale = scale
-        return out
-
-    @staticmethod
-    def backward(ctx: torch.autograd.function.FunctionCtx, grad_out: torch.Tensor):
-        q, k, v, out, lse, prefix_start, prefix_end, sequence_start, sequence_end, group_end = ctx.saved_tensors
-        dq, dk, dv = torch.ops.prefix_grouper_npu.shared_prefix_attention_backward(
-            grad_out.contiguous(), q, k, v, out, lse,
-            prefix_start, prefix_end, sequence_start, sequence_end, group_end, ctx.scale
-        )
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None
-
-
 def shared_prefix_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -180,10 +145,11 @@ def shared_prefix_attention(
     with host_stage("pg_host/custom/python_scale"):
         # C++ converts to FP32 and validates the scalar at the dispatch boundary.
         scale = _default_scale(q.shape[2]) if softmax_scale is None else float(softmax_scale)
-    with host_stage("pg_host/custom/load_extension"):
-        load_extension()
-    with host_stage("pg_host/custom/autograd_apply"):
-        return _SharedPrefixAttention.apply(
+    with host_stage("pg_host/custom/dispatch"):
+        # Resolve the overload once; PyTorch's registered autograd implementation
+        # only creates a backward context when gradients are actually required.
+        out, _ = get_forward_op()(
             q, k, v, plan.prefix_start, plan.prefix_end, plan.sequence_start, plan.sequence_end, plan.group_end, scale,
             plan.prefix_lens, plan.suffix_lens, plan.group_sizes
         )
+        return out

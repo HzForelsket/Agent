@@ -182,8 +182,8 @@ def _profile(operators, modes, grad_output, args, result, save, profiler):
                         on_trace_ready=profiler.tensorboard_trace_handler(
                             str(capture_dir), analyse_flag=True, async_mode=False,
                         ),
-                        record_shapes=True,
-                        profile_memory=True,
+                        record_shapes=args.profile_record_shapes,
+                        profile_memory=args.profile_memory,
                         with_stack=args.profile_with_stack,
                         experimental_config=profiler._ExperimentalConfig(
                             profiler_level=profiler.ProfilerLevel.Level1,
@@ -316,7 +316,9 @@ def _markdown_report(result):
             f"Host 分段统计与回传清单：[host_profile.md](<{profiling['host_report_path']}>)。", "",
             f"采集状态：`{profiling['status']}`；Level1；请求的 AI Core 指标：`{profiling['aic_metrics']}`。",
             f"每条路径采集 {profiling['steps']} 次，每次采集前额外预热 {inputs['warmup']} 次。", "",
-            "- CPU/NPU 时间线、输入形状和内存分配均开启；堆栈采集："
+            "- CPU/NPU 时间线开启；输入形状："
+            f"{'开启' if profiling['record_shapes'] else '关闭'}；内存分配："
+            f"{'开启' if profiling['profile_memory'] else '关闭'}；堆栈："
             f"{'开启' if profiling['with_stack'] else '关闭'}。",
             "- 反向建图在采集外完成；时间线中的 pg_attention 范围标识路径及模式。",
             "- Profile 包含采集开销，只用于定位瓶颈；上方耗时来自未开启 profiler 的采样。",
@@ -383,6 +385,10 @@ def main() -> None:
                         help="one AI Core metric group per run; requires --trace-dir")
     parser.add_argument("--profile-with-stack", action="store_true",
                         help="include Python stacks in the profile; requires --trace-dir")
+    parser.add_argument("--profile-record-shapes", action="store_true",
+                        help="record input shapes (extra overhead); requires --trace-dir")
+    parser.add_argument("--profile-memory", action="store_true",
+                        help="record tensor allocations (extra overhead); requires --trace-dir")
     args = parser.parse_args()
     if args.prefix <= 0 or any(length <= 0 for length in args.suffixes):
         parser.error("prefix and suffix lengths must be positive")
@@ -393,7 +399,7 @@ def main() -> None:
     if args.profile_steps <= 0:
         parser.error("profile-steps must be positive")
     if not args.trace_dir and (args.profile_steps != 1 or args.profile_aic_metrics != "PipeUtilization"
-                               or args.profile_with_stack):
+                               or args.profile_with_stack or args.profile_record_shapes or args.profile_memory):
         parser.error("profile options require --trace-dir")
     if args.trace_dir:
         args.trace_dir = args.trace_dir.resolve()
@@ -462,7 +468,8 @@ def main() -> None:
         result["profiling"] = {
             "status": "pending", "directory": str(args.trace_dir), "steps": args.profile_steps,
             "level": "Level1", "aic_metrics": args.profile_aic_metrics,
-            "with_stack": args.profile_with_stack, "record_shapes": True, "profile_memory": True,
+            "with_stack": args.profile_with_stack,
+            "record_shapes": args.profile_record_shapes, "profile_memory": args.profile_memory,
             "host_probe_version": HOST_PROBE_VERSION,
             "host_report_path": str(args.trace_dir / "host_profile.md"),
             "captures": [],

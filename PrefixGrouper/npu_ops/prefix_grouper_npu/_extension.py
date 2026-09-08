@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+from functools import lru_cache
 from pathlib import Path
 from threading import Lock
 
@@ -35,4 +36,13 @@ def load_extension() -> None:
             os.environ["ASCEND_CUSTOM_OPP_PATH"] = ":".join([str(vendor), *entries])
         ctypes.CDLL(str(op_api), mode=ctypes.RTLD_GLOBAL)
         torch.ops.load_library(str(extension))
+        from ._autograd import register_autograd
+
+        register_autograd()
         _LOADED = True
+
+
+@lru_cache(maxsize=1)
+def get_forward_op():
+    load_extension()
+    return torch.ops.prefix_grouper_npu.shared_prefix_attention_forward.default

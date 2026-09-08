@@ -5,7 +5,8 @@ from contextvars import ContextVar
 import torch
 
 _ENABLED = ContextVar("prefix_grouper_host_profile", default=False)
-HOST_PROBE_VERSION = 2
+HOST_PROBE_VERSION = 3
+_NO_PROFILE = nullcontext()
 
 
 @contextmanager
@@ -19,4 +20,4 @@ def profile_host_stages():
 
 def host_stage(name: str):
     # No record_function calls outside the explicit capture context.
-    return torch.profiler.record_function(name) if _ENABLED.get() else nullcontext()
+    return torch.profiler.record_function(name) if _ENABLED.get() else _NO_PROFILE
