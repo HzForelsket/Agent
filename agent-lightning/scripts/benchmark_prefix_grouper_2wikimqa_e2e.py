@@ -26,6 +26,8 @@ from typing import Any, Literal, cast
 import httpx
 from omegaconf import OmegaConf
 from packaging.version import InvalidVersion, Version
+from transformers import AutoConfig
+from verl.workers.rollout.utils import get_max_position_embeddings
 
 import agentlightning as agl
 from agentlightning.verl.accelerator import AcceleratorRuntime, Backend, select_accelerator
@@ -35,7 +37,7 @@ from prepare_prefix_grouper_2wikimqa import dataset_source, download_source_rows
 from prefix_grouper_stack import NPU_CANN_VERSION, REQUIRED_STACKS
 
 BENCHMARK_ID = "pg-2wikimqa-e2e"
-RESULT_SCHEMA_VERSION = 3
+RESULT_SCHEMA_VERSION = 4
 DATASET_NAME = "2WikiMQA"
 DEFAULT_MODEL = "Qwen/Qwen3-8B"
 DEFAULT_DOWNLOAD_DIR = Path(".cache/pg-2wikimqa-e2e")
@@ -43,14 +45,10 @@ SYSTEM_PROMPT = (
     "Answer the question using only the supplied Wikipedia passages. "
     "Return only the shortest answer phrase, with no explanation."
 )
-DEFAULT_MAX_PROMPT_TOKENS = 2048
-DEFAULT_MIN_PROMPT_TOKENS = 1900
-DEFAULT_MAX_RESPONSE_TOKENS = 64
 MINIMUM_DATASET_ROWS = 64
 DEFAULT_ROLLOUTS_PER_SAMPLE = 4
 DEFAULT_TRAIN_BATCH_SIZE = 8
 DEFAULT_MICRO_BATCH_SIZE = 2
-DEFAULT_STEPS = 8
 DEFAULT_RUNNERS = 16
 DEFAULT_SEED = 20260827
 Mode = Literal["baseline", "prefix_grouper"]
@@ -211,7 +209,7 @@ async def wiki_agent(task: dict[str, Any], llm: agl.LLM, rollout: agl.Rollout) -
         "model": llm.model,
         "messages": messages,
         "temperature": 1.0,
-        "max_tokens": int(task["max_response_tokens"]),
+        "max_tokens": int(task["request_max_tokens"]),
         "seed": request_seed,
         "return_token_ids": True,
     }
@@ -223,6 +221,7 @@ async def wiki_agent(task: dict[str, Any], llm: agl.LLM, rollout: agl.Rollout) -
         payload = response.json()
 
     _record_training_tokens(payload, llm.model)
+    _, response_ids = _response_token_ids(payload)
     message = payload["choices"][0]["message"]
     text = str(message.get("content") or message.get("reasoning_content") or "").strip()
     answers = [str(answer) for answer in task["answers"]]
@@ -241,6 +240,9 @@ async def wiki_agent(task: dict[str, Any], llm: agl.LLM, rollout: agl.Rollout) -
                 "prompt_tokens": task["prompt_tokens"],
                 "rollout_index": rollout_index,
                 "request_seed": request_seed,
+                "response_tokens": len(response_ids),
+                "finish_reason": payload["choices"][0]["finish_reason"],
+                "request_max_tokens": task["request_max_tokens"],
                 "answers": answers,
                 "response": text,
                 "exact_reward": exact_reward,
@@ -253,9 +255,8 @@ async def wiki_agent(task: dict[str, Any], llm: agl.LLM, rollout: agl.Rollout) -
 def load_dataset(
     path: Path,
     benchmark_seed: int,
-    min_prompt_tokens: int,
-    max_prompt_tokens: int,
-    max_response_tokens: int,
+    min_prompt_tokens: int | None,
+    max_prompt_tokens: int | None,
 ) -> list[dict[str, Any]]:
     """Load and validate the maintained 2WikiMQA JSONL schema."""
     rows: list[dict[str, Any]] = []
@@ -278,7 +279,11 @@ def load_dataset(
                 raise ValueError(f"{path}:{line_number} has no golden answers.")
             answer_values = cast(list[Any], answers)
             prompt_tokens = int(source["prompt_tokens"])
-            if not min_prompt_tokens <= prompt_tokens <= max_prompt_tokens:
+            if (
+                prompt_tokens <= 0
+                or (min_prompt_tokens is not None and prompt_tokens < min_prompt_tokens)
+                or (max_prompt_tokens is not None and prompt_tokens > max_prompt_tokens)
+            ):
                 raise ValueError(
                     f"{path}:{line_number} has {prompt_tokens} prompt tokens; "
                     f"the configured range is {min_prompt_tokens}–{max_prompt_tokens}."
@@ -290,10 +295,41 @@ def load_dataset(
                     "sample_id": sample_id,
                     "prompt_tokens": prompt_tokens,
                     "benchmark_seed": benchmark_seed,
-                    "max_response_tokens": max_response_tokens,
                 }
             )
     return rows
+
+
+def resolve_workload_limits(args: argparse.Namespace, dataset: list[dict[str, Any]]) -> None:
+    """Resolve finite engine capacities without adding implicit workload limits."""
+    if args.steps is None:
+        if len(dataset) % args.train_batch_size:
+            raise ValueError(
+                "A full epoch requires --train-batch-size to divide the dataset row count "
+                f"({len(dataset)}); VERL drops incomplete batches. Choose a divisor to retain every sample."
+            )
+        args.steps = len(dataset) // args.train_batch_size
+
+    model_config = AutoConfig.from_pretrained(args.model, local_files_only=True)
+    model_context_length = get_max_position_embeddings(model_config)
+    observed_max_prompt = max(row["prompt_tokens"] for row in dataset)
+    if observed_max_prompt >= model_context_length:
+        raise ValueError(
+            f"Dataset prompt length {observed_max_prompt} leaves no output space in the model's "
+            f"{model_context_length}-token context. Use a longer-context model or explicit prompt filtering."
+        )
+    args.resolved_max_prompt_tokens = observed_max_prompt
+    args.resolved_max_model_len = (
+        model_context_length
+        if args.max_response_tokens is None
+        else min(model_context_length, observed_max_prompt + args.max_response_tokens)
+    )
+    for row in dataset:
+        remaining = args.resolved_max_model_len - row["prompt_tokens"]
+        row["request_max_tokens"] = (
+            remaining if args.max_response_tokens is None else min(args.max_response_tokens, remaining)
+        )
+    args.resolved_max_response_tokens = max(row["request_max_tokens"] for row in dataset)
 
 
 def _normalized_version(value: str) -> str:
@@ -346,8 +382,8 @@ def build_config(
         "agentlightning": {"model_name": args.model_name},
         "data": {
             "train_batch_size": args.train_batch_size,
-            "max_prompt_length": args.max_prompt_tokens,
-            "max_response_length": args.max_response_tokens,
+            "max_prompt_length": args.resolved_max_prompt_tokens,
+            "max_response_length": args.resolved_max_response_tokens,
             "filter_overlong_prompts": False,
         },
         "actor_rollout_ref": {
@@ -361,7 +397,7 @@ def build_config(
                 "log_prob_micro_batch_size_per_gpu": args.micro_batch_size_per_device,
                 "multi_turn": {"enable": False, "format": "hermes"},
                 "gpu_memory_utilization": 0.35,
-                "max_model_len": args.max_prompt_tokens + args.max_response_tokens,
+                "max_model_len": args.resolved_max_model_len,
                 "prometheus": {"served_model_name": args.model_name},
             },
             "actor": {
@@ -430,9 +466,9 @@ def build_config(
     }
     if mode == "prefix_grouper":
         config.setdefault("agentlightning", {})["prefix_grouper"] = {"enabled": True}
-        config["actor_rollout_ref"]["model"]["override_config"]["prefix_grouper_npu_backend"] = (
-            args.npu_attention_backend
-        )
+        config["actor_rollout_ref"]["model"]["override_config"][
+            "prefix_grouper_npu_backend"
+        ] = args.npu_attention_backend
     return config
 
 
@@ -459,10 +495,12 @@ def parse_args() -> argparse.Namespace:
         help="Shared GPU/NPU cache root for model and dataset artifacts.",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
-    parser.add_argument("--min-prompt-tokens", type=int, default=DEFAULT_MIN_PROMPT_TOKENS)
-    parser.add_argument("--max-prompt-tokens", type=int, default=DEFAULT_MAX_PROMPT_TOKENS)
-    parser.add_argument("--max-response-tokens", type=int, default=DEFAULT_MAX_RESPONSE_TOKENS)
+    parser.add_argument("--steps", type=int, help="Optional training step limit; default: one full dataset epoch.")
+    parser.add_argument("--min-prompt-tokens", type=int, help="Optional minimum original prompt length.")
+    parser.add_argument("--max-prompt-tokens", type=int, help="Optional maximum original prompt length.")
+    parser.add_argument(
+        "--max-response-tokens", type=int, help="Optional output cap; default: remaining model context."
+    )
     parser.add_argument("--train-batch-size", type=int, default=DEFAULT_TRAIN_BATCH_SIZE)
     parser.add_argument("--micro-batch-size-per-device", type=int, default=DEFAULT_MICRO_BATCH_SIZE)
     parser.add_argument("--rollouts-per-sample", type=int, default=DEFAULT_ROLLOUTS_PER_SAMPLE)
@@ -553,16 +591,11 @@ def materialize_workload(args: argparse.Namespace) -> None:
     if args.dataset_path is None:
         source_identity = dataset_source()
         tokenizer_key = hashlib.sha256(model_ref.encode("utf-8")).hexdigest()[:12]
-        source_key = hashlib.sha256(
-            json.dumps(source_identity, sort_keys=True).encode("utf-8")
-        ).hexdigest()[:12]
+        source_key = hashlib.sha256(json.dumps(source_identity, sort_keys=True).encode("utf-8")).hexdigest()[:12]
         prepared_path = (
             download_dir
             / "datasets"
-            / (
-                f"2wikimqa-{args.min_prompt_tokens}-{args.max_prompt_tokens}-"
-                f"{source_key}-{tokenizer_key}.jsonl"
-            )
+            / (f"2wikimqa-{args.min_prompt_tokens}-{args.max_prompt_tokens}-" f"{source_key}-{tokenizer_key}.jsonl")
         ).resolve()
         if not prepared_path.is_file():
             source_path = download_source_rows(
@@ -640,10 +673,13 @@ def run_benchmark(
         "micro_batch_size_per_device": args.micro_batch_size_per_device,
         "rollouts_per_sample": args.rollouts_per_sample,
         "input_policy": "filter-untruncated",
-        "response_policy": "truncate-at-max-tokens",
+        "response_policy": "model-context" if args.max_response_tokens is None else "truncate-at-max-tokens",
         "min_prompt_tokens": args.min_prompt_tokens,
         "max_prompt_tokens": args.max_prompt_tokens,
         "max_response_tokens": args.max_response_tokens,
+        "resolved_max_prompt_tokens": args.resolved_max_prompt_tokens,
+        "resolved_max_response_tokens": args.resolved_max_response_tokens,
+        "resolved_max_model_len": args.resolved_max_model_len,
         "n_devices_per_node": config["trainer"]["n_gpus_per_node"],
         "tensor_model_parallel_size": config["actor_rollout_ref"]["rollout"]["tensor_model_parallel_size"],
         "n_runners": args.n_runners,
@@ -673,8 +709,14 @@ def main() -> None:
         "--max-prompt-tokens",
         "--max-response-tokens",
     ):
-        _validate_positive(name, int(getattr(args, name[2:].replace("-", "_"))))
-    if args.min_prompt_tokens > args.max_prompt_tokens:
+        value = getattr(args, name[2:].replace("-", "_"))
+        if value is not None:
+            _validate_positive(name, value)
+    if (
+        args.min_prompt_tokens is not None
+        and args.max_prompt_tokens is not None
+        and args.min_prompt_tokens > args.max_prompt_tokens
+    ):
         raise ValueError("--min-prompt-tokens cannot exceed --max-prompt-tokens.")
     runtime: AcceleratorRuntime | None = None
     if args.dry_run:
@@ -699,7 +741,6 @@ def main() -> None:
         args.seed,
         args.min_prompt_tokens,
         args.max_prompt_tokens,
-        args.max_response_tokens,
     )
     if len(dataset) < MINIMUM_DATASET_ROWS:
         raise ValueError(
@@ -707,6 +748,7 @@ def main() -> None:
         )
     if len(dataset) < args.train_batch_size:
         raise ValueError(f"Dataset has {len(dataset)} rows, fewer than train batch size {args.train_batch_size}.")
+    resolve_workload_limits(args, dataset)
 
     output_dir = args.output_dir.resolve()
     metrics_path = output_dir / "metrics.jsonl"

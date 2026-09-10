@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 BENCHMARK_ID = "pg-2wikimqa-e2e"
-RESULT_SCHEMA_VERSION = 3
+RESULT_SCHEMA_VERSION = 4
 Direction = Literal["higher", "lower", "neutral"]
 Record = dict[str, Any]
 
@@ -72,6 +72,9 @@ COMPARABLE_RUN_FIELDS = (
     "min_prompt_tokens",
     "max_prompt_tokens",
     "max_response_tokens",
+    "resolved_max_prompt_tokens",
+    "resolved_max_response_tokens",
+    "resolved_max_model_len",
     "n_devices_per_node",
     "tensor_model_parallel_size",
     "n_runners",
@@ -391,6 +394,32 @@ def _response_summary(records: list[Record], path: Path) -> dict[str, dict[str, 
     return result
 
 
+def _response_length_summary(records: list[Record], path: Path) -> Record:
+    """Summarize serving token lengths and explicit length termination reasons."""
+    lengths: list[float] = []
+    finish_reasons: Counter[str] = Counter()
+    histogram: Counter[int] = Counter()
+    for index, record in enumerate(records, start=1):
+        context = f"{path} record {index}"
+        length = _require_int(record, "response_tokens", context)
+        budget = _require_int(record, "request_max_tokens", context)
+        reason = record.get("finish_reason")
+        if length <= 0 or budget <= 0 or length > budget:
+            raise ValueError(f"{context} has invalid response length/budget: {length}/{budget}.")
+        if not isinstance(reason, str) or not reason:
+            raise ValueError(f"{context} requires a non-empty finish_reason.")
+        lengths.append(float(length))
+        histogram[length] += 1
+        finish_reasons[reason] += 1
+    return {
+        "response_tokens": summarize(lengths),
+        "length_histogram": [{"tokens": length, "count": count} for length, count in sorted(histogram.items())],
+        "finish_reason_counts": dict(sorted(finish_reasons.items())),
+        "truncated_count": finish_reasons["length"],
+        "truncation_rate": finish_reasons["length"] / len(records),
+    }
+
+
 def build_report(baseline: RunArtifacts, prefix: RunArtifacts) -> Record:
     """Build a comparison report after strict equivalence checks."""
     invariants = validate_comparable(baseline, prefix)
@@ -408,7 +437,8 @@ def build_report(baseline: RunArtifacts, prefix: RunArtifacts) -> Record:
         ("steady_state", baseline.steps[1:], prefix.steps[1:]),
     ):
         if not baseline_steps or not prefix_steps:
-            raise ValueError("At least two training steps are required to compute a steady-state report.")
+            windows[name] = {"step_numbers": [], "metrics": {}}
+            continue
         baseline_summary = _summarize_steps(baseline_steps, common_metric_names)
         prefix_summary = _summarize_steps(prefix_steps, common_metric_names)
         windows[name] = {
@@ -441,6 +471,11 @@ def build_report(baseline: RunArtifacts, prefix: RunArtifacts) -> Record:
             "speedup": wall_baseline / wall_prefix if wall_prefix else None,
         },
         "windows": windows,
+        "response_lengths": {
+            "baseline": _response_length_summary(baseline.responses, baseline.responses_path),
+            "prefix_grouper": _response_length_summary(prefix.responses, prefix.responses_path),
+            "truncation_definition": "finish_reason=length; output cap or model context exhausted",
+        },
         "rollout_quality": {
             "response_count": len(baseline.responses),
             "metrics": compare_summaries(baseline_responses, prefix_responses),
@@ -470,6 +505,8 @@ def _format_number(value: Any) -> str:
 
 def _metric_table(report: Record, window: str, metrics: tuple[str, ...]) -> list[str]:
     window_record = cast(Record, cast(Record, report["windows"])[window])
+    if not window_record["step_numbers"]:
+        return ["无可用 step（仅一个训练 step 时，steady-state 为空）。"]
     comparisons = cast(dict[str, Record], window_record["metrics"])
     lines = [
         "| 指标 | B mean | B p50 | B p95 | PG mean | PG p50 | PG p95 | Mean 差值 | 改善 | Speedup |",
@@ -510,6 +547,15 @@ def render_markdown(report: Record) -> str:
     wall = cast(Record, report["run_wall_seconds"])
     rollout_quality = cast(Record, report["rollout_quality"])
     quality_metrics = cast(dict[str, Record], rollout_quality["metrics"])
+    minimum = invariants["min_prompt_tokens"]
+    maximum = invariants["max_prompt_tokens"]
+    prompt_range = f"{minimum if minimum is not None else '不限'}–{maximum if maximum is not None else '不限'}"
+    response_limit = invariants["max_response_tokens"]
+    response_description = (
+        "输出不设额外上限（EOS 或模型上下文耗尽时结束）"
+        if response_limit is None
+        else f"输出最多 {response_limit} tokens（同时受模型上下文约束）"
+    )
     lines = [
         "# PrefixGrouper 2WikiMQA 训练端到端基准报告",
         "",
@@ -517,8 +563,7 @@ def render_markdown(report: Record) -> str:
         f"- 后端：`{invariants['backend']}`；设备：`{invariants['device_name']}`",
         f"- 模型：`{invariants['model_name']}`（来源：`{invariants['model_ref']}`；本地：`{invariants['model_path']}`）",
         f"- 数据：`{invariants['dataset']}`，{invariants['dataset_rows']} rows",
-        f"- 输入：原始 prompt 过滤 {invariants['min_prompt_tokens']}–{invariants['max_prompt_tokens']} tokens；"
-        f"输出最多 {invariants['max_response_tokens']} tokens",
+        f"- 输入：原始 prompt 范围 {prompt_range} tokens；{response_description}",
         f"- Steps：{invariants['steps']}；steady-state 排除 step 1",
         f"- 比较条件校验：通过（{len(COMPARABLE_RUN_FIELDS)} 个受控字段一致）",
         "",
@@ -566,6 +611,28 @@ def render_markdown(report: Record) -> str:
             f"| {display_name} | {_format_number(cast(Record, item['baseline'])['mean'])} | "
             f"{_format_number(cast(Record, item['prefix_grouper'])['mean'])} | "
             f"{_format_number(item['prefix_minus_baseline'])} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## 输出截断率与长度分布",
+            "",
+            "截断率 = finish_reason 为 length 的响应数 / 总响应数；包括输出上限或模型上下文耗尽。",
+            "输出长度按服务端返回的生成 token IDs 统计；JSON 保留逐 token 长度频数和结束原因计数。",
+            "",
+            "| 模式 | 截断数 / 总数 | 截断率 | Mean | Stddev | Min | P50 | P90 | P95 | Max |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for mode in ("baseline", "prefix_grouper"):
+        length_summary = cast(Record, report["response_lengths"][mode])
+        stats = cast(Record, length_summary["response_tokens"])
+        values = " | ".join(
+            _format_number(stats[key]) for key in ("mean", "stddev", "min", "median", "p90", "p95", "max")
+        )
+        lines.append(
+            f"| {mode} | {length_summary['truncated_count']} / {stats['count']} | "
+            f"{length_summary['truncation_rate']:.2%} | {values} |"
         )
     lines.extend(
         [

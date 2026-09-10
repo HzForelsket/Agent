@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare a token-filtered 2WikiMQA workload for the PrefixGrouper E2E benchmark.
+"""Prepare full 2WikiMQA prompts, optionally filtered by token length.
 
 Example:
     python scripts/prepare_prefix_grouper_2wikimqa.py \
@@ -26,8 +26,6 @@ SYSTEM_PROMPT = (
     "Answer the question using only the supplied Wikipedia passages. "
     "Return only the shortest answer phrase, with no explanation."
 )
-DEFAULT_MAX_PROMPT_TOKENS = 2048
-DEFAULT_MIN_PROMPT_TOKENS = 1900
 MINIMUM_ROWS = 64
 DATASET_REPOSITORY = "framolfese/2WikiMultihopQA"
 DATASET_REVISION = "fe713bfbd1afbca1a65246741a75890405d56a3a"
@@ -51,8 +49,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, nargs="+", help="Existing pinned 2WikiMQA Parquet source files.")
     parser.add_argument("--output", type=Path, required=True, help="Destination JSONL file.")
     parser.add_argument("--tokenizer", type=Path, required=True, help="Local Qwen tokenizer/model directory.")
-    parser.add_argument("--min-prompt-tokens", type=int, default=DEFAULT_MIN_PROMPT_TOKENS)
-    parser.add_argument("--max-prompt-tokens", type=int, default=DEFAULT_MAX_PROMPT_TOKENS)
+    parser.add_argument("--min-prompt-tokens", type=int, help="Optional minimum original prompt length.")
+    parser.add_argument("--max-prompt-tokens", type=int, help="Optional maximum original prompt length.")
     parser.add_argument("--download-dir", type=Path, default=DEFAULT_DOWNLOAD_DIR)
     parser.add_argument("--local-files-only", action="store_true", help="Require an existing source cache.")
     parser.add_argument("--overwrite", action="store_true", help="Replace the destination if it already exists.")
@@ -175,14 +173,14 @@ def prepare_dataset(
     tokenizer_path: Path,
     output: Path,
     *,
-    min_prompt_tokens: int,
-    max_prompt_tokens: int,
+    min_prompt_tokens: int | None,
+    max_prompt_tokens: int | None,
     overwrite: bool,
 ) -> dict[str, Any]:
     """Filter full, untruncated prompts by tokenized input length."""
-    if min_prompt_tokens <= 0 or max_prompt_tokens <= 0:
+    if any(bound is not None and bound <= 0 for bound in (min_prompt_tokens, max_prompt_tokens)):
         raise ValueError("Prompt token bounds must be positive.")
-    if min_prompt_tokens > max_prompt_tokens:
+    if min_prompt_tokens is not None and max_prompt_tokens is not None and min_prompt_tokens > max_prompt_tokens:
         raise ValueError("Minimum prompt tokens cannot exceed maximum prompt tokens.")
     if output.exists() and not overwrite:
         raise FileExistsError(f"Refusing to overwrite existing output: {output}")
@@ -201,7 +199,9 @@ def prepare_dataset(
         context = render_context(row)
         prompt = build_user_prompt(context, str(row["question"]))
         prompt_tokens = chat_length(tokenizer, prompt)
-        if not min_prompt_tokens <= prompt_tokens <= max_prompt_tokens:
+        if min_prompt_tokens is not None and prompt_tokens < min_prompt_tokens:
+            continue
+        if max_prompt_tokens is not None and prompt_tokens > max_prompt_tokens:
             continue
         answers = [str(row["answer"])]
         if not answers[0]:
