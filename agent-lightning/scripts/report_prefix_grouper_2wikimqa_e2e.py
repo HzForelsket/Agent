@@ -14,6 +14,7 @@ import argparse
 import json
 import math
 import statistics
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -249,10 +250,10 @@ def validate_comparable(baseline: RunArtifacts, prefix: RunArtifacts) -> dict[st
     baseline_keys = _response_keys(baseline.responses, baseline.responses_path)
     prefix_keys = _response_keys(prefix.responses, prefix.responses_path)
     if baseline_keys != prefix_keys:
-        missing_from_prefix = sorted(baseline_keys - prefix_keys)
-        missing_from_baseline = sorted(prefix_keys - baseline_keys)
+        missing_from_prefix = sorted((baseline_keys - prefix_keys).items())
+        missing_from_baseline = sorted((prefix_keys - baseline_keys).items())
         raise ValueError(
-            "Rollout identity sets differ: "
+            "Rollout identity counts differ (identity, missing count): "
             + json.dumps(
                 {
                     "missing_from_prefix_grouper": missing_from_prefix[:10],
@@ -265,8 +266,10 @@ def validate_comparable(baseline: RunArtifacts, prefix: RunArtifacts) -> dict[st
     return invariants
 
 
-def _response_keys(records: list[Record], path: Path) -> set[tuple[str, int, int]]:
-    keys: set[tuple[str, int, int]] = set()
+def _response_keys(records: list[Record], path: Path) -> Counter[tuple[str, int, int]]:
+    # Samples recur across epochs with the same rollout index and deterministic seed.
+    # Compare their multiplicities without relying on asynchronous completion order.
+    keys: Counter[tuple[str, int, int]] = Counter()
     for index, record in enumerate(records, start=1):
         sample_id = record.get("sample_id")
         rollout_index = record.get("rollout_index")
@@ -274,9 +277,7 @@ def _response_keys(records: list[Record], path: Path) -> set[tuple[str, int, int
         if not isinstance(sample_id, str) or not isinstance(rollout_index, int) or not isinstance(request_seed, int):
             raise ValueError(f"{path} record {index} has an invalid rollout identity.")
         key = (sample_id, rollout_index, request_seed)
-        if key in keys:
-            raise ValueError(f"{path} contains duplicate rollout identity {key!r}.")
-        keys.add(key)
+        keys[key] += 1
     return keys
 
 
@@ -554,7 +555,7 @@ def render_markdown(report: Record) -> str:
         "",
         "## 质量指标",
         "",
-        f"共比较 {rollout_quality['response_count']} 个具有相同 sample、rollout index 和 seed 的响应。",
+        f"共比较 {rollout_quality['response_count']} 个响应；两组中每个 sample、rollout index 和 seed 组合的出现次数一致。",
         "",
         "| 指标 | Baseline mean | PrefixGrouper mean | 差值 |",
         "|---|---:|---:|---:|",
