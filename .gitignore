@@ -1,4 +1,10 @@
 .agents
 .codex
 .hf_cache
-agent-lightning/output
+agent-lightning/output/
+.cache/
+__pycache__/
+/output/
+/data/cache/
+/agent-lightning/examples/rag/data/
+/agent-lightning/examples/rag/traces/

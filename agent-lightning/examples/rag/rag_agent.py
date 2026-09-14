@@ -6,7 +6,7 @@ import logging
 from typing import Any, Dict, List, cast
 
 import pandas as pd
-from agents import Agent, Runner
+from agents import Agent, RunHooks, Runner
 from agents.extensions.models.litellm_model import LitellmModel
 from agents.mcp import MCPServerSse
 from agents.model_settings import ModelSettings
@@ -31,9 +31,16 @@ Repeat as needed. When done, wrap your final, concise answer in <answer> tags.""
 class RAGAgent(agl.LitAgent[Dict[str, Any]]):
     """RAGAgent is an agent that relies on a MCP-based retriever to answer questions."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        mcp_server_url: str = "http://127.0.0.1:8099/sse",
+        max_turns: int = 10,
+        hooks: RunHooks[Any] | None = None,
+    ) -> None:
         super().__init__()
-        self.mcp_server_url = "http://127.0.0.1:8099/sse"
+        self.mcp_server_url = mcp_server_url
+        self.max_turns = max_turns
+        self.hooks = hooks
 
     async def training_rollout_async(
         self, task: Dict[str, Any], resources: agl.NamedResources, rollout: agl.Rollout
@@ -57,14 +64,14 @@ class RAGAgent(agl.LitAgent[Dict[str, Any]]):
                     base_url=base_url,
                 ),
                 model_settings=ModelSettings(
-                    max_tokens=2048,
-                    temperature=0.7,
+                    max_tokens=llm.sampling_parameters.get("max_tokens", 2048),
+                    temperature=llm.sampling_parameters.get("temperature", 0.7),
                 ),
                 name="Assistant",
                 instructions=agent_prompt,
                 mcp_servers=[server],
             )
-            result = await Runner.run(agent, task["question"])
+            result = await Runner.run(agent, task["question"], max_turns=self.max_turns, hooks=self.hooks)
             answer = result.final_output
 
             # reward

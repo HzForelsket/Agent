@@ -4,6 +4,9 @@
 
 This example demonstrates training a Retrieval-Augmented Generation (RAG) agent using Agent-Lightning with retrieval capabilities. The agent answers multi-hop questions from a tiny MuSiQue dataset by retrieving and reasoning over Wikipedia passages.
 
+For 30B multi-turn trace collection through an NPU model service and a complete-trajectory prefix-sharing benefit table,
+see [NPU 轨迹采集与收益表](TRACE_COLLECTION.md).
+
 ## Overview
 
 This example can run on a single GPU for demonstration purposes.
@@ -22,16 +25,17 @@ pip install gdown
 
 # tiny training dataset
 cd examples/rag
-gdown --fuzzy "https://drive.google.com/file/d/1Pq4Ag8zVoN8gUtLu0LcBfY35Dm5zL0hq/view?usp=drive_link" \
-    -O dataset_tiny.parquet
+mkdir -p data
+gdown "https://drive.google.com/file/d/1Pq4Ag8zVoN8gUtLu0LcBfY35Dm5zL0hq/view?usp=drive_link" \
+    -O data/dataset_tiny.parquet
 
 # chunks_candidate_tiny.pkl
-gdown --fuzzy "https://drive.google.com/file/d/1REXCpRLbeZu1KfWWKhIGEQe_WNHUOBkS/view?usp=drive_link" \
-    -O chunks_candidate_tiny.pkl
+gdown "https://drive.google.com/file/d/1REXCpRLbeZu1KfWWKhIGEQe_WNHUOBkS/view?usp=drive_link" \
+    -O data/chunks_candidate_tiny.pkl
 
 # index_hnsw_faiss_n32e40_tiny.index
-gdown --fuzzy "https://drive.google.com/file/d/1f6P-h_8KSRhe5pqDHWbRQWvUhTygfZ-c/view?usp=drive_link" \
-    -O index_hnsw_faiss_n32e40_tiny.index
+gdown "https://drive.google.com/file/d/1f6P-h_8KSRhe5pqDHWbRQWvUhTygfZ-c/view?usp=drive_link" \
+    -O data/index_hnsw_faiss_n32e40_tiny.index
 ```
 
 **Step 3:** Start the MCP server. Open a terminal and run:
@@ -54,6 +58,10 @@ python train_rag.py
 | `train_rag.py` | Initiates the GRPO training process |
 | `metric_utils.py` | Scoring utilities for exact match, F1 score, and response parsing |
 | `wiki_retriever_mcp.py` | MCP server for Wikipedia retrieval |
+| `collect_traces.py` | Collect complete trajectories and exact model token IDs, then generate a benefit table |
+| `analyze_traces.py` | Offline sharing estimates across complete trajectory groups; Markdown/CSV/JSON output |
+| `requirements-traces.txt` | Application dependencies for the separate trace collection client |
+| `TRACE_COLLECTION.md` | Chinese instructions for NPU serving integration, saved traces and metric definitions |
 
 ## How to Prepare the Retrieval Corpus Yourself
 

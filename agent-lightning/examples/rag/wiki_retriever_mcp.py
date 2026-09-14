@@ -1,52 +1,49 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-# type: ignore
+"""Serve the example Wikipedia corpus: python wiki_retriever_mcp.py --data-dir data."""
 
+import argparse
 import pickle
-
-import faiss
-from fastmcp import FastMCP
-from sentence_transformers import SentenceTransformer
-
-index = faiss.read_index("data/index_hnsw_faiss_n32e40_tiny.index")
-print("Index loaded successfully.")
-
-model = SentenceTransformer("BAAI/bge-large-en-v1.5")
-print("Model loaded successfully.")
-
-# with open('/mnt/input/agent_lightning/nq_list.pkl', 'rb') as f:
-with open("data/chunks_candidate_tiny.pkl", "rb") as f:
-    chunks = pickle.load(f)
-print("Chunks loaded successfully.")
-
-mcp = FastMCP(name="wiki retrieval mcp")
+from pathlib import Path
+from typing import Any
 
 
-@mcp.tool(
-    name="retrieve",
-    description="retrieve relevant chunks from the wikipedia",
-)
-def retrieve(query: str) -> list:
-    """
-    Retrieve relevant chunks from the Wikipedia dataset.
+def main() -> None:
+    """Load the retrieval corpus and serve its original top-one retrieval tool."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", type=Path, default=Path(__file__).parent / "data")
+    parser.add_argument("--embedding-model", default="BAAI/bge-large-en-v1.5")
+    parser.add_argument("--device", default="cpu", help="Embedding device; CPU avoids using the serving accelerator.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8099)
+    args = parser.parse_args()
 
-    Args:
-        query (str): The query string to search for.
+    import faiss
+    from fastmcp import FastMCP
+    from sentence_transformers import SentenceTransformer
 
-    Returns:
-        list: A list of dictionaries containing the retrieved chunks and their metadata.
-    """
-    top_k = 1  # Number of top results to return
-    embedding = model.encode([query], normalize_embeddings=True)
-    D, I = index.search(embedding, top_k)
+    index = faiss.read_index(str(args.data_dir / "index_hnsw_faiss_n32e40_tiny.index"))
+    with (args.data_dir / "chunks_candidate_tiny.pkl").open("rb") as handle:
+        chunks = pickle.load(handle)
+    model = SentenceTransformer(args.embedding_model, device=args.device)
+    if index.ntotal != len(chunks) or model.get_sentence_embedding_dimension() != index.d:
+        raise ValueError("Corpus, index and embedding dimensions do not match")
+    mcp = FastMCP(name="wiki retrieval mcp")
 
-    results = []
-    for i in range(top_k):
-        if I[0][i] != -1:
-            chunk = chunks[I[0][i]]
-            results.append({"chunk": chunk, "chunk_id": int(I[0][i]), "distance": float(D[0][i])})
-    return results
+    @mcp.tool(name="retrieve", description="retrieve relevant chunks from the wikipedia")
+    def retrieve(query: str) -> list[dict[str, Any]]:
+        """Retrieve the most relevant Wikipedia chunk for the query."""
+        embedding = model.encode([query], normalize_embeddings=True)
+        distances, indices = index.search(embedding, 1)
+        return [
+            {"chunk": chunks[idx], "chunk_id": int(idx), "distance": float(distance)}
+            for idx, distance in zip(indices[0], distances[0])
+            if idx != -1
+        ]
+
+    print(f"Loaded {len(chunks)} chunks; embedding device: {args.device}", flush=True)
+    mcp.run(transport="sse", host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
-    mcp.run(transport="sse", host="127.0.0.1", port=8099)
+    main()
