@@ -43,7 +43,9 @@ python -m pip install --upgrade \
 ```
 
 这组版本对应本地已成功运行的 CPU MCP 环境。FastMCP 2.13.1 使用 `DiskStore`，不导入 `filetree`；
-出现该导入通常意味着实际加载的 FastMCP 与项目版本不一致，或安装文件混杂。
+仅凭该报错不能确定版本不一致或安装文件混杂，仍需根据完整 traceback 核对实际导入源码。
+采集器的就绪检查使用 `mcp` SDK 的 `ClientSession` 和 SSE 连接，不导入 FastMCP 客户端及其认证模块。
+检索服务本身仍使用 `FastMCP`；若错误来自 `mcp.log`，仍需定位服务端的依赖导入错误。
 上述命令用于采集器/MCP 环境，`--vllm-python` 指定的独立服务环境无需修改。
 若对齐后仍报相同错误，需检查完整 traceback 的导入来源与 `python -m pip show fastmcp py-key-value-aio py-key-value-shared`。
 

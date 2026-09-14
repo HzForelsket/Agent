@@ -58,7 +58,8 @@ class Processes:
     async def ready(self, config: dict[str, Any]) -> None:
         """Wait for the served model and the MCP retrieve tool before creating workers."""
         import httpx
-        from fastmcp import Client
+        from mcp import ClientSession
+        from mcp.client.sse import sse_client
 
         deadline = time.monotonic() + config["startup_timeout"]
         next_report = 0.0
@@ -80,8 +81,10 @@ class Processes:
                         else:
                             # The outer timeout also bounds SSE connection/initialization and teardown.
                             async def list_tools() -> list[Any]:
-                                async with Client(config["mcp_url"], timeout=5) as mcp:
-                                    return await mcp.list_tools()
+                                async with sse_client(config["mcp_url"], timeout=5, sse_read_timeout=5) as streams:
+                                    async with ClientSession(*streams) as session:
+                                        await session.initialize()
+                                        return (await session.list_tools()).tools
 
                             names = {tool.name for tool in await asyncio.wait_for(list_tools(), timeout=8)}
                             if "retrieve" not in names:
