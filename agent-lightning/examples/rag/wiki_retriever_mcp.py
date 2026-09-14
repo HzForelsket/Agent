@@ -37,7 +37,7 @@ def main() -> None:
     model_path = model_path.resolve()
 
     import faiss
-    from fastmcp import FastMCP
+    from mcp.server.fastmcp import FastMCP
     from sentence_transformers import SentenceTransformer
 
     index = faiss.read_index(str(args.data_dir / "index_hnsw_faiss_n32e40_tiny.index"))
@@ -53,7 +53,7 @@ def main() -> None:
         ) from error
     if index.ntotal != len(chunks) or model.get_sentence_embedding_dimension() != index.d:
         raise ValueError("Corpus, index and embedding dimensions do not match")
-    mcp = FastMCP(name="wiki retrieval mcp")
+    mcp = FastMCP(name="wiki retrieval mcp", host=args.host, port=args.port)
 
     @mcp.tool(name="retrieve", description="retrieve relevant chunks from the wikipedia")
     def retrieve(query: str) -> list[dict[str, Any]]:
@@ -67,7 +67,7 @@ def main() -> None:
         ]
 
     print(f"Loaded {len(chunks)} chunks; embedding device: {args.device}", flush=True)
-    mcp.run(transport="sse", host=args.host, port=args.port)
+    mcp.run(transport="sse")
 
 
 if __name__ == "__main__":

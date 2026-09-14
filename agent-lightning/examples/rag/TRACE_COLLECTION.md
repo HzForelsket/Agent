@@ -31,23 +31,20 @@ cd examples/rag
 CPU torch 源使用 `--trusted-host download.pytorch.org --trusted-host download-r2.pytorch.org`。
 应用依赖清单不修改主项目的 `uv.lock`。
 
-若报 `No module named 'key_value.aio.stores.filetree'`，先在运行采集器的 Python 环境中对齐 MCP 依赖：
+检索服务与就绪检查统一使用 `mcp` SDK，不再导入独立的 `fastmcp` 包及其 `key_value` 存储依赖。
+旧代码遇到 `No module named 'key_value.aio.stores.filetree'` 时，先更新仓库代码，再在采集环境安装：
 
 ```bash
 python -m pip install --upgrade \
-  'fastmcp==2.13.1' \
-  'py-key-value-aio[disk,keyring,memory]==0.2.8' \
-  'py-key-value-shared==0.2.8' \
+  'mcp==1.29.0' \
   --index-url https://pypi.org/simple \
   --trusted-host pypi.org --trusted-host files.pythonhosted.org
 ```
 
-这组版本对应本地已成功运行的 CPU MCP 环境。FastMCP 2.13.1 使用 `DiskStore`，不导入 `filetree`；
-仅凭该报错不能确定版本不一致或安装文件混杂，仍需根据完整 traceback 核对实际导入源码。
-采集器的就绪检查使用 `mcp` SDK 的 `ClientSession` 和 SSE 连接，不导入 FastMCP 客户端及其认证模块。
-检索服务本身仍使用 `FastMCP`；若错误来自 `mcp.log`，仍需定位服务端的依赖导入错误。
+检索服务使用 `from mcp.server.fastmcp import FastMCP`，主机和端口在构造函数中设置。
+就绪检查使用同一个 SDK 的 `ClientSession` 和 SSE 连接，保留 `/sse` 地址及 `retrieve` 工具。
+已安装的独立 `fastmcp` 和 `py-key-value-*` 包可以保留，当前采集入口不使用它们。
 上述命令用于采集器/MCP 环境，`--vllm-python` 指定的独立服务环境无需修改。
-若对齐后仍报相同错误，需检查完整 traceback 的导入来源与 `python -m pip show fastmcp py-key-value-aio py-key-value-shared`。
 
 ## 2. 一条命令采集
 
@@ -184,6 +181,10 @@ python analyze_traces.py --input traces/npu-qwen30b-run01
 表中比例不包含反向传播、通信、packing、显存或 kernel 调度成本，不能当作训练加速比。
 
 ## 已完成的验证
+
+改用 `mcp==1.29.0` SDK 内置服务后，在本地 `agent` 环境通过正式检索入口加载缓存 BGE 和 2,000 条文档，
+成功监听 `127.0.0.1:18099`，随后由 30 秒限时命令停止。该验证覆盖 CPU 服务初始化及启动，
+未验证此次替换后的工具调用结果，也未运行 NPU 采集。
 
 本次自动服务编排完成 CLI 帮助、Python 语法及格式静态检查；本机无可用 NPU，尚未验证 NPU 启动、就绪探测和进程清理的完整运行链路。
 
