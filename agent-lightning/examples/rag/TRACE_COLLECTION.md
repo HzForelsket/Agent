@@ -5,7 +5,7 @@
 目标模型是 `Qwen/Qwen3-30B-A3B-Instruct-2507`（总参数 30B，激活参数约 3B）。
 采集结束自动生成收益表；不启动训练，也不要求安装 PrefixGrouper 或 verl。
 
-收益表只比较**完整轨迹分别表示**与**同题 4 条完整轨迹合并前缀树**，不把每次模型调用当成独立训练样本。
+统计单位统一为**一条完整轨迹、一条 token 序列**，收益表比较**每条完整轨迹独立计算**与**同题 4 条完整轨迹合并前缀树**。
 它估计 token 位置和 causal attention pair 的减少，不测量 NPU 训练加速。
 
 ## 1. 环境和模型服务
@@ -138,7 +138,8 @@ tail -f traces/npu-qwen30b-run01/worker-*.log
 | `analysis/report.md` | 可直接阅读的收益表与覆盖率 |
 | `analysis/benefit.csv` | 可用表格软件打开的汇总收益表 |
 | `analysis/per_task.csv` | 每题收益，CSV 中比例以 0–1 小数保存 |
-| `analysis/summary.json` | 精确计数、排除原因、非严格追加转移数量和指标定义 |
+| `analysis/summary.json` | 精确计数、排除原因、序列表示方式和指标定义 |
+| `analysis/trajectory_sequences.jsonl` | 实际纳入统计的完整轨迹，每条包含一条 token 序列及完整消息历史 |
 
 重算或分析中断采集的已保存数据，不需要模型、NPU 或 SDK，只需 Python 标准库：
 
@@ -146,26 +147,30 @@ tail -f traces/npu-qwen30b-run01/worker-*.log
 python analyze_traces.py --input traces/npu-qwen30b-run01
 ```
 
-设每条完整轨迹实际调用序列的 token 前缀并集为 `T_i`，同题的 4 条轨迹为一个组：
+每条完整轨迹的序列 `S_i` 包含初始问题、全部模型动作、工具结果和最终回复。
+使用最后一次请求的完整历史 `prompt_token_ids` 加最终 `response_token_ids` 构造一条序列；
+逐轮检查原有消息和模型动作均保留在后续历史中，否则排除该题组。
+同题 4 条完整轨迹为一个组，统一采用以下统计方式：
 
-- 基线工作量：`sum_i |T_i|`；每条轨迹内部已有的历史共享不再次计入跨轨迹收益。
-- 共享后工作量：`|union_prefix(T_1, T_2, T_3, T_4)|`。
+- 基线 token 工作量：`|S_1| + |S_2| + |S_3| + |S_4|`。
+- 共享后 token 工作量：`Trie(S_1, S_2, S_3, S_4)` 的节点数（不计空根节点）。
 - token 减少比例：`1 - 共享后 / 基线`；工作量缩减倍数：`基线 / 共享后`。
-- attention pair 计数：每个唯一节点的祖先数加自身，假定完整 causal attention，不代表 kernel 实际执行量。
+- 基线 attention pairs：`sum_i |S_i| * (|S_i| + 1) / 2`。
+- 共享后 attention pairs：树中每个 token 节点可见祖先数加自身，假定完整 causal attention。
 
-严格历史追加时，`T_i` 就是一条完整 token 序列。工具调用重序列化可能改变前轮结尾，
-此时保留该轨迹各次调用的真实上下文；只取最后一次调用会丢失部分实际生成 token 的条件上下文。
 主表只纳入组内全部完成、无长度截断、调用连续、真实 token ID 完整的组，并显示排除组数。
 不同题目之间不合树；同题分叉后重复出现的文本也不当作共享前缀。
-完整轨迹是样本单位，optimizer.step 通常聚合一个 batch，二者并非一一对应。
+汇总比例按所有题组的工作量总和计算。
 
 共享激活不能合并不同轨迹的 advantage、loss 权重或 clipping 项，必须保留其贡献并正确累加梯度。
 工具输出只有上下文作用，不直接作为模型动作计算 policy loss。
+统计使用最终完整历史的序列表示；接入训练时须保证 tokenizer、loss mask 与 rollout log-prob 的位置映射一致。
 表中比例不包含反向传播、通信、packing、显存或 kernel 调度成本，不能当作训练加速比。
 
 ## 已完成的验证
 
 在本地 `agent` 环境通过 CLI 帮助、语法和格式检查，并使用此前真实采集的
-32 题 × 4 条完整轨迹（408 次调用）运行正式离线入口：基线 104,998 token 位置，
-合并后 54,621，减少 47.98%；attention pairs 减少 29.21%。这些数据来自此前 GPU 采集，
+32 题 × 4 条完整轨迹（408 次调用）运行正式离线入口，全部通过消息历史和模型动作保留检查：
+基线 101,927 token 位置，合并后 51,656，减少 49.32%；attention pairs 从 49,310,766
+降到 34,283,950，减少 30.47%。这些数据来自此前 GPU 采集，
 用于核对统计口径，**不是本次 NPU 实测结果**。NPU 侧采集结果以用户运行后生成的文件为准。

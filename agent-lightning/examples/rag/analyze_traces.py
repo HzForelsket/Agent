@@ -82,6 +82,25 @@ def metrics(separate: int, merged: int, separate_pairs: int, merged_pairs: int) 
     }
 
 
+def complete_sequence(calls: list[dict[str, Any]]) -> list[int]:
+    """Return one full-history sequence after checking that prior messages and actions remain present."""
+    for previous, following in zip(calls, calls[1:]):
+        history = previous["request"]["messages"]
+        following_history = following["request"]["messages"]
+        if len(following_history) <= len(history) or following_history[: len(history)] != history:
+            raise ValueError("message_history_not_preserved")
+        action = previous["response"]["choices"][0]["message"]
+        recorded_action = following_history[len(history)]
+        if any(
+            recorded_action.get(key) != action[key]
+            for key in ("role", "content", "tool_calls", "reasoning")
+            if action.get(key) is not None
+        ):
+            raise ValueError("assistant_action_not_preserved")
+    final = calls[-1]
+    return final["prompt_token_ids"] + final["response_token_ids"]
+
+
 def write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> None:
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -119,7 +138,8 @@ def main() -> None:
         raise ValueError("Trajectory task IDs do not match selected_tasks.json")
     per_task = []
     excluded = []
-    transitions = non_append = included_calls = 0
+    trajectory_sequences = []
+    included_calls = 0
     for task_id in task_ids:
         group = by_task[task_id]
         reason = None
@@ -129,7 +149,7 @@ def main() -> None:
             reason = "incomplete_trajectory"
         sequences: list[list[int]] = []
         separate_tokens = separate_pairs = calls_in_group = 0
-        group_transitions = group_non_append = 0
+        group_sequences = []
         for trajectory in group:
             calls = sorted(by_trajectory[trajectory["trajectory_id"]], key=lambda row: row["turn"])
             if (
@@ -147,15 +167,25 @@ def main() -> None:
                 continue
             if calls[-1]["response"]["choices"][0]["finish_reason"] != "stop":
                 reason = reason or "no_final_model_answer"
-            full = [row["prompt_token_ids"] + row["response_token_ids"] for row in calls]
-            tokens, pairs = tree_cost(full)
-            separate_tokens += tokens
-            separate_pairs += pairs
+            try:
+                sequence = complete_sequence(calls)
+            except ValueError as error:
+                reason = reason or str(error)
+                continue
+            length = len(sequence)
+            separate_tokens += length
+            separate_pairs += length * (length + 1) // 2
             calls_in_group += len(calls)
-            sequences.extend(full)
-            for previous, following in zip(full, calls[1:]):
-                group_transitions += 1
-                group_non_append += lcp(previous, following["prompt_token_ids"]) != len(previous)
+            sequences.append(sequence)
+            group_sequences.append(
+                {
+                    "task_id": task_id,
+                    "trajectory_id": trajectory["trajectory_id"],
+                    "sample_index": trajectory["sample_index"],
+                    "token_ids": sequence,
+                    "messages": calls[-1]["request"]["messages"] + [calls[-1]["response"]["choices"][0]["message"]],
+                }
+            )
         if reason:
             excluded.append({"task_id": task_id, "reason": reason, "recorded_trajectories": len(group)})
             continue
@@ -168,8 +198,7 @@ def main() -> None:
                 **metrics(separate_tokens, merged_tokens, separate_pairs, merged_pairs),
             }
         )
-        transitions += group_transitions
-        non_append += group_non_append
+        trajectory_sequences.extend(group_sequences)
         included_calls += calls_in_group
     aggregate = metrics(
         *(
@@ -178,6 +207,8 @@ def main() -> None:
         )
     )
     summary = {
+        "statistics_unit": "one_complete_trajectory_sequence",
+        "sequence_representation": "final_prompt_token_ids_plus_final_response_token_ids",
         "input": str(root),
         "group_size": group_size,
         "selected_tasks": len(selected),
@@ -187,16 +218,14 @@ def main() -> None:
         "included_model_calls": included_calls,
         "recorded_model_calls": len(raw),
         "trajectory_status": dict(Counter(t["status"] for t in trajectories)),
-        "adjacent_turn_transitions": transitions,
-        "non_append_only_transitions": non_append,
         "cross_trajectory_sharing": aggregate,
         "excluded": excluded,
         "diagnostics": diagnostics,
         "definitions": {
-            "baseline": "Each complete trajectory independently, preserving all actual per-call contexts and counting its unique prefix nodes once.",
-            "comparison": "Merge exactly the complete group for each question by token prefix; no sharing across questions.",
+            "baseline": "Sum the lengths of one complete token sequence per trajectory: final full-history prompt plus final response.",
+            "comparison": "Build one prefix tree from exactly G complete trajectory sequences for each question; no sharing across questions.",
             "causal_pairs": "Sum of visible ancestor keys including self for every unique token node; full causal attention assumed.",
-            "scope": "Only complete groups with successful, non-truncated, exact-token calls; global ratios use summed costs.",
+            "scope": "Only complete groups with successful, non-truncated, exact-token calls and all prior messages/actions preserved; global ratios use summed costs.",
             "loss": "Shared states retain separate per-trajectory loss multiplicities, advantages and clipping terms.",
             "limitation": "Structural work estimate, not measured training speedup or support already implemented in PrefixGrouper. Requires matching positions, masks and model state.",
         },
@@ -204,11 +233,14 @@ def main() -> None:
     output = (args.output or root / "analysis").resolve()
     output.mkdir(parents=True, exist_ok=True)
     (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with (output / "trajectory_sequences.jsonl").open("w", encoding="utf-8") as handle:
+        for trajectory in trajectory_sequences:
+            handle.write(json.dumps(trajectory, ensure_ascii=False) + "\n")
     fields = ["task_id", "trajectories", "model_calls", *aggregate]
     write_csv(output / "per_task.csv", per_task, fields)
     table = [
         {
-            "方案": "完整轨迹分别表示（基线）",
+            "方案": "每条完整轨迹独立计算（基线）",
             "token位置数": aggregate["separate_tokens"],
             "减少token位置数": 0,
             "token减少比例": 0 if per_task else "N/A",
@@ -240,22 +272,21 @@ def main() -> None:
 
 | 方案 | token 位置数 | token 减少比例 | token 工作量缩减倍数 | causal attention pairs | pair 减少比例 |
 |---|---:|---:|---:|---:|---:|
-| 完整轨迹分别表示（基线） | {aggregate['separate_tokens']:,} | {'0%' if per_task else 'N/A'} | {'1.00x' if per_task else 'N/A'} | {aggregate['separate_causal_pairs']:,} | {'0%' if per_task else 'N/A'} |
+| 每条完整轨迹独立计算（基线） | {aggregate['separate_tokens']:,} | {'0%' if per_task else 'N/A'} | {'1.00x' if per_task else 'N/A'} | {aggregate['separate_causal_pairs']:,} | {'0%' if per_task else 'N/A'} |
 | 同题 {group_size} 条完整轨迹合并前缀树 | {aggregate['merged_tokens']:,} | {percent(aggregate['token_reduction'])} | {ratio_text} | {aggregate['merged_causal_pairs']:,} | {percent(aggregate['causal_pair_reduction'])} |
 
-减少比例 = 1 − 合并后工作量 / 完整轨迹分别表示的工作量。汇总使用工作量之和，非各题百分比的算术平均。
-这里只计算同题完整轨迹之间的额外共享，不把多轮历史的重复输入再次计为训练收益。
-
-纳入轨迹有 {transitions} 次相邻轮转移，其中 {non_append} 次不是严格 token 追加。
-为保留真实条件上下文，每条轨迹先取其所有调用序列的前缀并集；严格追加时等价于一条完整序列。
-不能直接取最后一次调用丢弃之前实际生成 token 的上下文，也不把每次调用当作一条完整轨迹。
+统计单位固定为一条完整轨迹、一条 token 序列：初始问题、全部模型动作和工具结果、最终回复。
+序列取最后一次完整历史请求的 prompt token ID 加最终 response token ID；逐轮检查历史消息和模型动作均被保留。
+基线 = 同题 {group_size} 条完整序列的长度之和；共享后 = 这 {group_size} 条序列合成前缀树的节点数。
+减少比例 = 1 − 共享后 / 基线。汇总使用工作量之和，非各题百分比的算术平均。
 
 这是结构上的计算量估算，不是 NPU 训练耗时、显存节省或实测加速比，也不表示 PrefixGrouper 已支持该树。
 共享还要求位置编码、attention mask 和模型状态一致；分叉后相同文本不重新合并。
 各轨迹的 response loss、advantage、权重与 clipping 仍须分别保留并正确累加梯度。
-工具结果作为上下文，不作为模型生成动作计算 policy loss。完整轨迹不等于单独一次 optimizer.step。
+工具结果作为上下文，不作为模型生成动作计算 policy loss。
+这是按最终完整历史序列估计的训练结构；实际训练还需保证 tokenizer、loss mask 和 rollout log-prob 的位置映射一致。
 
-详细数据见 `per_task.csv`、`benefit.csv`、`summary.json`；排除原因和中断记录见 `summary.json`。
+详细数据见 `per_task.csv`、`benefit.csv`、`summary.json`；实际纳入的完整序列见 `trajectory_sequences.jsonl`。
 """
     (output / "report.md").write_text(report, encoding="utf-8")
     print(report)
