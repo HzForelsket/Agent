@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from rag_data import DEFAULT_DATA_DIR, ensure_example_data
+from rag_data import DEFAULT_DATA_DIR, add_download_argument, ensure_example_data
 
 CURRENT: contextvars.ContextVar[str] = contextvars.ContextVar("trajectory_id")
 
@@ -57,6 +57,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--endpoint", default="http://127.0.0.1:18030/v1", help="vLLM OpenAI base URL, ending in /v1.")
     parser.add_argument("--model", default="Qwen3-30B-A3B-Instruct-2507", help="Served model name, not weight path.")
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATA_DIR / "dataset_tiny.parquet")
+    add_download_argument(parser)
     parser.add_argument("--mcp-url", default="http://127.0.0.1:8099/sse")
     parser.add_argument("--tasks", type=positive, default=32)
     parser.add_argument("--rollouts-per-task", type=positive, default=4)
@@ -319,7 +320,7 @@ async def collect(args: argparse.Namespace) -> None:
         import pandas as pd
 
         if args.dataset.name == "dataset_tiny.parquet":
-            ensure_example_data(args.dataset.parent)
+            ensure_example_data(args.dataset.parent, insecure=args.insecure_download)
         frame = pd.read_parquet(args.dataset)
         if not {"id", "question", "answer"}.issubset(frame.columns) or len(frame) < args.tasks:
             raise ValueError("Dataset must have id/question/answer columns and at least --tasks rows")

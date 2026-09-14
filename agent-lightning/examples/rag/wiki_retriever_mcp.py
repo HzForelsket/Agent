@@ -3,24 +3,34 @@
 """Download missing example data and serve retrieval: python wiki_retriever_mcp.py."""
 
 import argparse
+import os
 import pickle
 from pathlib import Path
 from typing import Any
 
-from rag_data import DEFAULT_DATA_DIR, ensure_example_data
+from rag_data import DEFAULT_DATA_DIR, add_download_argument, ensure_example_data
 
 
 def main() -> None:
     """Load the retrieval corpus and serve its original top-one retrieval tool."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    add_download_argument(parser)
     parser.add_argument("--embedding-model", default="BAAI/bge-large-en-v1.5")
     parser.add_argument("--device", default="cpu", help="Embedding device; CPU avoids using the serving accelerator.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8099)
     args = parser.parse_args()
 
-    ensure_example_data(args.data_dir)
+    ensure_example_data(args.data_dir, insecure=args.insecure_download)
+
+    if args.insecure_download:
+        # Xet uses a separate TLS stack; route Hub downloads through the configured HTTP client.
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+        import httpx
+        from huggingface_hub import set_client_factory
+
+        set_client_factory(lambda: httpx.Client(verify=False, follow_redirects=True, timeout=60))
 
     import faiss
     from fastmcp import FastMCP

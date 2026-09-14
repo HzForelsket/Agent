@@ -30,6 +30,22 @@ cd examples/rag
 它们无需 NPU 专用版本。实际模型计算由 NPU 上的 vLLM 服务执行。
 应用依赖清单是独立采集入口的安装清单，不修改主项目的 `uv.lock`。
 
+服务器没有 CA 证书时，在运行采集与检索服务的各终端设置：
+
+```bash
+export RAG_DOWNLOAD_INSECURE=1
+```
+
+也可为 `collect_traces.py`、`wiki_retriever_mcp.py` 或 `rag_data.py` 单独传入 `--insecure-download`。
+这会跳过示例数据和检索模型下载的 TLS 证书验证，不修改系统证书或模型 API 请求配置。
+数据下载只使用 Python 标准库，不需要 `gdown`；示例文件下载后仍必须通过固定 SHA-256 校验。
+检索模型下载使用 Hugging Face Hub 1.x 的 HTTP 客户端配置，并禁用独立 TLS 通道的 Xet 下载。
+本地 embedding 模型目录同样可用。
+
+若安装 pip 依赖也遇到证书错误，可为上面的安装命令添加所用下载域名的 `--trusted-host`：
+PyPI 使用 `--trusted-host pypi.org --trusted-host files.pythonhosted.org`；CPU torch 索引使用
+`--trusted-host download.pytorch.org --trusted-host download-r2.pytorch.org`。
+
 在已有可运行该模型的 NPU 部署命令中，设置以下 vLLM API 参数：
 
 ```text

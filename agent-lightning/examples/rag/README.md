@@ -22,11 +22,14 @@ source .venv/bin/activate
 collector and training entrypoints into the repository's `data/cache/rag/` directory. Existing files are reused.
 
 ```bash
-pip install gdown
 cd examples/rag
 # Optional: prepare the cache without starting a service.
 python rag_data.py
 ```
+
+The data downloader uses Python's standard library. On a host without CA certificates, pass
+`--insecure-download` to `rag_data.py`, `wiki_retriever_mcp.py` and `collect_traces.py`, or set
+`RAG_DOWNLOAD_INSECURE=1` for all entrypoints. Newly downloaded example files still require matching SHA-256 hashes.
 
 **Step 3:** Start the MCP server. Open a terminal and run:
 
