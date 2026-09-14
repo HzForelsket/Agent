@@ -3,6 +3,8 @@ openai==2.54.0
 openai-agents==0.20.0
 litellm[proxy]==1.80.0
 fastmcp==2.13.1
+py-key-value-aio[disk,keyring,memory]==0.2.8
+py-key-value-shared==0.2.8
 faiss-cpu==1.11.0
 sentence-transformers==6.0.1
 pandas

@@ -31,6 +31,22 @@ cd examples/rag
 CPU torch 源使用 `--trusted-host download.pytorch.org --trusted-host download-r2.pytorch.org`。
 应用依赖清单不修改主项目的 `uv.lock`。
 
+若报 `No module named 'key_value.aio.stores.filetree'`，先在运行采集器的 Python 环境中对齐 MCP 依赖：
+
+```bash
+python -m pip install --upgrade \
+  'fastmcp==2.13.1' \
+  'py-key-value-aio[disk,keyring,memory]==0.2.8' \
+  'py-key-value-shared==0.2.8' \
+  --index-url https://pypi.org/simple \
+  --trusted-host pypi.org --trusted-host files.pythonhosted.org
+```
+
+这组版本对应本地已成功运行的 CPU MCP 环境。FastMCP 2.13.1 使用 `DiskStore`，不导入 `filetree`；
+出现该导入通常意味着实际加载的 FastMCP 与项目版本不一致，或安装文件混杂。
+上述命令用于采集器/MCP 环境，`--vllm-python` 指定的独立服务环境无需修改。
+若对齐后仍报相同错误，需检查完整 traceback 的导入来源与 `python -m pip show fastmcp py-key-value-aio py-key-value-shared`。
+
 ## 2. 一条命令采集
 
 在 NPU 机器的 `agent-lightning/examples/rag` 目录运行，替换模型路径与实际分配的芯片 ID：
