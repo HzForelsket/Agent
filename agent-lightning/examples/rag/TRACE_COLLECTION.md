@@ -46,36 +46,35 @@ cd examples/rag
 服务必须支持 `return_token_ids=true`，返回真实的 `prompt_token_ids` 和 `choices[0].token_ids`；
 采集器会检查它们与 usage 长度一致，缺失时停止该轨迹，不通过本地重新 tokenize 猜测。
 
-可将实际服务信息保存为 `data/server_metadata.json`，使用 `--server-metadata` 随轨迹保存。
+可将实际服务信息保存为 `../../../data/cache/rag/server_metadata.json`，使用 `--server-metadata` 随轨迹保存。
 内容应包含实际 NPU 型号/数量、模型路径与 revision、CANN/vLLM/vllm-ascend 版本、
 完整启动命令、tensor parallel、dtype、chat template，以及检索模型路径和 revision。
 客户端自动记录的包版本只代表客户端，不能替代远程服务端版本。
 
 ## 2. 准备示例数据和检索服务
 
-以下是本 RAG 示例原有的 MuSiQue tiny 数据和 Wikipedia 检索语料。
-可以在能联网的机器下载后整体拷贝 `data/` 到 NPU 主机；无需上传到 Git。
-已有这三个文件时跳过下载。
-先进入仓库的 `agent-lightning/examples/rag` 目录。`data/` 已被 Git 忽略，
-`git pull` 不会带来这些文件，采集入口也不会自动下载它们。
+采集入口和检索服务会自动下载缺失的 MuSiQue tiny 题目、Wikipedia 文本和 FAISS 索引，
+统一保存到**仓库根目录的 `data/cache/rag/`**。路径根据脚本位置定位，不依赖启动时的工作目录。
+已有非空文件直接复用；新下载文件校验 SHA-256 后原子写入，失败不会留下可被误用的半成品。
+两个入口同时启动时使用文件锁，避免重复下载。缓存已被 Git 忽略。
+
+在 `agent-lightning/examples/rag` 目录直接启动检索服务即可，无需手动下载：
 
 ```bash
-mkdir -p data
-gdown 1Pq4Ag8zVoN8gUtLu0LcBfY35Dm5zL0hq -O data/dataset_tiny.parquet
-gdown 1REXCpRLbeZu1KfWWKhIGEQe_WNHUOBkS -O data/chunks_candidate_tiny.pkl
-gdown 1f6P-h_8KSRhe5pqDHWbRQWvUhTygfZ-c -O data/index_hnsw_faiss_n32e40_tiny.index
-ls -lh data/dataset_tiny.parquet data/chunks_candidate_tiny.pkl data/index_hnsw_faiss_n32e40_tiny.index
-python wiki_retriever_mcp.py --data-dir data --device cpu \
-  --embedding-model BAAI/bge-large-en-v1.5
+python wiki_retriever_mcp.py --device cpu --embedding-model BAAI/bge-large-en-v1.5
 ```
 
-离线机器将 `--embedding-model` 替换为已下载的 BGE 模型目录。检索索引与该 embedding 模型配套，
-保持现有工具每次返回 top-1 文档的行为。该终端保持运行，默认 MCP 地址是 `http://127.0.0.1:8099/sse`。
+该终端保持运行，默认 MCP 地址是 `http://127.0.0.1:8099/sse`。
+下一节的采集命令也会自动补齐缓存。若只想提前准备数据，可运行 `python rag_data.py`。
+离线机器将 `--embedding-model` 替换为已下载的 BGE 模型目录；检索索引与该 embedding 模型配套，
+保持现有工具每次返回 top-1 文档的行为。
 
-如果报 `dataset_tiny.parquet` 不存在，先完成以上下载，再重新运行采集。
-已有数据放在其他目录时，用 `--dataset /绝对路径/dataset_tiny.parquet` 指定题目文件，
-并用检索服务的 `--data-dir /绝对路径/语料目录` 指定索引和文本位置。
-若 NPU 主机无法访问 Google Drive，在可联网机器下载这三个文件后拷贝过去。
+若 NPU 主机无法访问 Google Drive，可在联网机器运行 `python rag_data.py`，
+再把 `data/cache/rag/` 整体拷贝到 NPU 机器的同一仓库相对路径。
+下载失败会显示失败文件和原因；网络恢复后重跑，已经下载完成的文件直接复用。
+自定义题目可用 `--dataset /绝对路径/题目.parquet` 指定；缺失的自定义文件不会被示例数据替换。
+使用 `dataset_tiny.parquet` 文件名时会自动在其所在目录补齐示例文件。
+检索服务可通过 `--data-dir /绝对路径/语料目录` 指定缓存目录。
 
 ## 3. 采集并自动生成收益表
 
@@ -86,7 +85,6 @@ conda activate agent
 python collect_traces.py \
   --endpoint http://127.0.0.1:18030/v1 \
   --model Qwen3-30B-A3B-Instruct-2507 \
-  --dataset data/dataset_tiny.parquet \
   --mcp-url http://127.0.0.1:8099/sse \
   --tasks 32 --rollouts-per-task 4 --concurrency 4 \
   --max-model-calls 8 --max-tokens-per-call 2048 \
@@ -94,7 +92,7 @@ python collect_traces.py \
   --output traces/npu-qwen30b-run01
 ```
 
-有服务端元数据时附加 `--server-metadata data/server_metadata.json`。
+有服务端元数据时附加 `--server-metadata ../../../data/cache/rag/server_metadata.json`。
 API 启用鉴权时，通过 `VLLM_API_KEY` 环境变量提供密钥；不要将密钥写入 URL、元数据或运行命令文件。
 每次采集必须用新目录。`--proxy-port` 默认 18031，会占用从该端口起连续 `--concurrency` 个本机端口。
 一个 worker 对应一个独立进程，避免 Lightning tracer 在同一线程中并发运行轨迹发生冲突。

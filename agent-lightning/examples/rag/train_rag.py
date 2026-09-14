@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from rag_agent import RAGAgent  # Make sure to import your RAGAgent class
+from rag_data import DEFAULT_DATA_DIR, ensure_example_data
 
 import agentlightning as agl
 
@@ -155,8 +156,9 @@ def train(config: Dict[str, Any], active_agent: Optional[str]) -> None:
     # NOTE: Fill in the path to your previously converted parquet file here
     # For demo purposes, we use the same dataset for training and validation,
     # which should be avoided in production.
-    train_df: pd.DataFrame = pd.read_parquet("data/dataset_tiny.parquet")  # type: ignore
-    val_df: pd.DataFrame = pd.read_parquet("data/dataset_tiny.parquet")  # type: ignore
+    ensure_example_data(DEFAULT_DATA_DIR)
+    train_df: pd.DataFrame = pd.read_parquet(DEFAULT_DATA_DIR / "dataset_tiny.parquet")  # type: ignore
+    val_df: pd.DataFrame = pd.read_parquet(DEFAULT_DATA_DIR / "dataset_tiny.parquet")  # type: ignore
 
     # Keep the rest of the code unchanged
     train_data: List[Dict[str, Any]] = train_df.to_dict(orient="records")  # type: ignore

@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from rag_data import DEFAULT_DATA_DIR, ensure_example_data
+
 CURRENT: contextvars.ContextVar[str] = contextvars.ContextVar("trajectory_id")
 
 
@@ -54,7 +56,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True, help="Fresh directory; existing paths are rejected.")
     parser.add_argument("--endpoint", default="http://127.0.0.1:18030/v1", help="vLLM OpenAI base URL, ending in /v1.")
     parser.add_argument("--model", default="Qwen3-30B-A3B-Instruct-2507", help="Served model name, not weight path.")
-    parser.add_argument("--dataset", type=Path, default=Path(__file__).parent / "data/dataset_tiny.parquet")
+    parser.add_argument("--dataset", type=Path, default=DEFAULT_DATA_DIR / "dataset_tiny.parquet")
     parser.add_argument("--mcp-url", default="http://127.0.0.1:8099/sse")
     parser.add_argument("--tasks", type=positive, default=32)
     parser.add_argument("--rollouts-per-task", type=positive, default=4)
@@ -81,12 +83,10 @@ def arguments() -> argparse.Namespace:
         parser.error("endpoint must be an HTTP(S) base URL ending in /v1")
     if endpoint.username or endpoint.password or endpoint.query or endpoint.fragment:
         parser.error("put API credentials in VLLM_API_KEY, not the endpoint URL")
-    if args.worker is None and not args.dataset.is_file():
+    if args.worker is None and args.dataset.name != "dataset_tiny.parquet" and not args.dataset.is_file():
         parser.error(
-            f"Dataset not found: {args.dataset.resolve()}\n"
-            "Example data is not included in Git and is not downloaded automatically. "
-            "Follow TRACE_COLLECTION.md, section 2, to download the dataset and retrieval corpus, "
-            "or pass --dataset /absolute/path/to/dataset_tiny.parquet."
+            f"Custom dataset not found: {args.dataset.resolve()}. "
+            "Only the bundled example filename dataset_tiny.parquet can be downloaded automatically."
         )
     return args
 
@@ -312,12 +312,14 @@ async def collect(args: argparse.Namespace) -> None:
                 "git_revision": revision,
                 "source_sha256": {
                     name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
-                    for name in ("collect_traces.py", "rag_agent.py", "wiki_retriever_mcp.py")
+                    for name in ("collect_traces.py", "rag_agent.py", "wiki_retriever_mcp.py", "rag_data.py")
                 },
             },
         )
         import pandas as pd
 
+        if args.dataset.name == "dataset_tiny.parquet":
+            ensure_example_data(args.dataset.parent)
         frame = pd.read_parquet(args.dataset)
         if not {"id", "question", "answer"}.issubset(frame.columns) or len(frame) < args.tasks:
             raise ValueError("Dataset must have id/question/answer columns and at least --tasks rows")

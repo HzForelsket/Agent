@@ -18,24 +18,14 @@ uv sync --frozen --extra apo --group agents --group torch-gpu-stable --extra ver
 source .venv/bin/activate
 ```
 
-**Step 2:** Prepare the tiny dataset.
+**Step 2:** Enter the example directory. Missing example files are downloaded automatically by the retriever,
+collector and training entrypoints into the repository's `data/cache/rag/` directory. Existing files are reused.
 
 ```bash
 pip install gdown
-
-# tiny training dataset
 cd examples/rag
-mkdir -p data
-gdown "https://drive.google.com/file/d/1Pq4Ag8zVoN8gUtLu0LcBfY35Dm5zL0hq/view?usp=drive_link" \
-    -O data/dataset_tiny.parquet
-
-# chunks_candidate_tiny.pkl
-gdown "https://drive.google.com/file/d/1REXCpRLbeZu1KfWWKhIGEQe_WNHUOBkS/view?usp=drive_link" \
-    -O data/chunks_candidate_tiny.pkl
-
-# index_hnsw_faiss_n32e40_tiny.index
-gdown "https://drive.google.com/file/d/1f6P-h_8KSRhe5pqDHWbRQWvUhTygfZ-c/view?usp=drive_link" \
-    -O data/index_hnsw_faiss_n32e40_tiny.index
+# Optional: prepare the cache without starting a service.
+python rag_data.py
 ```
 
 **Step 3:** Start the MCP server. Open a terminal and run:
@@ -57,6 +47,7 @@ python train_rag.py
 | `rag_agent.py` | RAG agent example using the OpenAI Agents SDK, with debugging utils |
 | `train_rag.py` | Initiates the GRPO training process |
 | `metric_utils.py` | Scoring utilities for exact match, F1 score, and response parsing |
+| `rag_data.py` | Shared automatic data download, checksum verification and cache preparation |
 | `wiki_retriever_mcp.py` | MCP server for Wikipedia retrieval |
 | `collect_traces.py` | Collect complete trajectories and exact model token IDs, then generate a benefit table |
 | `analyze_traces.py` | Offline sharing estimates across complete trajectory groups; Markdown/CSV/JSON output |

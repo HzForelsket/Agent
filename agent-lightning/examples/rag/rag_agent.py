@@ -113,7 +113,10 @@ def debug():
     agl.setup_logging("DEBUG", apply_to=[logger.name])
 
     # 1. loading dataset
-    dataset_path = "data/dataset_tiny.parquet"
+    from rag_data import DEFAULT_DATA_DIR, ensure_example_data
+
+    ensure_example_data(DEFAULT_DATA_DIR)
+    dataset_path = DEFAULT_DATA_DIR / "dataset_tiny.parquet"
     df: pd.DataFrame = pd.read_parquet(dataset_path)  # type: ignore
     data: List[Dict[str, Any]] = df.head(5).to_dict(orient="records")  # type: ignore
     # NOTE: The following dummy data can also be used if you don't have the dataset.

@@ -1,22 +1,26 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Serve the example Wikipedia corpus: python wiki_retriever_mcp.py --data-dir data."""
+"""Download missing example data and serve retrieval: python wiki_retriever_mcp.py."""
 
 import argparse
 import pickle
 from pathlib import Path
 from typing import Any
 
+from rag_data import DEFAULT_DATA_DIR, ensure_example_data
+
 
 def main() -> None:
     """Load the retrieval corpus and serve its original top-one retrieval tool."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-dir", type=Path, default=Path(__file__).parent / "data")
+    parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--embedding-model", default="BAAI/bge-large-en-v1.5")
     parser.add_argument("--device", default="cpu", help="Embedding device; CPU avoids using the serving accelerator.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8099)
     args = parser.parse_args()
+
+    ensure_example_data(args.data_dir)
 
     import faiss
     from fastmcp import FastMCP
