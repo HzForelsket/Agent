@@ -85,6 +85,25 @@ python wiki_retriever_mcp.py --device cpu --embedding-model BAAI/bge-large-en-v1
 离线机器将 `--embedding-model` 替换为已下载的 BGE 模型目录；检索索引与该 embedding 模型配套，
 保持现有工具每次返回 top-1 文档的行为。
 
+若在加载 `SentenceTransformer` 时报 Hugging Face 504，MCP 服务还没有开始监听。
+把完整 BGE 模型目录拷贝到服务器，使用离线加载即可避免 Hub 请求。
+传入模型目录会自动只读本地文件，也可显式要求离线加载：
+
+```bash
+python wiki_retriever_mcp.py --device cpu --insecure-download \
+  --embedding-model /实际路径/bge-large-en-v1.5 --local-files-only
+```
+
+`--local-files-only` 只约束 embedding 模型加载，三个示例数据文件仍须存在或能够下载。
+拷贝 Hugging Face snapshot 时须包含符号链接指向的实际文件（例如用 `tar -chf` 打包），否则离线包会缺权重。
+等 MCP 显示监听成功，再启动轨迹采集。
+
+如有已确认可达的 Hub 镜像，可通过 `--hf-endpoint` 或 `HF_ENDPOINT` 环境变量设置，
+它在导入 Hub 库之前生效；`--insecure-download` 对该源同样有效。
+embedding 模型缓存默认位于仓库根目录 `data/cache/rag/embedding-models/`，可用 `--embedding-cache` 指定。
+本机尝试 [HF-Mirror](https://hf-mirror.com/) 时，Hub 元数据请求仍被重定向到 Hugging Face 并失败，
+因此本次未将换镜像视为已验证的解决办法。
+
 若 NPU 主机无法访问 Google Drive，可在联网机器运行 `python rag_data.py`，
 再把 `data/cache/rag/` 整体拷贝到 NPU 机器的同一仓库相对路径。
 下载失败会显示失败文件和原因；网络恢复后重跑，已经下载完成的文件直接复用。
@@ -178,3 +197,7 @@ python analyze_traces.py --input traces/npu-qwen30b-run01
 基线 101,927 token 位置，合并后 51,656，减少 49.32%；attention pairs 从 49,310,766
 降到 34,283,950，减少 30.47%。这些数据来自此前 GPU 采集，
 用于核对统计口径，**不是本次 NPU 实测结果**。NPU 侧采集结果以用户运行后生成的文件为准。
+
+本地 `agent` 环境还使用 BGE revision `d4aa6901d3a41ba39fb536a557fa166f842b0e09`
+完整缓存及 `--local-files-only --device cpu` 启动了 MCP 服务，成功列出并调用 `retrieve`，
+返回语料文档。该验证覆盖 CPU 检索服务的离线加载，不涉及 NPU 模型推理。
