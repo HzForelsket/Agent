@@ -6,7 +6,6 @@ import argparse
 import fcntl
 import hashlib
 import os
-import shutil
 import ssl
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -78,20 +77,40 @@ def ensure_example_data(data_dir: Path, *, insecure: bool | None = None) -> None
                     url = "https://drive.usercontent.google.com/download?" + urlencode(
                         {"id": file_id, "export": "download", "confirm": "t"}
                     )
-                    request = Request(url, headers={"User-Agent": "RAG-data-collector/1.0"})
+                    request = Request(
+                        url, headers={"User-Agent": "RAG-data-collector/1.0", "Accept-Encoding": "identity"}
+                    )
                     with opener.open(request, timeout=60) as response, downloaded.open("wb") as output:
-                        if response.headers.get_content_type() == "text/html":
-                            raise ValueError("Google Drive returned an HTML page instead of the requested data file")
-                        shutil.copyfileobj(response, output, length=1024 * 1024)
-                    if not downloaded.is_file() or hashlib.sha256(downloaded.read_bytes()).hexdigest() != checksum:
-                        raise ValueError("Downloaded file is missing or its SHA-256 does not match the example data")
+                        status = response.status
+                        content_type = response.headers.get("Content-Type", "unknown")
+                        content_length = response.headers.get("Content-Length", "unknown")
+                        encoding = response.headers.get("Content-Encoding", "identity")
+                        digest = hashlib.sha256()
+                        received = 0
+                        prefix = b""
+                        while chunk := response.read(1024 * 1024):
+                            if not prefix:
+                                prefix = chunk[:160]
+                            output.write(chunk)
+                            digest.update(chunk)
+                            received += len(chunk)
+                    actual_checksum = digest.hexdigest()
+                    if actual_checksum != checksum:
+                        preview = repr(prefix.decode("utf-8", errors="replace"))
+                        raise ValueError(
+                            f"SHA-256 mismatch for {name}: expected={checksum}, actual={actual_checksum}; "
+                            f"received_bytes={received}, HTTP={status}, Content-Type={content_type}, "
+                            f"Content-Length={content_length}, Content-Encoding={encoding}; "
+                            f"response_prefix={preview}. The response is not the pinned example file; "
+                            "it has not been added to the cache."
+                        )
                     downloaded.replace(destination)
             except Exception as error:
                 raise RuntimeError(
                     f"Automatic download failed for {destination}: {error}. "
-                    "Check that Google Drive is reachable; for missing CA certificates use "
-                    "--insecure-download or RAG_DOWNLOAD_INSECURE=1, then rerun; "
-                    "completed files will be reused."
+                    "Rerun rag_data.py separately to diagnose the download without starting model collection. "
+                    "For certificate verification errors use --insecure-download or RAG_DOWNLOAD_INSECURE=1; "
+                    "this does not bypass file-content verification. Completed files will be reused."
                 ) from error
             print(f"Saved and verified: {destination}", flush=True)
 

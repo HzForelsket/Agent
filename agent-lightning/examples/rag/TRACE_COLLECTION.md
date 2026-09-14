@@ -88,6 +88,10 @@ python wiki_retriever_mcp.py --device cpu --embedding-model BAAI/bge-large-en-v1
 若 NPU 主机无法访问 Google Drive，可在联网机器运行 `python rag_data.py`，
 再把 `data/cache/rag/` 整体拷贝到 NPU 机器的同一仓库相对路径。
 下载失败会显示失败文件和原因；网络恢复后重跑，已经下载完成的文件直接复用。
+若出现 SHA-256 不匹配，在 `examples/rag` 目录单独执行 `python rag_data.py --insecure-download`，
+无需启动模型。报错会显示预期/实际 SHA-256、实际字节数、HTTP 状态、Content-Type、
+Content-Length、Content-Encoding 和响应开头，供判断返回内容为何与示例文件不同。
+示例索引 `index_hnsw_faiss_n32e40_tiny.index` 的已核验大小为 8,735,522 字节。
 自定义题目可用 `--dataset /绝对路径/题目.parquet` 指定；缺失的自定义文件不会被示例数据替换。
 使用 `dataset_tiny.parquet` 文件名时会自动在其所在目录补齐示例文件。
 检索服务可通过 `--data-dir /绝对路径/语料目录` 指定缓存目录。
