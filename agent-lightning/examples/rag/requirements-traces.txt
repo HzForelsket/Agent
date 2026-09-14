@@ -5,6 +5,5 @@ litellm[proxy]==1.80.0
 fastmcp==2.13.1
 faiss-cpu==1.11.0
 sentence-transformers==6.0.1
-huggingface-hub>=1.0,<2.0
 pandas
 pyarrow

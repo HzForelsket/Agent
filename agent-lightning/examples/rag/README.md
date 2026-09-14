@@ -31,7 +31,8 @@ The data downloader uses Python's standard library. On a host without CA certifi
 `--insecure-download` to `rag_data.py`, `wiki_retriever_mcp.py` and `collect_traces.py`, or set
 `RAG_DOWNLOAD_INSECURE=1` for all entrypoints. Newly downloaded example files still require matching SHA-256 hashes.
 
-**Step 3:** Start the MCP server. Open a terminal and run:
+**Step 3:** Start the MCP server. It downloads the BGE model from ModelScope into
+`data/cache/rag/embedding-models/`, verifies each file, and loads the model locally. Open a terminal and run:
 
 ```bash
 python wiki_retriever_mcp.py
@@ -51,6 +52,7 @@ python train_rag.py
 | `train_rag.py` | Initiates the GRPO training process |
 | `metric_utils.py` | Scoring utilities for exact match, F1 score, and response parsing |
 | `rag_data.py` | Shared automatic data download, checksum verification and cache preparation |
+| `embedding_download.py` | ModelScope embedding model downloads with resume, checksums and optional TLS verification |
 | `wiki_retriever_mcp.py` | MCP server for Wikipedia retrieval |
 | `collect_traces.py` | Collect complete trajectories and exact model token IDs, then generate a benefit table |
 | `analyze_traces.py` | Offline sharing estimates across complete trajectory groups; Markdown/CSV/JSON output |

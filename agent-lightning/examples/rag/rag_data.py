@@ -10,7 +10,7 @@ import ssl
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.parse import urlencode
-from urllib.request import HTTPSHandler, Request, build_opener
+from urllib.request import HTTPSHandler, OpenerDirector, Request, build_opener
 
 DEFAULT_DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "cache" / "rag"
 EXAMPLE_FILES = {
@@ -44,6 +44,18 @@ def add_download_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def create_download_opener(insecure: bool | None = None) -> OpenerDirector:
+    """Create a downloader honoring the shared TLS verification setting."""
+    insecure = insecure_downloads_enabled() if insecure is None else insecure
+    if insecure:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    else:
+        context = ssl.create_default_context()
+    return build_opener(HTTPSHandler(context=context))
+
+
 def ensure_example_data(data_dir: Path, *, insecure: bool | None = None) -> None:
     """Download missing example files atomically, preserving existing local data.
 
@@ -52,14 +64,7 @@ def ensure_example_data(data_dir: Path, *, insecure: bool | None = None) -> None
         insecure: Skip TLS certificate checks; defaults to RAG_DOWNLOAD_INSECURE.
     """
     data_dir = data_dir.resolve()
-    insecure = insecure_downloads_enabled() if insecure is None else insecure
-    if insecure:
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-    else:
-        context = ssl.create_default_context()
-    opener = build_opener(HTTPSHandler(context=context))
+    opener = create_download_opener(insecure)
     data_dir.mkdir(parents=True, exist_ok=True)
     with (data_dir / ".download.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)

@@ -36,11 +36,11 @@ cd examples/rag
 export RAG_DOWNLOAD_INSECURE=1
 ```
 
-也可为 `collect_traces.py`、`wiki_retriever_mcp.py` 或 `rag_data.py` 单独传入 `--insecure-download`。
+也可为 `collect_traces.py`、`wiki_retriever_mcp.py`、`embedding_download.py` 或 `rag_data.py` 单独传入 `--insecure-download`。
 这会跳过示例数据和检索模型下载的 TLS 证书验证，不修改系统证书或模型 API 请求配置。
 数据下载只使用 Python 标准库，不需要 `gdown`；示例文件下载后仍必须通过固定 SHA-256 校验。
-检索模型下载使用 Hugging Face Hub 1.x 的 HTTP 客户端配置，并禁用独立 TLS 通道的 Xet 下载。
-本地 embedding 模型目录同样可用。
+检索模型改为直接使用 ModelScope 文件接口，同样只用标准库，无需 ModelScope SDK。
+模型文件下载和校验完成后，SentenceTransformer 严格从本地加载，不访问 Hugging Face。
 
 若安装 pip 依赖也遇到证书错误，可为上面的安装命令添加所用下载域名的 `--trusted-host`：
 PyPI 使用 `--trusted-host pypi.org --trusted-host files.pythonhosted.org`；CPU torch 索引使用
@@ -85,24 +85,37 @@ python wiki_retriever_mcp.py --device cpu --embedding-model BAAI/bge-large-en-v1
 离线机器将 `--embedding-model` 替换为已下载的 BGE 模型目录；检索索引与该 embedding 模型配套，
 保持现有工具每次返回 top-1 文档的行为。
 
-若在加载 `SentenceTransformer` 时报 Hugging Face 504，MCP 服务还没有开始监听。
-把完整 BGE 模型目录拷贝到服务器，使用离线加载即可避免 Hub 请求。
-传入模型目录会自动只读本地文件，也可显式要求离线加载：
+检索模型默认从 [ModelScope 的 BAAI/bge-large-en-v1.5](https://modelscope.cn/models/BAAI/bge-large-en-v1.5)
+自动下载。服务器没有 CA 证书时直接运行：
+
+```bash
+python wiki_retriever_mcp.py --device cpu --insecure-download
+```
+
+模型保存在仓库根目录 `data/cache/rag/embedding-models/BAAI/bge-large-en-v1.5/`。
+先读取 ModelScope 文件清单，按其 revision 下载 safetensors 权重、配置和 tokenizer，逐文件核验字节数与 SHA-256。
+不下载重复的 PyTorch bin 和 ONNX 权重；主 safetensors 文件约 1.34 GB。
+`.modelscope-manifest.json` 保存源、revision 和文件摘要；已完成文件校验后复用，中断的 `.part` 文件下次续传。
+所有下载请求及跳转都遵循 `--insecure-download`；支持环境变量 `RAG_DOWNLOAD_INSECURE=1`。
+
+只想下载模型、不启动 MCP 时运行：
+
+```bash
+python embedding_download.py --insecure-download
+```
+
+`--embedding-model` 接受 ModelScope 模型 ID 或完整本地模型目录。
+`--embedding-cache` 可指定模型缓存根目录；`--local-files-only` 要求模型已经缓存完整，禁止模型下载。
+传入完整本地目录时直接离线加载：
 
 ```bash
 python wiki_retriever_mcp.py --device cpu --insecure-download \
   --embedding-model /实际路径/bge-large-en-v1.5 --local-files-only
 ```
 
-`--local-files-only` 只约束 embedding 模型加载，三个示例数据文件仍须存在或能够下载。
+`--local-files-only` 只约束 embedding 模型，三个示例数据文件仍须存在或能够下载。
 拷贝 Hugging Face snapshot 时须包含符号链接指向的实际文件（例如用 `tar -chf` 打包），否则离线包会缺权重。
 等 MCP 显示监听成功，再启动轨迹采集。
-
-如有已确认可达的 Hub 镜像，可通过 `--hf-endpoint` 或 `HF_ENDPOINT` 环境变量设置，
-它在导入 Hub 库之前生效；`--insecure-download` 对该源同样有效。
-embedding 模型缓存默认位于仓库根目录 `data/cache/rag/embedding-models/`，可用 `--embedding-cache` 指定。
-本机尝试 [HF-Mirror](https://hf-mirror.com/) 时，Hub 元数据请求仍被重定向到 Hugging Face 并失败，
-因此本次未将换镜像视为已验证的解决办法。
 
 若 NPU 主机无法访问 Google Drive，可在联网机器运行 `python rag_data.py`，
 再把 `data/cache/rag/` 整体拷贝到 NPU 机器的同一仓库相对路径。
@@ -198,6 +211,7 @@ python analyze_traces.py --input traces/npu-qwen30b-run01
 降到 34,283,950，减少 30.47%。这些数据来自此前 GPU 采集，
 用于核对统计口径，**不是本次 NPU 实测结果**。NPU 侧采集结果以用户运行后生成的文件为准。
 
-本地 `agent` 环境还使用 BGE revision `d4aa6901d3a41ba39fb536a557fa166f842b0e09`
-完整缓存及 `--local-files-only --device cpu` 启动了 MCP 服务，成功列出并调用 `retrieve`，
-返回语料文档。该验证覆盖 CPU 检索服务的离线加载，不涉及 NPU 模型推理。
+本地 `agent` 环境使用标准库从 ModelScope revision `bb9873b4c485b66b143ff6d8313e447b30f41c34`
+实际下载了完整 BGE 模型，包含 1,340,616,616 字节的 safetensors 权重，全部文件通过大小及 SHA-256 校验。
+随后使用默认模型 ID、`--device cpu --insecure-download` 启动 MCP，复用缓存并成功调用 `retrieve`，
+返回 chunk 1205。该验证覆盖模型下载、缓存复用和 CPU 检索服务，不涉及 NPU 模型推理；续传分支尚未实际中断验证。
