@@ -8,156 +8,116 @@
 统计单位统一为**一条完整轨迹、一条 token 序列**，收益表比较**每条完整轨迹独立计算**与**同题 4 条完整轨迹合并前缀树**。
 它估计 token 位置和 causal attention pair 的减少，不测量 NPU 训练加速。
 
-## 1. 环境和模型服务
+## 1. NPU 主机环境
 
-模型服务运行在已经配置好的 NPU 环境中，项目指定版本为 CANN 9.0.0、vLLM 0.22.1、
-vllm-ascend 0.22.1rc1（训练栈的 verl 0.9.0 不参与采集）。
-本机没有 NPU，当前入口尚未在 NPU 上实跑；这里准备的是连接该服务的客户端和离线统计工具。
+现在 `collect_traces.py` 自动启动本机的 **NPU vLLM + CPU MCP**，等待两者就绪后采集，
+结束后关闭本次启动的服务并生成收益表。无需另开终端手动启动服务。
+采集器和 vLLM 必须处于同一主机/容器、能访问相同模型路径和本机端口。
 
-采集客户端与 CPU 检索服务可以运行在 NPU 主机的独立 `agent` conda 环境，也可运行在另一台能访问模型 API 的主机。
-不要将客户端依赖安装命令用于替换现有 NPU serving 环境的 torch/CANN/vLLM。
+NPU 环境按项目固定栈准备：CANN 9.0.0、vLLM 0.22.1、vllm-ascend 0.22.1rc1。
+采集不需要 verl。客户端及 CPU 检索依赖可安装在独立环境，避免修改已有 NPU torch/CANN 环境。
 在仓库的 `agent-lightning` 目录，使用客户端环境安装：
 
 ```bash
 conda activate agent
-# 客户端只需要 CPU torch；已有可用 torch 时跳过这一行。
+# 客户端已有可用 torch 时跳过这一行。
 python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -e . -r examples/rag/requirements-traces.txt
 cd examples/rag
 ```
 
-`openai` 和 `openai-agents` 都是 pip 包，负责发 HTTP 请求和执行 Agent 循环；
-它们无需 NPU 专用版本。实际模型计算由 NPU 上的 vLLM 服务执行。
-应用依赖清单是独立采集入口的安装清单，不修改主项目的 `uv.lock`。
+`openai`、`openai-agents` 是普通 pip 包，负责 HTTP 请求与 Agent 循环，不需要 NPU 专用版本。
+安装 pip 包若遇证书错误，按下载源添加 `--trusted-host pypi.org --trusted-host files.pythonhosted.org`；
+CPU torch 源使用 `--trusted-host download.pytorch.org --trusted-host download-r2.pytorch.org`。
+应用依赖清单不修改主项目的 `uv.lock`。
 
-服务器没有 CA 证书时，在运行采集与检索服务的各终端设置：
+## 2. 一条命令采集
 
-```bash
-export RAG_DOWNLOAD_INSECURE=1
-```
-
-也可为 `collect_traces.py`、`wiki_retriever_mcp.py`、`embedding_download.py` 或 `rag_data.py` 单独传入 `--insecure-download`。
-这会跳过示例数据和检索模型下载的 TLS 证书验证，不修改系统证书或模型 API 请求配置。
-数据下载只使用 Python 标准库，不需要 `gdown`；示例文件下载后仍必须通过固定 SHA-256 校验。
-检索模型改为直接使用 ModelScope 文件接口，同样只用标准库，无需 ModelScope SDK。
-模型文件下载和校验完成后，SentenceTransformer 严格从本地加载，不访问 Hugging Face。
-
-若安装 pip 依赖也遇到证书错误，可为上面的安装命令添加所用下载域名的 `--trusted-host`：
-PyPI 使用 `--trusted-host pypi.org --trusted-host files.pythonhosted.org`；CPU torch 索引使用
-`--trusted-host download.pytorch.org --trusted-host download-r2.pytorch.org`。
-
-在已有可运行该模型的 NPU 部署命令中，设置以下 vLLM API 参数：
-
-```text
---served-model-name Qwen3-30B-A3B-Instruct-2507
---host 127.0.0.1 --port 18030
---enable-auto-tool-choice --tool-call-parser hermes
---max-model-len 32768
-```
-
-模型权重路径、NPU 设备选择、tensor parallel 大小沿用该 NPU 机器上可运行的模型部署配置。
-上述是 vLLM API 参数片段，不是完整的 NPU 部署命令。
-跨主机访问时使用服务端实际监听地址和可达的 API URL。
-`--model` 传入 `--served-model-name` 的逻辑名，不传权重目录。
-服务必须支持 `return_token_ids=true`，返回真实的 `prompt_token_ids` 和 `choices[0].token_ids`；
-采集器会检查它们与 usage 长度一致，缺失时停止该轨迹，不通过本地重新 tokenize 猜测。
-
-可将实际服务信息保存为 `../../../data/cache/rag/server_metadata.json`，使用 `--server-metadata` 随轨迹保存。
-内容应包含实际 NPU 型号/数量、模型路径与 revision、CANN/vLLM/vllm-ascend 版本、
-完整启动命令、tensor parallel、dtype、chat template，以及检索模型路径和 revision。
-客户端自动记录的包版本只代表客户端，不能替代远程服务端版本。
-
-## 2. 准备示例数据和检索服务
-
-采集入口和检索服务会自动下载缺失的 MuSiQue tiny 题目、Wikipedia 文本和 FAISS 索引，
-统一保存到**仓库根目录的 `data/cache/rag/`**。路径根据脚本位置定位，不依赖启动时的工作目录。
-已有非空文件直接复用；新下载文件校验 SHA-256 后原子写入，失败不会留下可被误用的半成品。
-两个入口同时启动时使用文件锁，避免重复下载。缓存已被 Git 忽略。
-
-在 `agent-lightning/examples/rag` 目录直接启动检索服务即可，无需手动下载：
+在 NPU 机器的 `agent-lightning/examples/rag` 目录运行，替换模型路径与实际分配的芯片 ID：
 
 ```bash
-python wiki_retriever_mcp.py --device cpu --embedding-model BAAI/bge-large-en-v1.5
-```
-
-该终端保持运行，默认 MCP 地址是 `http://127.0.0.1:8099/sse`。
-下一节的采集命令也会自动补齐缓存。若只想提前准备数据，可运行 `python rag_data.py`。
-离线机器将 `--embedding-model` 替换为已下载的 BGE 模型目录；检索索引与该 embedding 模型配套，
-保持现有工具每次返回 top-1 文档的行为。
-
-检索模型默认从 [ModelScope 的 BAAI/bge-large-en-v1.5](https://modelscope.cn/models/BAAI/bge-large-en-v1.5)
-自动下载。服务器没有 CA 证书时直接运行：
-
-```bash
-python wiki_retriever_mcp.py --device cpu --insecure-download
-```
-
-模型保存在仓库根目录 `data/cache/rag/embedding-models/BAAI/bge-large-en-v1.5/`。
-先读取 ModelScope 文件清单，按其 revision 下载 safetensors 权重、配置和 tokenizer，逐文件核验字节数与 SHA-256。
-不下载重复的 PyTorch bin 和 ONNX 权重；主 safetensors 文件约 1.34 GB。
-`.modelscope-manifest.json` 保存源、revision 和文件摘要；已完成文件校验后复用，中断的 `.part` 文件下次续传。
-所有下载请求及跳转都遵循 `--insecure-download`；支持环境变量 `RAG_DOWNLOAD_INSECURE=1`。
-
-只想下载模型、不启动 MCP 时运行：
-
-```bash
-python embedding_download.py --insecure-download
-```
-
-`--embedding-model` 接受 ModelScope 模型 ID 或完整本地模型目录。
-`--embedding-cache` 可指定模型缓存根目录；`--local-files-only` 要求模型已经缓存完整，禁止模型下载。
-传入完整本地目录时直接离线加载：
-
-```bash
-python wiki_retriever_mcp.py --device cpu --insecure-download \
-  --embedding-model /实际路径/bge-large-en-v1.5 --local-files-only
-```
-
-`--local-files-only` 只约束 embedding 模型，三个示例数据文件仍须存在或能够下载。
-拷贝 Hugging Face snapshot 时须包含符号链接指向的实际文件（例如用 `tar -chf` 打包），否则离线包会缺权重。
-等 MCP 显示监听成功，再启动轨迹采集。
-
-若 NPU 主机无法访问 Google Drive，可在联网机器运行 `python rag_data.py`，
-再把 `data/cache/rag/` 整体拷贝到 NPU 机器的同一仓库相对路径。
-下载失败会显示失败文件和原因；网络恢复后重跑，已经下载完成的文件直接复用。
-若出现 SHA-256 不匹配，在 `examples/rag` 目录单独执行 `python rag_data.py --insecure-download`，
-无需启动模型。报错会显示预期/实际 SHA-256、实际字节数、HTTP 状态、Content-Type、
-Content-Length、Content-Encoding 和响应开头，供判断返回内容为何与示例文件不同。
-示例索引 `index_hnsw_faiss_n32e40_tiny.index` 的已核验大小为 8,735,522 字节。
-自定义题目可用 `--dataset /绝对路径/题目.parquet` 指定；缺失的自定义文件不会被示例数据替换。
-使用 `dataset_tiny.parquet` 文件名时会自动在其所在目录补齐示例文件。
-检索服务可通过 `--data-dir /绝对路径/语料目录` 指定缓存目录。
-
-## 3. 采集并自动生成收益表
-
-另开客户端终端，进入同一 `examples/rag` 目录：
-
-```bash
-conda activate agent
 python collect_traces.py \
-  --endpoint http://127.0.0.1:18030/v1 \
-  --model Qwen3-30B-A3B-Instruct-2507 \
-  --mcp-url http://127.0.0.1:8099/sse \
+  --model-path /实际模型路径/Qwen3-30B-A3B-Instruct-2507 \
+  --npu-devices 0,1,2,3 \
+  --insecure-download \
   --tasks 32 --rollouts-per-task 4 --concurrency 4 \
-  --max-model-calls 8 --max-tokens-per-call 2048 \
-  --temperature 0.7 --seed 20260914 \
   --output traces/npu-qwen30b-run01
 ```
 
-有服务端元数据时附加 `--server-metadata ../../../data/cache/rag/server_metadata.json`。
-API 启用鉴权时，通过 `VLLM_API_KEY` 环境变量提供密钥；不要将密钥写入 URL、元数据或运行命令文件。
-每次采集必须用新目录。`--proxy-port` 默认 18031，会占用从该端口起连续 `--concurrency` 个本机端口。
-一个 worker 对应一个独立进程，避免 Lightning tracer 在同一线程中并发运行轨迹发生冲突。
+若 vLLM 安装在另一个环境，追加 `--vllm-python /实际NPU环境/bin/python`；默认使用采集器自身的 Python。
+该路径必须是同一主机/容器内已配置好 vLLM Ascend 的解释器。CANN 所需环境变量应在运行命令前加载，子进程会继承。
+A3 部署如需 AIV，在运行前设置 `export HCCL_OP_EXPANSION_MODE=AIV`；A2 不需要此设置。
+设备编号是 `ASCEND_RT_VISIBLE_DEVICES` 使用的芯片编号，TP 自动取编号个数；也可直接沿用已设置的这个环境变量。
 
-主进程首先打印输出目录。可在第三个终端查看增量进度：
+`--model-path` 是**已下载的完整 BF16 30B 模型目录**；服务使用本地权重并禁用 Hugging Face 联网。
+`--model` 是逻辑服务名，默认 `Qwen3-30B-A3B-Instruct-2507`，与本地目录名分开记录。
+自动启动参数包括 BF16、expert parallel、mp、Hermes 工具解析、eager，以及关闭推理前缀缓存。
+默认 `--max-model-len 32768`、`--gpu-memory-utilization 0.85`，后一个是 vLLM 在 NPU 上沿用的参数名。
+部署参数参考固定版本的 [vllm-ascend Qwen3-30B 文档](https://github.com/vllm-project/vllm-ascend/blob/v0.22.1rc1/docs/source/tutorials/models/Qwen3-30B-A3B.md)。
+
+入口依次执行：
+
+1. 创建新的输出目录，保存配置、环境与题目，自动补齐缺失的示例数据。
+2. 启动 CPU MCP 和 NPU vLLM，分别写入 `mcp.log`、`vllm.log`。
+3. 检查 vLLM `/health` 和 `/v1/models`，并连接 MCP 确认 `retrieve` 工具存在。
+4. 两者就绪后，创建独立 worker 进程，每题采集 4 条完整轨迹。
+5. 关闭本次启动的进程组，自动生成 `analysis/report.md` 和 `analysis/benefit.csv`。
+
+`--startup-timeout` 默认 1800 秒，包含服务内的 BGE 下载和模型加载，首次下载慢时可增大。
+等待期间每 30 秒打印进度。默认 vLLM 端口 18030、MCP 端口 8099、代理端口 18031–18034。
+可用 `--vllm-port`、`--mcp-port`、`--proxy-port` 修改；端口冲突会直接报错，不会接管或关闭其他进程。
+若之前手动启动过服务，先在对应终端退出，或为本次采集选择其他端口。
+原来的 `--endpoint` 和 `--mcp-url` 参数已移除，地址由自动启动的本机端口生成。
+
+通过 `VLLM_API_KEY` 环境变量配置模型 API 密钥，采集器和服务共同使用；不写入配置文件。
+可用 `--server-metadata /路径/server_metadata.json` 补充实际 NPU 型号、CANN/服务包版本和权重 revision。
+`services.json` 自动记录启动命令与部分环境变量，其中 `reference_stack` 是目标版本，不是服务实际版本检测结果。
+
+查看实时日志：
 
 ```bash
+tail -f traces/npu-qwen30b-run01/mcp.log traces/npu-qwen30b-run01/vllm.log
 tail -f traces/npu-qwen30b-run01/worker-*.log
 ```
 
-每次模型调用、工具事件和完成轨迹逐条 flush/fsync 保存。中断时已经保存的记录仍可用于离线分析；
-没有完整保存的轨迹不会进入主收益表。若初始化失败且没有任何有效模型调用，会打印失败日志并删除空跑目录。
-不支持在原目录续写，以免重复样本混入同一组。
+采集期间服务退出或 worker 失败会停止其他进程；Ctrl+C / SIGTERM 同样触发清理，
+先发送 SIGTERM，超过 15 秒则强制关闭本次进程组，包括 vLLM 子进程。
+每次模型调用和轨迹逐条 flush/fsync 保存；已有有效模型调用时保留部分数据、服务日志和 `failure.json`。
+如果尚无有效模型调用，会先在终端打印错误和日志末尾，再删除失败的空跑目录。
+每次必须使用新输出目录，不在原目录续写，以免混入重复样本。
+
+## 3. 数据与检索模型缓存
+
+缺失的 MuSiQue tiny 题目、Wikipedia 文本及 FAISS 索引自动下载到仓库根目录 `data/cache/rag/`。
+BGE 检索模型默认从 ModelScope 下载到 `data/cache/rag/embedding-models/BAAI/bge-large-en-v1.5/`。
+已有数据和完整模型缓存会复用；这些缓存以及轨迹目录已被 Git 忽略。
+
+`--insecure-download` 会同时传给 MCP，跳过数据和 BGE 下载中所有请求及跳转的 TLS 证书验证。
+也可设置 `RAG_DOWNLOAD_INSECURE=1`。下载只使用标准库，不用 gdown 或 ModelScope SDK。
+数据核验固定 SHA-256；模型按 ModelScope manifest 固定 revision，逐文件核验大小与 SHA-256，
+中断的模型 `.part` 文件支持续传。SentenceTransformer 严格从本地文件加载，不连接 Hugging Face。
+
+若已有离线 BGE 模型，在采集命令追加：
+
+```text
+--embedding-model /实际路径/bge-large-en-v1.5 --local-files-only
+```
+
+`--embedding-cache` 可修改模型缓存根目录；`--local-files-only` 只约束检索模型，示例数据仍须存在或能下载。
+可用 `--retrieval-data-dir` 指定语料/索引目录，`--dataset` 单独指定题目 parquet。
+自定义题目必须包含 id/question/answer 列；缺失的自定义文件不会被示例数据替换。
+使用 `dataset_tiny.parquet` 文件名时会在其所在目录自动补齐示例文件。
+
+只想提前下载、不启动服务时，在 `examples/rag` 运行：
+
+```bash
+python rag_data.py --insecure-download
+python embedding_download.py --insecure-download
+```
+
+若不能访问 Google Drive，可在联网机器下载数据后拷贝 `data/cache/rag/`。
+数据下载失败会显示文件名、预期/实际 SHA-256、字节数、HTTP 状态、响应类型及内容开头。
+示例索引 `index_hnsw_faiss_n32e40_tiny.index` 的已核验大小为 8,735,522 字节。
 
 ## 4. 保存文件与计算口径
 
@@ -165,7 +125,9 @@ tail -f traces/npu-qwen30b-run01/worker-*.log
 |---|---|
 | `config.json`、`environment.json` | 采样配置、客户端包版本、Git revision、入口源码摘要 |
 | `selected_tasks.json`、`dataset_metadata.json` | 实际题目、数据文件 SHA-256 |
-| `server_metadata.json` | 传入的服务端部署信息（提供参数时保存） |
+| `services.json`、`services_ready.json` | 自动启动命令、环境、就绪时间和进程 ID |
+| `mcp.log`、`vllm.log`、`analysis.log` | 检索服务、模型服务和离线统计日志 |
+| `server_metadata.json` | 补充的实际服务端部署信息（提供参数时保存） |
 | `calls.jsonl` | 完整请求/回复、真实 prompt/response token ID、顺序和时间 |
 | `events.jsonl` | 工具执行事件、工具结果、最终答案；工具参数也在原始模型消息中 |
 | `trajectories.jsonl` | 一条记录对应一条完整或中断轨迹，含题号、组内编号、状态 |
@@ -204,6 +166,8 @@ python analyze_traces.py --input traces/npu-qwen30b-run01
 表中比例不包含反向传播、通信、packing、显存或 kernel 调度成本，不能当作训练加速比。
 
 ## 已完成的验证
+
+本次自动服务编排完成 CLI 帮助、Python 语法及格式静态检查；本机无可用 NPU，尚未验证 NPU 启动、就绪探测和进程清理的完整运行链路。
 
 在本地 `agent` 环境通过 CLI 帮助、语法和格式检查，并使用此前真实采集的
 32 题 × 4 条完整轨迹（408 次调用）运行正式离线入口，全部通过消息历史和模型动作保留检查：

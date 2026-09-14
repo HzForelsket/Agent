@@ -54,7 +54,8 @@ python train_rag.py
 | `rag_data.py` | Shared automatic data download, checksum verification and cache preparation |
 | `embedding_download.py` | ModelScope embedding model downloads with resume, checksums and optional TLS verification |
 | `wiki_retriever_mcp.py` | MCP server for Wikipedia retrieval |
-| `collect_traces.py` | Collect complete trajectories and exact model token IDs, then generate a benefit table |
+| `collect_traces.py` | Automatically start NPU vLLM and CPU MCP, collect complete trajectories, and generate a benefit table |
+| `trace_services.py` | Owned service process groups, port checks, readiness, failure monitoring and shutdown |
 | `analyze_traces.py` | Offline sharing estimates across complete trajectory groups; Markdown/CSV/JSON output |
 | `requirements-traces.txt` | Application dependencies for the separate trace collection client |
 | `TRACE_COLLECTION.md` | Chinese instructions for NPU serving integration, saved traces and metric definitions |

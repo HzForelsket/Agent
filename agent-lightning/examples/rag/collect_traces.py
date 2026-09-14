@@ -1,6 +1,6 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Collect complete RAG trajectories through a vLLM endpoint; see TRACE_COLLECTION.md."""
+"""Start NPU vLLM and CPU MCP, collect complete RAG trajectories, and generate the benefit table."""
 
 import argparse
 import asyncio
@@ -13,15 +13,16 @@ import logging
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import sys
 import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 from rag_data import DEFAULT_DATA_DIR, add_download_argument, ensure_example_data
+from trace_services import Processes, check_ports, service_commands
 
 CURRENT: contextvars.ContextVar[str] = contextvars.ContextVar("trajectory_id")
 
@@ -54,11 +55,27 @@ def positive(value: str) -> int:
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True, help="Fresh directory; existing paths are rejected.")
-    parser.add_argument("--endpoint", default="http://127.0.0.1:18030/v1", help="vLLM OpenAI base URL, ending in /v1.")
     parser.add_argument("--model", default="Qwen3-30B-A3B-Instruct-2507", help="Served model name, not weight path.")
+    parser.add_argument("--model-path", type=Path, help="Local BF16 Qwen3-30B-A3B-Instruct-2507 weight directory.")
+    parser.add_argument("--vllm-python", default=sys.executable, help="Python executable in the NPU vLLM environment.")
+    parser.add_argument(
+        "--npu-devices",
+        default=os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
+        help="NPU chip IDs, e.g. 0,1,2,3; TP equals their count.",
+    )
+    parser.add_argument("--vllm-port", type=positive, default=18030)
+    parser.add_argument("--mcp-port", type=positive, default=8099)
+    parser.add_argument("--startup-timeout", type=positive, default=1800)
+    parser.add_argument("--max-model-len", type=positive, default=32768)
+    parser.add_argument(
+        "--gpu-memory-utilization", type=float, default=0.85, help="vLLM memory fraction (also named gpu on NPU)."
+    )
+    parser.add_argument("--retrieval-data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    parser.add_argument("--embedding-model", default="BAAI/bge-large-en-v1.5")
+    parser.add_argument("--embedding-cache", type=Path, default=DEFAULT_DATA_DIR / "embedding-models")
+    parser.add_argument("--local-files-only", action="store_true", help="Require cached/local embedding model files.")
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATA_DIR / "dataset_tiny.parquet")
     add_download_argument(parser)
-    parser.add_argument("--mcp-url", default="http://127.0.0.1:8099/sse")
     parser.add_argument("--tasks", type=positive, default=32)
     parser.add_argument("--rollouts-per-task", type=positive, default=4)
     parser.add_argument("--concurrency", type=positive, default=4)
@@ -73,17 +90,30 @@ def arguments() -> argparse.Namespace:
     )
     parser.add_argument("--worker", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.worker is not None:
+        return args
+    if not args.model_path or not (args.model_path / "config.json").is_file():
+        parser.error("--model-path must point to the local 30B weight directory containing config.json")
+    devices = (args.npu_devices or "").split(",")
+    if not all(device.strip().isdigit() for device in devices) or len({int(device) for device in devices}) != len(
+        devices
+    ):
+        parser.error("set --npu-devices (or ASCEND_RT_VISIBLE_DEVICES) to distinct chip IDs, e.g. 0,1,2,3")
+    args.npu_devices = ",".join(str(int(device)) for device in devices)
+    executable = shutil.which(args.vllm_python)
+    if executable is None:
+        parser.error(f"vLLM Python executable not found: {args.vllm_python}")
+    args.vllm_python = str(Path(executable).absolute())
+    if not 0 < args.gpu_memory_utilization < 1:
+        parser.error("gpu-memory-utilization must be in (0, 1)")
+    if args.max_tokens_per_call >= args.max_model_len:
+        parser.error("max-tokens-per-call must be smaller than max-model-len")
     if args.rollouts_per_task < 2:
         parser.error("rollouts-per-task must be at least 2 for cross-trajectory sharing")
     if not 0 <= args.temperature <= 2 or not 0 <= args.seed < 2**32:
         parser.error("temperature must be in [0, 2] and seed in [0, 2**32)")
-    if args.proxy_port + args.concurrency - 1 > 65535:
+    if max(args.vllm_port, args.mcp_port, args.proxy_port + args.concurrency - 1) > 65535:
         parser.error("proxy port range exceeds 65535")
-    endpoint = urlsplit(args.endpoint)
-    if endpoint.scheme not in {"http", "https"} or not endpoint.netloc or not endpoint.path.endswith("/v1"):
-        parser.error("endpoint must be an HTTP(S) base URL ending in /v1")
-    if endpoint.username or endpoint.password or endpoint.query or endpoint.fragment:
-        parser.error("put API credentials in VLLM_API_KEY, not the endpoint URL")
     if args.worker is None and args.dataset.name != "dataset_tiny.parquet" and not args.dataset.is_file():
         parser.error(
             f"Custom dataset not found: {args.dataset.resolve()}. "
@@ -291,12 +321,22 @@ async def collect(args: argparse.Namespace) -> None:
         output=str(root),
         dataset=str(args.dataset.resolve()),
         schema_version=1,
-        endpoint=args.endpoint.rstrip("/"),
+        endpoint=f"http://127.0.0.1:{args.vllm_port}/v1",
+        mcp_url=f"http://127.0.0.1:{args.mcp_port}/sse",
+        model_path=str(args.model_path.resolve()),
+        retrieval_data_dir=str(args.retrieval_data_dir.resolve()),
+        embedding_cache=str(args.embedding_cache.resolve()),
         created_at=time.time(),
     )
     write_json(root / "config.json", config)
-    processes: list[asyncio.subprocess.Process] = []
-    logs: list[Any] = []
+    processes = Processes(root)
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    if task is not None:
+        loop.add_signal_handler(signal.SIGTERM, task.cancel)
+    # Local SSE and model traffic must not be sent through download proxies.
+    for key in ("NO_PROXY", "no_proxy"):
+        os.environ[key] = ",".join(filter(None, [os.environ.get(key), "127.0.0.1", "localhost"]))
     try:
         if args.server_metadata:
             write_json(root / "server_metadata.json", json.loads(args.server_metadata.read_text()))
@@ -313,10 +353,18 @@ async def collect(args: argparse.Namespace) -> None:
                 "git_revision": revision,
                 "source_sha256": {
                     name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
-                    for name in ("collect_traces.py", "rag_agent.py", "wiki_retriever_mcp.py", "rag_data.py")
+                    for name in (
+                        "collect_traces.py",
+                        "trace_services.py",
+                        "rag_agent.py",
+                        "wiki_retriever_mcp.py",
+                        "rag_data.py",
+                        "embedding_download.py",
+                    )
                 },
             },
         )
+        check_ports([args.vllm_port, args.mcp_port, *range(args.proxy_port, args.proxy_port + args.concurrency)])
         import pandas as pd
 
         if args.dataset.name == "dataset_tiny.parquet":
@@ -337,42 +385,58 @@ async def collect(args: argparse.Namespace) -> None:
                 "rows": len(frame),
             },
         )
+        commands, overrides = service_commands(config)
+        write_json(
+            root / "services.json",
+            {
+                "commands": commands,
+                "vllm_environment": {
+                    **{key: value for key, value in os.environ.items() if key.startswith(("HCCL_", "ASCEND_"))},
+                    **overrides,
+                },
+                "reference_stack": {"CANN": "9.0.0", "vllm": "0.22.1", "vllm-ascend": "0.22.1rc1"},
+                "started_at": time.time(),
+            },
+        )
+        await processes.start("mcp", commands["mcp"])
+        await processes.start("vllm", commands["vllm"], env={**os.environ, **overrides})
+        await processes.ready(config)
+        write_json(
+            root / "services_ready.json",
+            {"time": time.time(), "pids": {name: child.pid for name, child in processes.children.items()}},
+        )
+        workers = []
         for worker_id in range(args.concurrency):
-            log = (root / f"worker-{worker_id}.log").open("w")
-            logs.append(log)
-            processes.append(
-                await asyncio.create_subprocess_exec(
-                    sys.executable,
-                    "-u",
-                    str(Path(__file__).resolve()),
-                    "--output",
-                    str(root),
-                    "--worker",
-                    str(worker_id),
-                    stdout=log,
-                    stderr=asyncio.subprocess.STDOUT,
+            workers.append(
+                await processes.start(
+                    f"worker-{worker_id}",
+                    [
+                        sys.executable,
+                        "-u",
+                        str(Path(__file__).resolve()),
+                        "--output",
+                        str(root),
+                        "--worker",
+                        str(worker_id),
+                    ],
                 )
             )
-        codes = await asyncio.gather(*(process.wait() for process in processes))
-        if any(codes):
-            raise RuntimeError(f"Worker exit codes: {codes}")
+        codes = await processes.wait_workers(workers)
         write_json(root / "completion.json", {"worker_exit_codes": codes, "finished_at": time.time()})
-        analysis = await asyncio.create_subprocess_exec(
-            sys.executable, str(Path(__file__).with_name("analyze_traces.py")), "--input", str(root)
+        await processes.stop()
+        analysis = await processes.start(
+            "analysis", [sys.executable, str(Path(__file__).with_name("analyze_traces.py")), "--input", str(root)]
         )
         if await analysis.wait():
             raise RuntimeError("Capture finished, but analysis failed; raw traces are retained")
+        print(f"Benefit table: {root / 'analysis' / 'report.md'}", flush=True)
     except BaseException as error:
-        for process in processes:
-            if process.returncode is None:
-                process.terminate()
-        try:
-            await asyncio.wait_for(asyncio.gather(*(process.wait() for process in processes)), timeout=10)
-        except asyncio.TimeoutError:
-            for process in processes:
-                if process.returncode is None:
-                    process.kill()
-            await asyncio.gather(*(process.wait() for process in processes))
+        await processes.stop()
+        print(f"Collection stopped: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
+        for path in root.glob("*.log"):
+            with path.open("rb") as log:
+                log.seek(max(0, path.stat().st_size - 6000))
+                print(f"{path.name}:\n{log.read().decode(errors='replace')}", file=sys.stderr)
         usable = False
         if (root / "calls.jsonl").exists():
             for line in (root / "calls.jsonl").read_text().splitlines():
@@ -387,16 +451,12 @@ async def collect(args: argparse.Namespace) -> None:
             )
             print(f"Partial traces retained: {root}", file=sys.stderr, flush=True)
         else:
-            for log in logs:
-                log.flush()
-            for path in root.glob("worker-*.log"):
-                print(f"{path.name}:\n{path.read_text()[-6000:]}", file=sys.stderr)
             shutil.rmtree(root)
             print("No usable model calls; removed the failed run directory.", file=sys.stderr, flush=True)
         raise
     finally:
-        for log in logs:
-            log.close()
+        await processes.stop()
+        loop.remove_signal_handler(signal.SIGTERM)
 
 
 if __name__ == "__main__":
