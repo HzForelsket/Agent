@@ -56,18 +56,26 @@ cd examples/rag
 以下是本 RAG 示例原有的 MuSiQue tiny 数据和 Wikipedia 检索语料。
 可以在能联网的机器下载后整体拷贝 `data/` 到 NPU 主机；无需上传到 Git。
 已有这三个文件时跳过下载。
+先进入仓库的 `agent-lightning/examples/rag` 目录。`data/` 已被 Git 忽略，
+`git pull` 不会带来这些文件，采集入口也不会自动下载它们。
 
 ```bash
 mkdir -p data
 gdown 1Pq4Ag8zVoN8gUtLu0LcBfY35Dm5zL0hq -O data/dataset_tiny.parquet
 gdown 1REXCpRLbeZu1KfWWKhIGEQe_WNHUOBkS -O data/chunks_candidate_tiny.pkl
 gdown 1f6P-h_8KSRhe5pqDHWbRQWvUhTygfZ-c -O data/index_hnsw_faiss_n32e40_tiny.index
+ls -lh data/dataset_tiny.parquet data/chunks_candidate_tiny.pkl data/index_hnsw_faiss_n32e40_tiny.index
 python wiki_retriever_mcp.py --data-dir data --device cpu \
   --embedding-model BAAI/bge-large-en-v1.5
 ```
 
 离线机器将 `--embedding-model` 替换为已下载的 BGE 模型目录。检索索引与该 embedding 模型配套，
 保持现有工具每次返回 top-1 文档的行为。该终端保持运行，默认 MCP 地址是 `http://127.0.0.1:8099/sse`。
+
+如果报 `dataset_tiny.parquet` 不存在，先完成以上下载，再重新运行采集。
+已有数据放在其他目录时，用 `--dataset /绝对路径/dataset_tiny.parquet` 指定题目文件，
+并用检索服务的 `--data-dir /绝对路径/语料目录` 指定索引和文本位置。
+若 NPU 主机无法访问 Google Drive，在可联网机器下载这三个文件后拷贝过去。
 
 ## 3. 采集并自动生成收益表
 

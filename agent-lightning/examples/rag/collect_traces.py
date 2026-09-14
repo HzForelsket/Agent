@@ -81,6 +81,13 @@ def arguments() -> argparse.Namespace:
         parser.error("endpoint must be an HTTP(S) base URL ending in /v1")
     if endpoint.username or endpoint.password or endpoint.query or endpoint.fragment:
         parser.error("put API credentials in VLLM_API_KEY, not the endpoint URL")
+    if args.worker is None and not args.dataset.is_file():
+        parser.error(
+            f"Dataset not found: {args.dataset.resolve()}\n"
+            "Example data is not included in Git and is not downloaded automatically. "
+            "Follow TRACE_COLLECTION.md, section 2, to download the dataset and retrieval corpus, "
+            "or pass --dataset /absolute/path/to/dataset_tiny.parquet."
+        )
     return args
 
 
