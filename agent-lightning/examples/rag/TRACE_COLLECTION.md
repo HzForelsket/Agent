@@ -5,7 +5,7 @@
 目标模型是 `Qwen/Qwen3-30B-A3B-Instruct-2507`（总参数 30B，激活参数约 3B）。
 采集结束自动生成收益表；不启动训练，也不要求安装 PrefixGrouper 或 verl。
 
-统计单位统一为**一条完整轨迹、一条 token 序列**，收益表比较**每条完整轨迹独立计算**与**同题 4 条完整轨迹合并前缀树**。
+统计单位统一为**一条完整轨迹、一条 token 序列**，收益表比较**每条完整轨迹独立计算**、**全组公共前缀简单共享**与**同题 4 条完整轨迹合并前缀树**。
 它估计 token 位置和 causal attention pair 的减少，不测量 NPU 训练加速。
 
 ## 1. NPU 主机环境
@@ -160,20 +160,38 @@ python embedding_download.py --insecure-download
 python analyze_traces.py --input traces/npu-qwen30b-run01
 ```
 
+也可直接读取已有 `analysis` 目录（支持把该目录独立拷贝到另一台机器），无需原始采集目录或模型：
+
+```bash
+python analyze_traces.py \
+  --input traces/npu-qwen30b-run01/analysis \
+  --output traces/npu-qwen30b-run01/analysis-comparison
+```
+
+输入分析目录必须包含 `summary.json`、`per_task.csv` 和 `trajectory_sequences.jsonl`；
+只有 Markdown/CSV 汇总表无法恢复公共前缀，必须保留完整 token 序列。
+不传 `--output` 时，原始轨迹输入默认写到其 `analysis/`，分析目录输入则更新该分析目录的派生文件。
+传入新的 `--output` 可保留旧报告。原始 `calls.jsonl` 等采集记录不修改，也不启动 MCP 或 vLLM。
+分析目录输入复用此前完整组的筛选结果，检查组内编号、计数及独立基线，不重新验证缺失的原始调用。
+
+
 每条完整轨迹的序列 `S_i` 包含初始问题、全部模型动作、工具结果和最终回复。
 使用最后一次请求的完整历史 `prompt_token_ids` 加最终 `response_token_ids` 构造一条序列；
 逐轮检查原有消息和模型动作均保留在后续历史中，否则排除该题组。
 同题 4 条完整轨迹为一个组，统一采用以下统计方式：
 
 - 基线 token 工作量：`|S_1| + |S_2| + |S_3| + |S_4|`。
-- 共享后 token 工作量：`Trie(S_1, S_2, S_3, S_4)` 的节点数（不计空根节点）。
+- 简单共享：全组最长公共 token 前缀长度为 `P` 时，只共享这段前缀一次，后缀各自独立；不对子组再共享。
+- 简单共享 token 工作量：`基线 − (G−1)×P`；attention pairs：`基线 pairs − (G−1)×P×(P+1)/2`。
+- 前缀树共享后 token 工作量：`Trie(S_1, S_2, S_3, S_4)` 的节点数（不计空根节点）。
 - token 减少比例：`1 - 共享后 / 基线`；工作量缩减倍数：`基线 / 共享后`。
 - 基线 attention pairs：`sum_i |S_i| * (|S_i| + 1) / 2`。
 - 共享后 attention pairs：树中每个 token 节点可见祖先数加自身，假定完整 causal attention。
 
 主表只纳入组内全部完成、无长度截断、调用连续、真实 token ID 完整的组，并显示排除组数。
 不同题目之间不合树；同题分叉后重复出现的文本也不当作共享前缀。
-汇总比例按所有题组的工作量总和计算。
+汇总比例按所有题组的工作量总和计算。报告另外给出前缀树相对简单共享的额外节省，以简单共享工作量为分母。
+简单共享是明确的单公共前缀算法对照，不等同于对现有 PrefixGrouper 实现的实测。
 
 共享激活不能合并不同轨迹的 advantage、loss 权重或 clipping 项，必须保留其贡献并正确累加梯度。
 工具输出只有上下文作用，不直接作为模型动作计算 policy loss。
@@ -181,6 +199,11 @@ python analyze_traces.py --input traces/npu-qwen30b-run01
 表中比例不包含反向传播、通信、packing、显存或 kernel 调度成本，不能当作训练加速比。
 
 ## 已完成的验证
+
+使用此前真实保存的 32 题、128 条完整轨迹、408 次调用，分别从原始采集目录和独立分析目录运行离线入口，
+生成的 `benefit.csv` 逐字节一致。独立基线 101,927 token 位置，简单共享 57,407（减少 43.68%），
+前缀树 51,656（减少 49.32%）；前缀树相对简单共享额外减少 5,751 token 位置，即 10.02%。
+该验证使用已有 GPU 轨迹，不是 NPU 训练实测；NPU 结果需对其保存目录执行同一分析命令。
 
 改用 `mcp==1.29.0` SDK 内置服务后，在本地 `agent` 环境通过正式检索入口加载缓存 BGE 和 2,000 条文档，
 成功监听 `127.0.0.1:18099`，随后由 30 秒限时命令停止。该验证覆盖 CPU 服务初始化及启动，

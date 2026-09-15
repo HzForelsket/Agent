@@ -56,7 +56,7 @@ python train_rag.py
 | `wiki_retriever_mcp.py` | MCP server for Wikipedia retrieval |
 | `collect_traces.py` | Automatically start NPU vLLM and CPU MCP, collect complete trajectories, and generate a benefit table |
 | `trace_services.py` | Owned service process groups, port checks, readiness, failure monitoring and shutdown |
-| `analyze_traces.py` | Offline sharing estimates across complete trajectory groups; Markdown/CSV/JSON output |
+| `analyze_traces.py` | Reanalyze raw traces or saved analysis directories; independent, single-prefix and trie sharing comparisons |
 | `requirements-traces.txt` | Application dependencies for the separate trace collection client |
 | `TRACE_COLLECTION.md` | Chinese instructions for NPU serving integration, saved traces and metric definitions |
 

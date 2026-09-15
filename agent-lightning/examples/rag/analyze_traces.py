@@ -1,6 +1,6 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Estimate sharing across complete trajectories: python analyze_traces.py --input RUN_DIR."""
+"""Estimate sharing across complete trajectories: python analyze_traces.py --input RUN_DIR_OR_ANALYSIS_DIR."""
 
 import argparse
 import csv
@@ -108,13 +108,8 @@ def write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> None
         writer.writerows(rows)
 
 
-def main() -> None:
-    """Write an aggregate benefit table and per-question results for complete groups."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, required=True)
-    parser.add_argument("--output", type=Path, help="Defaults to RUN_DIR/analysis; raw traces are never modified.")
-    args = parser.parse_args()
-    root = args.input.resolve()
+def analyze_raw(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Validate raw calls and select complete trajectory groups."""
     config = json.loads((root / "config.json").read_text())
     group_size = config["rollouts_per_task"]
     if type(group_size) is not int or group_size < 2:
@@ -147,8 +142,7 @@ def main() -> None:
             reason = "missing_or_duplicate_samples"
         elif any(row["status"] != "completed" for row in group):
             reason = "incomplete_trajectory"
-        sequences: list[list[int]] = []
-        separate_tokens = separate_pairs = calls_in_group = 0
+        calls_in_group = 0
         group_sequences = []
         for trajectory in group:
             calls = sorted(by_trajectory[trajectory["trajectory_id"]], key=lambda row: row["turn"])
@@ -172,11 +166,7 @@ def main() -> None:
             except ValueError as error:
                 reason = reason or str(error)
                 continue
-            length = len(sequence)
-            separate_tokens += length
-            separate_pairs += length * (length + 1) // 2
             calls_in_group += len(calls)
-            sequences.append(sequence)
             group_sequences.append(
                 {
                     "task_id": task_id,
@@ -189,105 +179,279 @@ def main() -> None:
         if reason:
             excluded.append({"task_id": task_id, "reason": reason, "recorded_trajectories": len(group)})
             continue
-        merged_tokens, merged_pairs = tree_cost(sequences)
         per_task.append(
             {
                 "task_id": task_id,
                 "trajectories": group_size,
                 "model_calls": calls_in_group,
-                **metrics(separate_tokens, merged_tokens, separate_pairs, merged_pairs),
             }
         )
         trajectory_sequences.extend(group_sequences)
         included_calls += calls_in_group
-    aggregate = metrics(
-        *(
-            sum(row[key] for row in per_task)
-            for key in ("separate_tokens", "merged_tokens", "separate_causal_pairs", "merged_causal_pairs")
-        )
+    return (
+        per_task,
+        trajectory_sequences,
+        {
+            "input": str(root),
+            "group_size": group_size,
+            "selected_tasks": len(selected),
+            "complete_groups": len(per_task),
+            "excluded_groups": len(excluded),
+            "included_trajectories": len(per_task) * group_size,
+            "included_model_calls": included_calls,
+            "recorded_model_calls": len(raw),
+            "trajectory_status": dict(Counter(t["status"] for t in trajectories)),
+            "excluded": excluded,
+            "diagnostics": diagnostics,
+            "validation_source": "raw_model_calls_and_trajectory_status",
+        },
     )
+
+
+def analyze_export(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Recompute from a saved analysis export without accessing the original run or model."""
+    summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
+    if (
+        summary.get("statistics_unit") != "one_complete_trajectory_sequence"
+        or summary.get("sequence_representation") != "final_prompt_token_ids_plus_final_response_token_ids"
+    ):
+        raise ValueError("Analysis input must contain complete trajectory sequences, not individual model calls")
+    group_size = summary["group_size"]
+    if type(group_size) is not int or group_size < 2:
+        raise ValueError("Analysis group_size must be an integer >= 2")
+    diagnostics: list[str] = []
+    sequences = read_records(root / "trajectory_sequences.jsonl", diagnostics)
+    if diagnostics:
+        raise ValueError("Incomplete analysis export: " + "; ".join(diagnostics))
+    with (root / "per_task.csv").open(encoding="utf-8-sig", newline="") as handle:
+        previous = list(csv.DictReader(handle))
+    rows = [
+        {"task_id": row["task_id"], "trajectories": int(row["trajectories"]), "model_calls": int(row["model_calls"])}
+        for row in previous
+    ]
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for sequence in sequences:
+        tokens = sequence.get("token_ids")
+        if not isinstance(tokens, list) or not tokens or any(type(token) is not int or token < 0 for token in tokens):
+            raise ValueError("Analysis contains missing or invalid full-trajectory token IDs")
+        groups[sequence["task_id"]].append(sequence)
+    if len({row["trajectory_id"] for row in sequences}) != len(sequences):
+        raise ValueError("Duplicate trajectory IDs in analysis export")
+    if len({row["task_id"] for row in rows}) != len(rows) or set(groups) != {row["task_id"] for row in rows}:
+        raise ValueError("Analysis per_task.csv does not match trajectory_sequences.jsonl")
+    for row, old in zip(rows, previous):
+        group = groups[row["task_id"]]
+        if (
+            row["trajectories"] != group_size
+            or len(group) != group_size
+            or {sequence["sample_index"] for sequence in group} != set(range(group_size))
+            or row["model_calls"] < group_size
+        ):
+            raise ValueError(f"Incomplete or inconsistent exported group: {row['task_id']}")
+        lengths = [len(sequence["token_ids"]) for sequence in group]
+        if sum(lengths) != int(old["separate_tokens"]) or sum(n * (n + 1) // 2 for n in lengths) != int(
+            old["separate_causal_pairs"]
+        ):
+            raise ValueError(f"Exported token sequences disagree with saved baseline: {row['task_id']}")
+    if (
+        len(rows) != summary["complete_groups"]
+        or len(sequences) != summary["included_trajectories"]
+        or sum(row["model_calls"] for row in rows) != summary["included_model_calls"]
+        or len(rows) + summary["excluded_groups"] != summary["selected_tasks"]
+    ):
+        raise ValueError("Analysis coverage counts disagree with exported records")
+    keys = (
+        "input",
+        "group_size",
+        "selected_tasks",
+        "complete_groups",
+        "excluded_groups",
+        "included_trajectories",
+        "included_model_calls",
+        "recorded_model_calls",
+        "trajectory_status",
+        "excluded",
+        "diagnostics",
+    )
+    context = {key: summary[key] for key in keys}
+    context["validation_source"] = "previously_validated_complete_sequence_export"
+    return rows, sequences, context
+
+
+def sharing_costs(sequences: list[list[int]]) -> dict[str, int]:
+    """Compare independent trajectories, one common prefix, and all trie branches."""
+    common = len(sequences[0])
+    for sequence in sequences[1:]:
+        common = min(common, lcp(sequences[0], sequence))
+    separate = sum(len(sequence) for sequence in sequences)
+    separate_pairs = sum(len(sequence) * (len(sequence) + 1) // 2 for sequence in sequences)
+    tree_tokens, tree_pairs = tree_cost(sequences)
+    return {
+        "separate_tokens": separate,
+        "separate_causal_pairs": separate_pairs,
+        "common_prefix_tokens": common,
+        "simple_tokens": separate - (len(sequences) - 1) * common,
+        "simple_causal_pairs": separate_pairs - (len(sequences) - 1) * common * (common + 1) // 2,
+        "merged_tokens": tree_tokens,
+        "merged_causal_pairs": tree_pairs,
+    }
+
+
+def comparisons(costs: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Use the same complete groups for every comparison and its denominator."""
+    return {
+        "simple_sharing": metrics(
+            costs["separate_tokens"],
+            costs["simple_tokens"],
+            costs["separate_causal_pairs"],
+            costs["simple_causal_pairs"],
+        ),
+        "cross_trajectory_sharing": metrics(
+            costs["separate_tokens"],
+            costs["merged_tokens"],
+            costs["separate_causal_pairs"],
+            costs["merged_causal_pairs"],
+        ),
+        "tree_over_simple": metrics(
+            costs["simple_tokens"], costs["merged_tokens"], costs["simple_causal_pairs"], costs["merged_causal_pairs"]
+        ),
+    }
+
+
+def main() -> None:
+    """Analyze raw trajectories or a standalone analysis export and write all three schemes."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--input", type=Path, required=True, help="Collection directory or existing analysis directory."
+    )
+    parser.add_argument(
+        "--output", type=Path, help="Destination; defaults to RUN_DIR/analysis or the input analysis directory."
+    )
+    args = parser.parse_args()
+    root = args.input.resolve()
+    if (root / "config.json").is_file():
+        per_task, sequences, context = analyze_raw(root)
+        default_output = root / "analysis"
+    elif (root / "summary.json").is_file():
+        per_task, sequences, context = analyze_export(root)
+        default_output = root
+    else:
+        parser.error(
+            "input must be a collection directory with config.json, or an analysis directory with summary.json, per_task.csv and trajectory_sequences.jsonl"
+        )
+    output = (args.output or default_output).resolve()
+    if (output / "config.json").exists() or (output / "calls.jsonl").exists():
+        parser.error("output cannot be a raw collection directory; choose its analysis subdirectory")
+    groups: dict[str, list[list[int]]] = defaultdict(list)
+    for sequence in sequences:
+        groups[sequence["task_id"]].append(sequence["token_ids"])
+    cost_fields = (
+        "separate_tokens",
+        "separate_causal_pairs",
+        "common_prefix_tokens",
+        "simple_tokens",
+        "simple_causal_pairs",
+        "merged_tokens",
+        "merged_causal_pairs",
+    )
+    for row in per_task:
+        row.update(sharing_costs(groups[row["task_id"]]))
+        for name, comparison in comparisons(row).items():
+            if name == "cross_trajectory_sharing":
+                row.update(comparison)
+            else:
+                row.update({f"{name}_{key}": value for key, value in comparison.items()})
+    totals = {key: sum(row[key] for row in per_task) for key in cost_fields}
+    comparison = comparisons(totals)
     summary = {
+        **context,
         "statistics_unit": "one_complete_trajectory_sequence",
         "sequence_representation": "final_prompt_token_ids_plus_final_response_token_ids",
-        "input": str(root),
-        "group_size": group_size,
-        "selected_tasks": len(selected),
-        "complete_groups": len(per_task),
-        "excluded_groups": len(excluded),
-        "included_trajectories": len(per_task) * group_size,
-        "included_model_calls": included_calls,
-        "recorded_model_calls": len(raw),
-        "trajectory_status": dict(Counter(t["status"] for t in trajectories)),
-        "cross_trajectory_sharing": aggregate,
-        "excluded": excluded,
-        "diagnostics": diagnostics,
+        "analysis_input": str(root),
+        **comparison,
         "definitions": {
-            "baseline": "Sum the lengths of one complete token sequence per trajectory: final full-history prompt plus final response.",
-            "comparison": "Build one prefix tree from exactly G complete trajectory sequences for each question; no sharing across questions.",
-            "causal_pairs": "Sum of visible ancestor keys including self for every unique token node; full causal attention assumed.",
-            "scope": "Only complete groups with successful, non-truncated, exact-token calls and all prior messages/actions preserved; global ratios use summed costs.",
-            "loss": "Shared states retain separate per-trajectory loss multiplicities, advantages and clipping terms.",
-            "limitation": "Structural work estimate, not measured training speedup or support already implemented in PrefixGrouper. Requires matching positions, masks and model state.",
+            "baseline": "Sum one complete sequence per trajectory: final full-history prompt plus final response.",
+            "simple_sharing": "Share the longest exact token prefix common to all G trajectories of the same question once; all suffixes are independent, without subgroup sharing.",
+            "comparison": "Share all exact prefixes across the same G complete trajectories using a prefix tree; never merge across questions or after divergence.",
+            "tree_over_simple": "Additional reductions use the simple-sharing cost as denominator, not the independent baseline.",
+            "causal_pairs": "Full causal attention: L*(L+1)/2 for each sequence. A shared prefix of length P saves (G-1)*P*(P+1)/2 pairs.",
+            "scope": "Identical complete groups for all schemes. Global ratios use summed costs. Analysis exports reuse prior raw-call validation; excluded groups are not recovered.",
+            "loss": "Retain separate per-trajectory loss multiplicities, advantages and clipping terms; tool outputs are context only.",
+            "limitation": "Structural estimate, not measured training speedup or a claim of PrefixGrouper implementation support. Matching positions, masks and model state required.",
         },
     }
-    output = (args.output or root / "analysis").resolve()
-    output.mkdir(parents=True, exist_ok=True)
-    (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    with (output / "trajectory_sequences.jsonl").open("w", encoding="utf-8") as handle:
-        for trajectory in trajectory_sequences:
-            handle.write(json.dumps(trajectory, ensure_ascii=False) + "\n")
-    fields = ["task_id", "trajectories", "model_calls", *aggregate]
-    write_csv(output / "per_task.csv", per_task, fields)
-    table = [
-        {
-            "方案": "每条完整轨迹独立计算（基线）",
-            "token位置数": aggregate["separate_tokens"],
-            "减少token位置数": 0,
-            "token减少比例": 0 if per_task else "N/A",
-            "token工作量缩减倍数": 1 if per_task else "N/A",
-            "causal_attention_pairs": aggregate["separate_causal_pairs"],
-            "attention_pair减少比例": 0 if per_task else "N/A",
-        },
-        {
-            "方案": f"同题{group_size}条完整轨迹合并前缀树",
-            "token位置数": aggregate["merged_tokens"],
-            "减少token位置数": aggregate["saved_tokens"],
-            "token减少比例": aggregate["token_reduction"],
-            "token工作量缩减倍数": aggregate["token_work_ratio"],
-            "causal_attention_pairs": aggregate["merged_causal_pairs"],
-            "attention_pair减少比例": aggregate["causal_pair_reduction"],
-        },
-    ]
-    write_csv(output / "benefit.csv", table, list(table[0]))
+    table = []
+    for name, token_key, pair_key in (
+        ("每条完整轨迹独立计算（基线）", "separate_tokens", "separate_causal_pairs"),
+        ("简单共享（全组最长公共前缀，后缀独立）", "simple_tokens", "simple_causal_pairs"),
+        (f"同题{context['group_size']}条完整轨迹合并前缀树", "merged_tokens", "merged_causal_pairs"),
+    ):
+        value = metrics(totals["separate_tokens"], totals[token_key], totals["separate_causal_pairs"], totals[pair_key])
+        table.append(
+            {
+                "方案": name,
+                "token位置数": value["merged_tokens"],
+                "减少token位置数": value["saved_tokens"],
+                "token减少比例": value["token_reduction"],
+                "token工作量缩减倍数": value["token_work_ratio"],
+                "causal_attention_pairs": value["merged_causal_pairs"],
+                "attention_pair减少比例": value["causal_pair_reduction"],
+            }
+        )
 
     def percent(value: float | None) -> str:
         return f"{value:.2%}" if value is not None else "N/A"
 
-    ratio = aggregate["token_work_ratio"]
-    ratio_text = f"{ratio:.2f}x" if ratio is not None else "N/A"
+    def ratio(value: float | None) -> str:
+        return f"{value:.2f}x" if value is not None else "N/A"
+
+    table_text = "\n".join(
+        f"| {row['方案']} | {row['token位置数']:,} | {percent(row['token减少比例'])} | {ratio(row['token工作量缩减倍数'])} | {row['causal_attention_pairs']:,} | {percent(row['attention_pair减少比例'])} |"
+        for row in table
+    )
+    extra = comparison["tree_over_simple"]
     report = f"""# 完整轨迹跨轨迹共享收益估算
 
-采集目录：`{root}`。每题 {group_size} 条轨迹，完整组 {len(per_task)}/{len(selected)}；
-纳入 {len(per_task) * group_size} 条轨迹、{included_calls} 次模型调用，排除 {len(excluded)} 个不完整或无效组。
+原采集目录：`{context['input']}`。本次分析输入：`{root}`。
+每题 {context['group_size']} 条轨迹，完整组 {context['complete_groups']}/{context['selected_tasks']}；
+纳入 {context['included_trajectories']} 条轨迹、{context['included_model_calls']} 次模型调用，排除 {context['excluded_groups']} 组。
+验证来源：`{context['validation_source']}`；三种方案使用完全相同的完整题组。
 
-| 方案 | token 位置数 | token 减少比例 | token 工作量缩减倍数 | causal attention pairs | pair 减少比例 |
+| 方案 | token 位置数 | 相对独立基线减少比例 | token 工作量缩减倍数 | causal attention pairs | 相对独立基线 pair 减少比例 |
 |---|---:|---:|---:|---:|---:|
-| 每条完整轨迹独立计算（基线） | {aggregate['separate_tokens']:,} | {'0%' if per_task else 'N/A'} | {'1.00x' if per_task else 'N/A'} | {aggregate['separate_causal_pairs']:,} | {'0%' if per_task else 'N/A'} |
-| 同题 {group_size} 条完整轨迹合并前缀树 | {aggregate['merged_tokens']:,} | {percent(aggregate['token_reduction'])} | {ratio_text} | {aggregate['merged_causal_pairs']:,} | {percent(aggregate['causal_pair_reduction'])} |
+{table_text}
 
-统计单位固定为一条完整轨迹、一条 token 序列：初始问题、全部模型动作和工具结果、最终回复。
-序列取最后一次完整历史请求的 prompt token ID 加最终 response token ID；逐轮检查历史消息和模型动作均被保留。
-基线 = 同题 {group_size} 条完整序列的长度之和；共享后 = 这 {group_size} 条序列合成前缀树的节点数。
-减少比例 = 1 − 共享后 / 基线。汇总使用工作量之和，非各题百分比的算术平均。
+前缀树相对简单共享额外减少 **{extra['saved_tokens']:,}** 个 token 位置，
+相对简单共享减少 **{percent(extra['token_reduction'])}**，工作量缩减倍数 **{ratio(extra['token_work_ratio'])}**；
+额外减少 **{extra['separate_causal_pairs'] - extra['merged_causal_pairs']:,}** 个 attention pairs，
+相对简单共享减少 **{percent(extra['causal_pair_reduction'])}**。
 
-这是结构上的计算量估算，不是 NPU 训练耗时、显存节省或实测加速比，也不表示 PrefixGrouper 已支持该树。
-共享还要求位置编码、attention mask 和模型状态一致；分叉后相同文本不重新合并。
-各轨迹的 response loss、advantage、权重与 clipping 仍须分别保留并正确累加梯度。
-工具结果作为上下文，不作为模型生成动作计算 policy loss。
-这是按最终完整历史序列估计的训练结构；实际训练还需保证 tokenizer、loss mask 和 rollout log-prob 的位置映射一致。
+统计单位固定为一条完整轨迹、一条 token 序列，包含初始问题、全部模型动作、工具结果和最终回复。
+序列使用最终完整历史请求的 prompt token ID 加最终 response token ID。
+简单共享只保存同题全组最长公共 token 前缀一次，第一次分叉后各条后缀独立；不再对子组共享。
+设该前缀长度为 P、轨迹数为 G：简单共享 token 工作量 = 独立基线 − (G−1)×P；
+attention pairs = 独立基线 pairs − (G−1)×P×(P+1)/2。
+前缀树还允许部分轨迹在共同分支上继续共享，但分叉后相同文本不重新合并。
+简单共享是这里定义的单公共前缀对照，不代表已实测 PrefixGrouper 的分组行为。
+所有汇总比例按工作量之和计算，不对各题百分比取平均。
 
-详细数据见 `per_task.csv`、`benefit.csv`、`summary.json`；实际纳入的完整序列见 `trajectory_sequences.jsonl`。
+原始轨迹输入会逐轮检查消息历史、模型动作、完成状态及真实 token ID。
+分析目录输入复用此前已通过检查的完整序列，并核对题组、编号、基线 token 数与覆盖率；
+无法仅凭导出目录重新验证原始调用，也不会补回此前排除的题组。
+
+这是结构上的计算量估算，不是 NPU 训练耗时、显存节省或实测加速比。
+共享要求位置编码、attention mask 和模型状态一致；每条轨迹的 loss、advantage、权重和 clipping 保持独立并累加梯度。
+工具结果只作为上下文。训练接入仍须保证 tokenizer、loss mask 和 rollout log-prob 位置映射一致。
+详细数据见 `per_task.csv`、`benefit.csv`、`summary.json` 和 `trajectory_sequences.jsonl`。
 """
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with (output / "trajectory_sequences.jsonl").open("w", encoding="utf-8") as handle:
+        for sequence in sequences:
+            handle.write(json.dumps(sequence, ensure_ascii=False) + "\n")
+    fields = list(per_task[0]) if per_task else ["task_id", "trajectories", "model_calls", *cost_fields]
+    write_csv(output / "per_task.csv", per_task, fields)
+    write_csv(output / "benefit.csv", table, list(table[0]))
     (output / "report.md").write_text(report, encoding="utf-8")
     print(report)
     print(f"Saved benefit table: {output / 'benefit.csv'}")
