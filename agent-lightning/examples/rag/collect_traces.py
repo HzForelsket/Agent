@@ -1,6 +1,6 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Start NPU vLLM and CPU MCP, collect complete RAG trajectories, and generate the benefit table."""
+"""Collect RAG, original SQL or original 20 Questions trajectories with managed NPU vLLM."""
 
 import argparse
 import asyncio
@@ -21,8 +21,9 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from rag_data import DEFAULT_DATA_DIR, add_download_argument, ensure_example_data
+from rag_data import DEFAULT_DATA_DIR, add_download_argument
 from trace_services import Processes, check_ports, service_commands
+from trace_tasks import prepare_tasks
 
 CURRENT: contextvars.ContextVar[str] = contextvars.ContextVar("trajectory_id")
 
@@ -55,6 +56,13 @@ def positive(value: str) -> int:
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True, help="Fresh directory; existing paths are rejected.")
+    parser.add_argument("--agent", choices=("rag", "sql", "q20"), default="rag")
+    parser.add_argument(
+        "--sql-database-dir", type=Path, help="Directory containing original Spider database/DB_ID/DB_ID.sqlite files."
+    )
+    parser.add_argument(
+        "--q20-search", action="store_true", help="Enable the original optional Q20 simulated-search tool."
+    )
     parser.add_argument("--model", default="Qwen3-30B-A3B-Instruct-2507", help="Served model name, not weight path.")
     parser.add_argument("--model-path", type=Path, help="Local BF16 Qwen3-30B-A3B-Instruct-2507 weight directory.")
     parser.add_argument("--vllm-python", default=sys.executable, help="Python executable in the NPU vLLM environment.")
@@ -74,14 +82,20 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--embedding-model", default="BAAI/bge-large-en-v1.5")
     parser.add_argument("--embedding-cache", type=Path, default=DEFAULT_DATA_DIR / "embedding-models")
     parser.add_argument("--local-files-only", action="store_true", help="Require cached/local embedding model files.")
-    parser.add_argument("--dataset", type=Path, default=DEFAULT_DATA_DIR / "dataset_tiny.parquet")
+    parser.add_argument("--dataset", type=Path, help="Default: cached RAG/Spider parquet or bundled Q20 nouns CSV.")
     add_download_argument(parser)
     parser.add_argument("--tasks", type=positive, default=32)
     parser.add_argument("--rollouts-per-task", type=positive, default=4)
     parser.add_argument("--concurrency", type=positive, default=4)
-    parser.add_argument("--max-model-calls", type=positive, default=8)
+    parser.add_argument(
+        "--max-model-calls",
+        type=positive,
+        help="Safety cap per role: RAG 8; SQL/Q20 128. Does not replace original flow limits.",
+    )
     parser.add_argument("--max-tokens-per-call", type=positive, default=2048)
-    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument(
+        "--temperature", type=float, default=0.7, help="RAG/SQL sampling; Q20 preserves original CrewLLM defaults."
+    )
     parser.add_argument("--seed", type=int, default=20260914)
     parser.add_argument("--proxy-port", type=positive, default=18031)
     parser.add_argument("--trajectory-timeout", type=positive, default=900)
@@ -92,6 +106,10 @@ def arguments() -> argparse.Namespace:
     args = parser.parse_args()
     if args.worker is not None:
         return args
+    if args.max_model_calls is None:
+        args.max_model_calls = 8 if args.agent == "rag" else 128
+    if args.agent == "sql" and args.max_tokens_per_call != 2048:
+        parser.error("Original SQL workflow fixes max_tokens=2048; capture does not change it")
     if not args.model_path or not (args.model_path / "config.json").is_file():
         parser.error("--model-path must point to the local 30B weight directory containing config.json")
     devices = (args.npu_devices or "").split(",")
@@ -114,10 +132,14 @@ def arguments() -> argparse.Namespace:
         parser.error("temperature must be in [0, 2] and seed in [0, 2**32)")
     if max(args.vllm_port, args.mcp_port, args.proxy_port + args.concurrency - 1) > 65535:
         parser.error("proxy port range exceeds 65535")
-    if args.worker is None and args.dataset.name != "dataset_tiny.parquet" and not args.dataset.is_file():
+    if (
+        args.dataset
+        and not args.dataset.is_file()
+        and not (args.agent == "rag" and args.dataset.name == "dataset_tiny.parquet")
+    ):
         parser.error(
             f"Custom dataset not found: {args.dataset.resolve()}. "
-            "Only the bundled example filename dataset_tiny.parquet can be downloaded automatically."
+            "Omit --dataset to prepare the bundled dataset automatically."
         )
     return args
 
@@ -127,16 +149,18 @@ async def run_worker(root: Path, config: dict[str, Any], worker_id: int) -> None
     os.environ["OPENAI_AGENTS_DISABLE_TRACING"] = "1"
     os.environ["OPENAI_API_KEY"] = "local-capture-proxy"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ["CREWAI_TELEMETRY_DISABLED"] = "true"
+    os.environ["CREWAI_TRACING_ENABLED"] = "false"
     import httpx
     import uvicorn
     from agents import RunHooks, set_tracing_disabled
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse
-    from rag_agent import RAGAgent
 
     import agentlightning as agl
 
     set_tracing_disabled(True)
+    role_counts: dict[tuple[str, str], int] = defaultdict(int)
     counts: dict[str, int] = defaultdict(int)
     valid_counts: dict[str, int] = defaultdict(int)
     finish_reasons: dict[str, list[str]] = defaultdict(list)
@@ -144,28 +168,35 @@ async def run_worker(root: Path, config: dict[str, Any], worker_id: int) -> None
     app = FastAPI()
     headers = {"Authorization": f"Bearer {os.environ['VLLM_API_KEY']}"} if os.environ.get("VLLM_API_KEY") else {}
 
-    @app.post("/{trajectory_id}/v1/chat/completions")
-    async def forward(trajectory_id: str, request: Request) -> JSONResponse:
-        if trajectory_id not in identities:
+    async def forward(trajectory_id: str, request: Request, role: str) -> JSONResponse:
+        if trajectory_id not in identities or role not in {"policy", "answerer", "search"}:
             return JSONResponse({"error": {"message": "unknown trajectory"}}, status_code=404)
-        turn = counts[trajectory_id]
-        counts[trajectory_id] += 1
-        if turn >= config["max_model_calls"]:
-            return JSONResponse({"error": {"message": "model call cap exceeded"}}, status_code=400)
+        turn = role_counts[trajectory_id, role]
+        role_counts[trajectory_id, role] += 1
+        if role == "policy":
+            counts[trajectory_id] += 1
         payload = await request.json()
         identity = identities[trajectory_id]
         payload["return_token_ids"] = True
         sample = identity["task_index"] * config["rollouts_per_task"] + identity["sample_index"]
-        payload["seed"] = (config["seed"] + sample * config["max_model_calls"] + turn) % (2**63)
+        payload["seed"] = (
+            config["seed"]
+            + sample * config["max_model_calls"]
+            + turn
+            + ("policy", "answerer", "search").index(role) * 2**40
+        ) % (2**63)
         record = {
             "trajectory_id": trajectory_id,
             **identity,
             "turn": turn,
+            "role": role,
             "started_at": time.time(),
             "request": payload,
             "token_ids_valid": False,
         }
         try:
+            if turn >= config["max_model_calls"]:
+                raise RuntimeError("Model call safety cap exceeded; original workflow did not finish")
             async with httpx.AsyncClient(timeout=config["trajectory_timeout"], trust_env=False) as client:
                 result = await client.post(config["endpoint"] + "/chat/completions", json=payload, headers=headers)
             record["http_status"] = result.status_code
@@ -189,7 +220,8 @@ async def run_worker(root: Path, config: dict[str, Any], worker_id: int) -> None
                 )
                 if not record["token_ids_valid"]:
                     raise ValueError("vLLM must return exact prompt_token_ids and choices[0].token_ids matching usage")
-                valid_counts[trajectory_id] += 1
+                if role == "policy":
+                    valid_counts[trajectory_id] += 1
                 finish_reasons[trajectory_id].append(choices[0]["finish_reason"])
             return JSONResponse(response, status_code=result.status_code)
         except Exception as error:
@@ -199,7 +231,15 @@ async def run_worker(root: Path, config: dict[str, Any], worker_id: int) -> None
             return JSONResponse({"error": {"message": str(error), "type": "capture_error"}}, status_code=502)
         finally:
             record["finished_at"] = time.time()
-            append(root, "calls.jsonl", record)
+            append(root, "calls.jsonl" if role == "policy" else "environment_calls.jsonl", record)
+
+    @app.post("/{trajectory_id}/v1/chat/completions")
+    async def forward_policy(trajectory_id: str, request: Request) -> JSONResponse:
+        return await forward(trajectory_id, request, "policy")
+
+    @app.post("/{trajectory_id}/{role}/v1/chat/completions")
+    async def forward_role(trajectory_id: str, role: str, request: Request) -> JSONResponse:
+        return await forward(trajectory_id, request, role)
 
     class Hooks(RunHooks[Any]):
         async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
@@ -240,7 +280,18 @@ async def run_worker(root: Path, config: dict[str, Any], worker_id: int) -> None
                 await server_task
                 raise RuntimeError("Capture proxy did not start")
             await asyncio.sleep(0.1)
-        runner.init(RAGAgent(mcp_server_url=config["mcp_url"], max_turns=config["max_model_calls"], hooks=Hooks()))
+        if config["agent"] == "rag":
+            from rag_agent import RAGAgent
+
+            agent = RAGAgent(mcp_server_url=config["mcp_url"], max_turns=config["max_model_calls"], hooks=Hooks())
+        else:
+            from trace_workflows import make_agent
+
+            def record_workflow(name: str, value: dict[str, Any]) -> None:
+                append(root, name, {"trajectory_id": CURRENT.get(), "time": time.time(), **value})
+
+            agent = make_agent(config, record_workflow)
+        runner.init(agent)
         runner.init_worker(worker_id, store)
         tasks = json.loads((root / "selected_tasks.json").read_text())
         for task_index, task in enumerate(tasks):
@@ -294,9 +345,17 @@ async def run_worker(root: Path, config: dict[str, Any], worker_id: int) -> None
                         finished_at=time.time(),
                         model_calls=counts[trajectory_id],
                         valid_model_calls=valid_counts[trajectory_id],
+                        role_model_calls={
+                            role: role_counts[trajectory_id, role] for role in ("policy", "answerer", "search")
+                        },
                     )
                     append(root, "trajectories.jsonl", info)
                     print(f"{trajectory_id}: {info['status']}, calls={counts[trajectory_id]}", flush=True)
+                if info.get("error_type") == "TimeoutError" and config["agent"] != "rag":
+                    # A cancelled await cannot stop a synchronous graph/flow thread. The parent owns
+                    # this process group and will clean up descendants after seeing the nonzero exit.
+                    print("Original workflow timed out; terminating this isolated worker", flush=True)
+                    os._exit(1)
                 if valid_counts[trajectory_id] == 0:
                     raise RuntimeError(f"No valid model call for {trajectory_id}; inspect worker log and calls.jsonl")
     finally:
@@ -319,7 +378,13 @@ async def collect(args: argparse.Namespace) -> None:
     }
     config.update(
         output=str(root),
-        dataset=str(args.dataset.resolve()),
+        dataset=str(args.dataset.resolve()) if args.dataset else None,
+        statistics_unit="one_complete_trajectory_sequence" if args.agent == "rag" else "original_workflow_call_slots",
+        workflow_implementation={
+            "rag": "rag.RAGAgent",
+            "sql": "spider.LitSQLAgent",
+            "q20": "tinker.TwentyQuestionsFlow",
+        }[args.agent],
         schema_version=1,
         endpoint=f"http://127.0.0.1:{args.vllm_port}/v1",
         mcp_url=f"http://127.0.0.1:{args.mcp_port}/sse",
@@ -356,6 +421,10 @@ async def collect(args: argparse.Namespace) -> None:
                     for name in (
                         "collect_traces.py",
                         "trace_services.py",
+                        "trace_tasks.py",
+                        "trace_workflows.py",
+                        "../spider/sql_agent.py",
+                        "../tinker/q20_agent.py",
                         "rag_agent.py",
                         "wiki_retriever_mcp.py",
                         "rag_data.py",
@@ -364,27 +433,22 @@ async def collect(args: argparse.Namespace) -> None:
                 },
             },
         )
-        check_ports([args.vllm_port, args.mcp_port, *range(args.proxy_port, args.proxy_port + args.concurrency)])
-        import pandas as pd
-
-        if args.dataset.name == "dataset_tiny.parquet":
-            ensure_example_data(args.dataset.parent, insecure=args.insecure_download)
-        frame = pd.read_parquet(args.dataset)
-        if not {"id", "question", "answer"}.issubset(frame.columns) or len(frame) < args.tasks:
-            raise ValueError("Dataset must have id/question/answer columns and at least --tasks rows")
-        tasks = frame.sample(n=args.tasks, random_state=args.seed)[["id", "question", "answer"]].to_dict("records")
-        tasks = [{key: str(value) for key, value in task.items()} for task in tasks]
-        if len({task["id"] for task in tasks}) != len(tasks):
-            raise ValueError("Selected task IDs must be unique")
+        ports = [args.vllm_port, *range(args.proxy_port, args.proxy_port + args.concurrency)]
+        if args.agent == "rag":
+            ports.append(args.mcp_port)
+        check_ports(ports)
+        if args.agent != "rag":
+            dependency_check = await processes.start(
+                "dependencies",
+                [sys.executable, "-u", str(Path(__file__).with_name("trace_workflows.py")), "--agent", args.agent],
+            )
+            if await dependency_check.wait():
+                raise RuntimeError(
+                    "Original workflow imports failed; install requirements-workflow-traces.txt in the collector environment"
+                )
+        tasks, dataset_metadata = prepare_tasks(config)
         write_json(root / "selected_tasks.json", tasks)
-        write_json(
-            root / "dataset_metadata.json",
-            {
-                "path": str(args.dataset.resolve()),
-                "sha256": hashlib.sha256(args.dataset.read_bytes()).hexdigest(),
-                "rows": len(frame),
-            },
-        )
+        write_json(root / "dataset_metadata.json", dataset_metadata)
         commands, overrides = service_commands(config)
         write_json(
             root / "services.json",
@@ -398,7 +462,8 @@ async def collect(args: argparse.Namespace) -> None:
                 "started_at": time.time(),
             },
         )
-        await processes.start("mcp", commands["mcp"])
+        if "mcp" in commands:
+            await processes.start("mcp", commands["mcp"])
         await processes.start("vllm", commands["vllm"], env={**os.environ, **overrides})
         await processes.ready(config)
         write_json(
@@ -424,8 +489,9 @@ async def collect(args: argparse.Namespace) -> None:
         codes = await processes.wait_workers(workers)
         write_json(root / "completion.json", {"worker_exit_codes": codes, "finished_at": time.time()})
         await processes.stop()
+        analyzer = "analyze_traces.py" if args.agent == "rag" else "analyze_call_traces.py"
         analysis = await processes.start(
-            "analysis", [sys.executable, str(Path(__file__).with_name("analyze_traces.py")), "--input", str(root)]
+            "analysis", [sys.executable, str(Path(__file__).with_name(analyzer)), "--input", str(root)]
         )
         if await analysis.wait():
             raise RuntimeError("Capture finished, but analysis failed; raw traces are retained")

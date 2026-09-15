@@ -6,6 +6,7 @@ This example demonstrates training a Retrieval-Augmented Generation (RAG) agent 
 
 For 30B multi-turn trace collection through an NPU model service and a complete-trajectory prefix-sharing benefit table,
 see [NPU 轨迹采集与收益表](TRACE_COLLECTION.md).
+For unchanged SQL and 20 Questions workflows, see [原流程采集与跨任务报告](WORKFLOW_TRACE_COLLECTION.md).
 
 ## Overview
 
@@ -55,6 +56,12 @@ python train_rag.py
 | `embedding_download.py` | ModelScope embedding model downloads with resume, checksums and optional TLS verification |
 | `wiki_retriever_mcp.py` | MCP server for Wikipedia retrieval |
 | `collect_traces.py` | Automatically start NPU vLLM and CPU MCP, collect complete trajectories, and generate a benefit table |
+| `trace_tasks.py` | Cached real RAG/Spider/Q20 inputs, database paths and data-only preparation CLI |
+| `trace_workflows.py` | Outer adapters calling unchanged SQL and CrewAI Q20 workflows |
+| `analyze_call_traces.py` | Independent-context call-slot sharing analysis without within-trajectory deduplication |
+| `compare_trace_reports.py` | Cross-workload summary from SQL/Q20 analysis directories |
+| `requirements-workflow-traces.txt` | Additional SQL and CrewAI client dependencies |
+| `WORKFLOW_TRACE_COLLECTION.md` | Original-workflow NPU collection commands, metadata and statistical scope |
 | `trace_services.py` | Owned service process groups, port checks, readiness, failure monitoring and shutdown |
 | `analyze_traces.py` | Reanalyze raw traces or saved analysis directories; independent, single-prefix and trie sharing comparisons |
 | `requirements-traces.txt` | Application dependencies for the separate trace collection client |

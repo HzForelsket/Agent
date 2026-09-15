@@ -1,0 +1,10 @@
+# Additional dependencies for unchanged SQL and CrewAI Q20 workflows; client environment only.
+-r requirements-traces.txt
+langchain==0.3.27
+langchain-community==0.3.27
+langchain-openai==0.3.35
+langgraph==0.6.11
+crewai==1.2.0
+sqlparse
+nltk
+termcolor

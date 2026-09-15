@@ -48,7 +48,7 @@ class Processes:
 
     def check_services(self) -> None:
         """Fail immediately if either serving process has exited."""
-        for name in ("mcp", "vllm"):
+        for name in (name for name in ("mcp", "vllm") if name in self.children):
             process = self.children[name]
             if process.returncode is not None:
                 raise RuntimeError(
@@ -63,7 +63,7 @@ class Processes:
 
         deadline = time.monotonic() + config["startup_timeout"]
         next_report = 0.0
-        pending = {"mcp", "vllm"}
+        pending = {"mcp", "vllm"} if config["agent"] == "rag" else {"vllm"}
         errors: dict[str, str] = {}
         headers = {"Authorization": f"Bearer {os.environ['VLLM_API_KEY']}"} if os.environ.get("VLLM_API_KEY") else {}
         async with httpx.AsyncClient(timeout=5, trust_env=False, headers=headers) as client:
@@ -208,4 +208,4 @@ def service_commands(config: dict[str, Any]) -> tuple[dict[str, list[str]], dict
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
     }
-    return {"mcp": mcp, "vllm": vllm}, overrides
+    return ({"mcp": mcp, "vllm": vllm} if config["agent"] == "rag" else {"vllm": vllm}), overrides

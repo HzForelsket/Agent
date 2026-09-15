@@ -1,7 +1,9 @@
 # Application dependencies only. Install separately from the NPU serving environment.
 openai==2.54.0
 openai-agents==0.20.0
-litellm[proxy]==1.80.0
+litellm==1.80.0
+fastapi>=0.115,<1
+uvicorn>=0.31.1,<1
 mcp==1.29.0
 faiss-cpu==1.11.0
 sentence-transformers==6.0.1

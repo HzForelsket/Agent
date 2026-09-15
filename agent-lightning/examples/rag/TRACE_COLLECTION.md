@@ -1,5 +1,7 @@
 # 在 NPU 服务上采集 30B 多轮 RAG 轨迹
 
+SQL / 20 Questions 保持原流程的采集和多上下文统计见 [原流程采集说明](WORKFLOW_TRACE_COLLECTION.md)。本页仅描述默认 RAG 模式。
+
 本入口调用仓库现有 `RAGAgent`，默认采样 32 题，每题独立运行 4 条完整轨迹，最多 8 次模型调用，
 每次最多生成 2048 token，temperature=0.7、seed=20260914、并发 4。
 目标模型是 `Qwen/Qwen3-30B-A3B-Instruct-2507`（总参数 30B，激活参数约 3B）。
