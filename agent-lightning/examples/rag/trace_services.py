@@ -39,8 +39,15 @@ class Processes:
         """Launch one owned process group with a continuously written log."""
         log = (self.root / f"{name}.log").open("w")
         self.logs.append(log)
+        # Collection children are noninteractive. Inheriting the terminal can leave
+        # CrewAI's trace-viewing input thread holding stdin during interpreter exit.
         process = await asyncio.create_subprocess_exec(
-            *command, stdout=log, stderr=asyncio.subprocess.STDOUT, env=env, start_new_session=True
+            *command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=log,
+            stderr=asyncio.subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
         )
         self.children[name] = process
         print(f"Started {name}: pid={process.pid}, log={self.root / (name + '.log')}", flush=True)

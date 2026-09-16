@@ -50,6 +50,9 @@ python collect_traces.py \
 SQL/Q20 不需要 Wikipedia 检索，所以不启动 RAG MCP 或加载 BGE。
 原流程含同步模型调用；它们在线程中执行，让同一 worker 内的 HTTP 记录代理继续处理请求。
 每个 worker 仍为独立进程，服务生命周期及日志清理沿用现有采集器。
+采集器启动的子进程使用 `/dev/null` 作为标准输入，不接受终端交互。
+CrewAI 1.2.0 的首次 trace 查看提示即使关闭 tracing 仍可能启动读取 stdin 的后台线程；
+让该提示读到 EOF，避免线程一直阻塞到 Python 退出时触发 `_enter_buffered_busy` / SIGABRT。
 SQL 固定 max_tokens=2048；`--temperature` 用于 SQL/RAG。Q20 保留原 CrewLLM 默认采样配置，实际参数见 calls.jsonl。
 Q20 的 Player、Answerer、可选 Search 均配置为本次本地 30B 服务；这是本次模型配置，
 不表示与原示例默认的云端 Answerer 模型有相同质量。Answerer 保留原结构化输出和 reasoning_effort 配置。
@@ -106,6 +109,11 @@ python compare_trace_reports.py \
   --inputs traces/sql-30b-run01/analysis traces/q20-30b-run01/analysis \
   --output traces/sql-q20-comparison
 ```
+
+若旧版本在最后一条轨迹显示 `completed` 后因 stdin 后台线程退出报错，
+可直接使用以上分析命令读取保留的原始目录，无需先重新采集。
+单个 worker 完成不代表所有 worker 都完成；分析只纳入同题 G 条轨迹齐全且通过校验的组，
+缺失或无效组会在报告中排除。保留 `failure.json`，不要把进程退出失败改写为整次采集成功。
 
 汇总输出为 `report.md`、`comparison.csv`、`comparison.json`，列出每个任务的覆盖率、独立基线、简单共享、树共享及额外收益。
 也支持只拷贝多上下文分析目录后重算：
