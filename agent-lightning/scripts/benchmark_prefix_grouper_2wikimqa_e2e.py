@@ -4,6 +4,8 @@
 Baseline and PrefixGrouper are deliberately separate invocations. The script
 supports the pinned GPU and Ascend NPU stacks through ``--device`` and records
 both per-step VERL metrics and per-rollout 2WikiMQA rewards as JSONL.
+The responses export includes exact serving token IDs for offline structural
+analysis with scripts/analyze_2wikimqa_sharing.py (see 2WIKIMQA_SHARING.md).
 """
 
 from __future__ import annotations
@@ -221,7 +223,7 @@ async def wiki_agent(task: dict[str, Any], llm: agl.LLM, rollout: agl.Rollout) -
         payload = response.json()
 
     _record_training_tokens(payload, llm.model)
-    _, response_ids = _response_token_ids(payload)
+    prompt_ids, response_ids = _response_token_ids(payload)
     message = payload["choices"][0]["message"]
     text = str(message.get("content") or message.get("reasoning_content") or "").strip()
     answers = [str(answer) for answer in task["answers"]]
@@ -237,7 +239,9 @@ async def wiki_agent(task: dict[str, Any], llm: agl.LLM, rollout: agl.Rollout) -
                 "schema_version": RESULT_SCHEMA_VERSION,
                 "benchmark_id": BENCHMARK_ID,
                 "sample_id": task["sample_id"],
-                "prompt_tokens": task["prompt_tokens"],
+                "prompt_tokens": len(prompt_ids),
+                "prompt_token_ids": prompt_ids,
+                "response_token_ids": response_ids,
                 "rollout_index": rollout_index,
                 "request_seed": request_seed,
                 "response_tokens": len(response_ids),
