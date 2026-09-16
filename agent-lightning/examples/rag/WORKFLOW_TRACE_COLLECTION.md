@@ -128,6 +128,10 @@ python analyze_call_traces.py --input /已有分析目录 --output /新的分析
 
 ## 验证范围
 
+已采集的 SQL 原始目录可交给 [GPU/NPU 固定轨迹训练回放入口](../../scripts/SQL_TRACE_REPLAY.md)，
+实测独立计算与全组公共前缀简单共享的前向、反向和参数更新。该入口不重新运行 SQL Agent，
+不改变本采集流程；需要原始 `events.jsonl` 中的 SQL reward，仅有分析目录不足以训练。
+
 本地 `agent` 环境已完成依赖解析与安装，并通过两个原流程的导入检查（SQL: LangChain 0.3.27、LangGraph 0.6.11、langchain-openai 0.3.35；Q20: CrewAI 1.2.0）。
 正式数据准备入口分别抽取 2 个真实任务，验证了 Spider 7,000 行题目及所选数据库路径/摘要、Q20 200 行词表缓存。
 CLI 帮助、语法、格式和原流程源码未修改的检查通过。没有可用 NPU，尚未运行 SQL/Q20 的 NPU 模型调用，
