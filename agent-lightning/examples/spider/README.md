@@ -26,6 +26,7 @@ Detailed dataset preparation instructions are available in the [How to Train a S
 | `sql_agent.py` | SQL agent implementation using LangGraph and LangChain, with debugging capabilities |
 | `data/` | Directory containing the Spider dataset files |
 | `spider_eval/` | Evaluation utilities for assessing SQL agent performance |
+| `../../scripts/train_multiturn_prefix_grouper.py` | Unified GPU/NPU entry for online multi-turn rollout and PrefixGrouper training |
 
 ## Running Examples
 
@@ -38,6 +39,34 @@ python train_sql_agent.py qwen
 ```
 
 If you want to use an NPU for training, please refer to the **Launch Training with NPUS** section in [How to Train a SQL Agent](../../docs/how-to/train-sql-agent.md).
+
+### Multi-turn shared-prefix training
+
+The online shared-prefix entry runs the original SQL agent workflow, collects all
+model calls from each rollout, merges prefix-consistent calls into a masked
+trajectory, and performs GRPO actor/reference updates with PrefixGrouper. GPU and
+NPU use the same command and configuration; only `--device` changes:
+
+```bash
+python ../../scripts/train_multiturn_prefix_grouper.py \
+  --device gpu \
+  --model /models/Qwen3-30B-A3B-Instruct-2507 \
+  --output-dir /runs/sql-prefix-gpu
+```
+
+For Ascend, load CANN 9.0.0 and use the pinned NPU package stack, then change
+only the device and output directory:
+
+```bash
+python ../../scripts/train_multiturn_prefix_grouper.py \
+  --device npu \
+  --model /models/Qwen3-30B-A3B-Instruct-2507 \
+  --output-dir /runs/sql-prefix-npu
+```
+
+The output directory must not already exist. Use `--dry-run` to validate the
+selected stack and inspect the fully merged VERL configuration without touching
+an accelerator.
 
 ### Debugging
 

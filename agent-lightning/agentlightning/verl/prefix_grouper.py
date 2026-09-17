@@ -351,26 +351,26 @@ def _response_values_to_nested(
     *,
     input_ids: torch.Tensor,
     prompt_lengths: torch.Tensor,
-    response_lengths: torch.Tensor,
+    suffix_lengths: torch.Tensor,
 ) -> torch.Tensor:
-    """Place response predictions in VERL's full-sequence jagged layout."""
+    """Place suffix predictions in VERL's full-sequence jagged layout."""
     if not input_ids.is_nested:
         raise ValueError("VERL 0.9 PrefixGrouper expects no-padding nested input_ids.")
 
     sequence_lengths = input_ids.offsets().diff().tolist()
     rows = []
-    for row, (sequence_length, prompt_length, response_length) in enumerate(
-        zip(sequence_lengths, prompt_lengths.tolist(), response_lengths.tolist(), strict=True)
+    for row, (sequence_length, prompt_length, suffix_length) in enumerate(
+        zip(sequence_lengths, prompt_lengths.tolist(), suffix_lengths.tolist(), strict=True)
     ):
         if prompt_length <= 0:
             raise ValueError("PrefixGrouper requires every sample to contain at least one prompt token.")
-        if sequence_length != prompt_length + response_length:
+        if sequence_length != prompt_length + suffix_length:
             raise ValueError(
-                "Nested input length does not match prompt + response length: "
-                f"{sequence_length} != {prompt_length} + {response_length}."
+                "Nested input length does not match prompt + suffix length: "
+                f"{sequence_length} != {prompt_length} + {suffix_length}."
             )
         full_row = values.new_zeros(sequence_length)
-        full_row[prompt_length - 1 : prompt_length + response_length - 1] = values[row, :response_length]
+        full_row[prompt_length - 1 : prompt_length + suffix_length - 1] = values[row, :suffix_length]
         rows.append(full_row)
     return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
 
@@ -386,7 +386,10 @@ def forward_with_prefix_grouper(
     """Run a shared-prefix forward and return VERL-compatible model outputs.
 
     ``None`` means that the batch has no repeated prompt and should use VERL's
-    standard forward path.
+    standard forward path. The full suffix attention mask is intentionally
+    distinct from ``response_mask``: trajectory aggregation inserts environment
+    tokens that must stay in the causal context while remaining outside policy
+    loss.
     """
     if "multi_modal_inputs" in micro_batch:
         return None
@@ -400,10 +403,17 @@ def forward_with_prefix_grouper(
         raise ValueError("PrefixGrouper requires the padded prompts and responses retained by VERL 0.9.")
 
     if "attention_mask" in micro_batch and not micro_batch["attention_mask"].is_nested:
-        prompt_mask = micro_batch["attention_mask"][:, : prompts.shape[1]].bool()
+        attention_mask = micro_batch["attention_mask"].bool()
+        prompt_mask = attention_mask[:, : prompts.shape[1]]
+        suffix_mask = attention_mask[:, prompts.shape[1] :]
     else:
         pad_token_id = int(tu.get_non_tensor_data(micro_batch, "pad_token_id", 0))
         prompt_mask = prompts.ne(pad_token_id)
+        suffix_mask = responses.ne(pad_token_id)
+    if suffix_mask.shape != responses.shape or response_mask.shape != responses.shape:
+        raise ValueError("PrefixGrouper requires response IDs, attention mask and response mask to have equal shapes.")
+    if (response_mask & ~suffix_mask).any():
+        raise ValueError("PrefixGrouper response_mask cannot select padded suffix positions.")
     grouped: OrderedDict[tuple[int, ...], list[int]] = OrderedDict()
     for row, prompt in enumerate(prompts):
         key = tuple(prompt[prompt_mask[row]].detach().cpu().tolist())
@@ -417,11 +427,11 @@ def forward_with_prefix_grouper(
     prefix_ids = prompts.index_select(0, representatives)
     prefix_mask = prompt_mask.index_select(0, representatives)
     ordered_responses = responses.index_select(0, order)
-    ordered_response_mask = response_mask.index_select(0, order)
+    ordered_suffix_mask = suffix_mask.index_select(0, order)
 
     prefix_grouper = build_prefix_grouper(
         prefix_mask=prefix_mask,
-        suffix_mask=ordered_response_mask,
+        suffix_mask=ordered_suffix_mask,
         group_sizes=[len(group) for group in groups],
         device=prompts.device,
     )
@@ -429,11 +439,11 @@ def forward_with_prefix_grouper(
         prefix_ids,
         prefix_mask,
         ordered_responses,
-        ordered_response_mask,
+        ordered_suffix_mask,
     )
     position_ids = build_position_ids_for_prefix_grouper(prefix_grouper)
 
-    log_probs, entropy, suffix_mask = pg_forward(
+    log_probs, entropy, grouped_suffix_mask = pg_forward(
         model=model,
         prefix_grouper=prefix_grouper,
         concat_input_ids=concat_input_ids,
@@ -442,7 +452,7 @@ def forward_with_prefix_grouper(
         attention_mask=None,
         position_ids=position_ids,
         completion_ids=ordered_responses,
-        completion_mask=ordered_response_mask,
+        completion_mask=ordered_suffix_mask,
         temperature=temperature,
         padding_mode="right",
         include_prefix_last=1,
@@ -450,18 +460,18 @@ def forward_with_prefix_grouper(
         entropy_fn=entropy_fn,
     )
 
-    log_probs = log_probs.masked_fill(~suffix_mask.bool(), 0).index_select(0, inverse_order)
+    log_probs = log_probs.masked_fill(~grouped_suffix_mask.bool(), 0).index_select(0, inverse_order)
     if entropy is not None:
-        entropy = entropy.masked_fill(~suffix_mask.bool(), 0).index_select(0, inverse_order)
+        entropy = entropy.masked_fill(~grouped_suffix_mask.bool(), 0).index_select(0, inverse_order)
 
     prompt_lengths = prompt_mask.sum(dim=-1)
-    response_lengths = response_mask.sum(dim=-1)
+    suffix_lengths = suffix_mask.sum(dim=-1)
     output = {
         "log_probs": _response_values_to_nested(
             log_probs,
             input_ids=input_ids,
             prompt_lengths=prompt_lengths,
-            response_lengths=response_lengths,
+            suffix_lengths=suffix_lengths,
         )
     }
     if entropy is not None:
@@ -469,7 +479,7 @@ def forward_with_prefix_grouper(
             entropy,
             input_ids=input_ids,
             prompt_lengths=prompt_lengths,
-            response_lengths=response_lengths,
+            suffix_lengths=suffix_lengths,
         )
     return output
 

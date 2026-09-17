@@ -359,6 +359,41 @@ For the LLaMA profile, export an `HF_TOKEN` before running so VERL can download 
     python train_sql_agent.py npu
     ```
 
+### Complete multi-turn trajectories with PrefixGrouper
+
+The shared-prefix entry includes live SQL agent rollout, reward collection,
+trajectory-level trace aggregation, GRPO, and actor/reference updates. It uses
+one accelerator-neutral path for both GPU and NPU:
+
+```bash
+python scripts/train_multiturn_prefix_grouper.py \
+  --device gpu \
+  --model /models/Qwen3-30B-A3B-Instruct-2507 \
+  --train-data examples/spider/data/train_spider.parquet \
+  --val-data examples/spider/data/test_dev_500.parquet \
+  --output-dir /runs/sql-prefix-gpu
+```
+
+For Ascend, load CANN 9.0.0 and install the pinned PrefixGrouper NPU stack.
+Then change only `--device` and the run-specific output directory:
+
+```bash
+python scripts/train_multiturn_prefix_grouper.py \
+  --device npu \
+  --model /models/Qwen3-30B-A3B-Instruct-2507 \
+  --train-data examples/spider/data/train_spider.parquet \
+  --val-data examples/spider/data/test_dev_500.parquet \
+  --output-dir /runs/sql-prefix-npu
+```
+
+PrefixGrouper shares each group’s identical initial prompt once. The remainder
+of every trajectory stays logically independent. Model-generated tokens retain
+their per-rollout GRPO loss, advantage, and clipping contributions; SQL results
+and other environment tokens participate in causal attention but remain outside
+the policy-loss mask. Groups do not cross a micro-batch or data-parallel rank,
+so `--micro-batch-size-per-device` must be a multiple of
+`--rollouts-per-sample`. The output directory must be new.
+
 ### Debugging the Agent without VERL
 
 [`sql_agent.py`]({{ src("examples/spider/sql_agent.py") }}) also provides a `debug_sql_agent()` helper to run the LangGraph workflow directly against a local or hosted OpenAI-compatible endpoint before using VERL.
