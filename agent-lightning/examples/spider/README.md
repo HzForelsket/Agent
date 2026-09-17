@@ -66,7 +66,9 @@ python ../../scripts/train_multiturn_prefix_grouper.py \
 
 The output directory must not already exist. Use `--dry-run` to validate the
 selected stack and inspect the fully merged VERL configuration without touching
-an accelerator.
+an accelerator. By default, the cumulative trajectory response limit is derived
+from the model context window after reserving `--max-prompt-length` tokens. For
+Qwen2.5-1.5B-Instruct this is `32768 - 4096 = 28672` tokens.
 
 ### Debugging
 

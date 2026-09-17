@@ -392,7 +392,10 @@ their per-rollout GRPO loss, advantage, and clipping contributions; SQL results
 and other environment tokens participate in causal attention but remain outside
 the policy-loss mask. Groups do not cross a micro-batch or data-parallel rank,
 so `--micro-batch-size-per-device` must be a multiple of
-`--rollouts-per-sample`. The output directory must be new.
+`--rollouts-per-sample`. The output directory must be new. The cumulative
+trajectory response limit defaults to the model context window minus
+`--max-prompt-length`; for Qwen2.5-1.5B-Instruct the defaults resolve to
+`32768 - 4096 = 28672`, so `max_model_len` remains within the model limit.
 
 ### Debugging the Agent without VERL
 

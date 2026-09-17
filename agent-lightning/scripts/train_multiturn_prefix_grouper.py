@@ -21,6 +21,8 @@ from typing import Any, cast
 
 from omegaconf import OmegaConf
 from packaging.version import InvalidVersion, Version
+from transformers import AutoConfig
+from verl.workers.rollout.utils import get_max_position_embeddings
 
 import agentlightning as agl
 from agentlightning.verl.accelerator import AcceleratorRuntime, Backend, select_accelerator
@@ -47,7 +49,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollouts-per-sample", type=int, default=4)
     parser.add_argument("--n-runners", type=int, default=10)
     parser.add_argument("--max-prompt-length", type=int, default=4096)
-    parser.add_argument("--max-response-length", type=int, default=34384)
+    parser.add_argument(
+        "--max-response-length",
+        type=int,
+        help="Cumulative trajectory suffix limit; defaults to model context minus --max-prompt-length.",
+    )
     parser.add_argument("--total-epochs", type=int, default=2)
     parser.add_argument("--total-training-steps", type=int)
     parser.add_argument("--save-freq", type=int, default=100)
@@ -113,7 +119,6 @@ def validate_args(args: argparse.Namespace) -> None:
         "rollouts_per_sample",
         "n_runners",
         "max_prompt_length",
-        "max_response_length",
         "total_epochs",
         "save_freq",
     )
@@ -136,6 +141,28 @@ def validate_args(args: argparse.Namespace) -> None:
     if tensor_parallel <= 0 or args.n_devices_per_node % tensor_parallel:
         raise ValueError("--tensor-model-parallel-size must be positive and divide --n-devices-per-node.")
     args.tensor_model_parallel_size = tensor_parallel
+
+
+def resolve_model_limits(args: argparse.Namespace) -> None:
+    """Resolve a valid trajectory capacity from the selected model config."""
+    model_config = AutoConfig.from_pretrained(args.model, local_files_only=args.local_files_only)
+    context_length = int(get_max_position_embeddings(model_config))
+    if args.max_prompt_length >= context_length:
+        raise ValueError(
+            f"--max-prompt-length={args.max_prompt_length} must be smaller than the model context "
+            f"length {context_length}."
+        )
+    if args.max_response_length is None:
+        args.max_response_length = context_length - args.max_prompt_length
+    elif args.max_response_length <= 0:
+        raise ValueError("--max-response-length must be positive.")
+    elif args.max_prompt_length + args.max_response_length > context_length:
+        raise ValueError(
+            f"Configured max_model_len={args.max_prompt_length + args.max_response_length} exceeds the "
+            f"model context length {context_length}; use --max-response-length no larger than "
+            f"{context_length - args.max_prompt_length}."
+        )
+    args.model_context_length = context_length
 
 
 def logical_model_name(model: str, configured_name: str | None) -> str:
@@ -282,6 +309,7 @@ def run_training(args: argparse.Namespace, runtime: AcceleratorRuntime, config: 
         "stack": installed_stack(runtime.backend),
         "train_data": str(train_path),
         "val_data": str(val_path),
+        "model_context_length": args.model_context_length,
         "config": config,
     }
     (output_dir / "launch.json").write_text(
@@ -305,6 +333,7 @@ def main() -> None:
     """Validate the common configuration and optionally launch training."""
     args = parse_args()
     validate_args(args)
+    resolve_model_limits(args)
     backend = requested_backend(args.device)
     stack = installed_stack(backend)
     check_stack(backend, stack)
