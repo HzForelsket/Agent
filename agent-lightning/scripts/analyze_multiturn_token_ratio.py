@@ -32,11 +32,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, required=True, help="JSONL file or a directory containing calls.jsonl.")
     parser.add_argument("--output", type=Path, help="Optional path for the JSON report; stdout is always printed.")
     parser.add_argument(
-        "--include-trajectories",
-        action="store_true",
-        help="Include every trajectory's metrics in the report instead of summary statistics only.",
-    )
-    parser.add_argument(
         "--role",
         default="policy",
         help="Analyze this role when records have a role field; use 'all' to keep every role (default: policy).",
@@ -169,6 +164,11 @@ def analyze_trajectory(trajectory: str, turns: list[dict[str, Any]]) -> dict[str
 
     api_prompt = sum(len(row["prompt_ids"]) for row in ordered)
     model_response = sum(len(row["response_ids"]) for row in ordered)
+    initial_prompt_ids = ordered[0]["prompt_ids"]
+    final_context_ids = ordered[-1]["prompt_ids"] + ordered[-1]["response_ids"]
+    logical_response = len(final_context_ids) - len(initial_prompt_ids)
+    if logical_response < 0:
+        raise ValueError(f"trajectory {trajectory!r} ends with fewer tokens than its initial prompt")
 
     # Match the trajectory aggregator's untruncated representation. The first
     # prompt is the training prompt. Later prompt deltas (tool/environment
@@ -230,12 +230,18 @@ def analyze_trajectory(trajectory: str, turns: list[dict[str, Any]]) -> dict[str
             "prompt_to_model_response_ratio": ratio(training_prompt, model_response),
             "policy_loss_token_share_of_suffix": share(model_response, response_suffix),
         },
+        "_initial_prompt_ids": initial_prompt_ids,
+        "_logical_response_tokens": logical_response,
+        "_logical_total_tokens": len(final_context_ids),
         "_sharing_segments": segments,
     }
 
 
 def analyze_sharing(trajectories: list[dict[str, Any]], requested_group_key: str) -> dict[str, Any]:
     """Measure exact-prompt sharing potential using the production grouping rule."""
+    for trajectory in trajectories:
+        trajectory["_shared_length"] = None
+        trajectory["_training_shared_length"] = None
     resolved_keys = {row["group_key"] for row in trajectories}
     if resolved_keys == {None}:
         return {
@@ -246,21 +252,37 @@ def analyze_sharing(trajectories: list[dict[str, Any]], requested_group_key: str
         raise ValueError(f"Inconsistent sharing group keys across trajectories: {sorted(map(str, resolved_keys))}")
     resolved_group_key = next(iter(resolved_keys))
 
-    exact_prompt_groups: dict[tuple[str, tuple[int, ...]], list[dict[str, Any]]] = defaultdict(list)
+    initial_prompt_groups: dict[tuple[str, tuple[int, ...]], list[dict[str, Any]]] = defaultdict(list)
+    exact_prompt_groups: dict[tuple[str, tuple[int, ...]], list[tuple[dict[str, Any], dict[str, Any]]]] = defaultdict(
+        list
+    )
     prompt_tokens = suffix_tokens = 0
     segment_count = 0
     for trajectory in trajectories:
         group_id = trajectory["group_id"]
+        initial_prompt_groups[(group_id, tuple(trajectory["_initial_prompt_ids"]))].append(trajectory)
+        trajectory["_shared_length"] = 0
+        trajectory["_training_shared_length"] = 0
         for segment in trajectory["_sharing_segments"]:
             prompt = segment["prompt_ids"]
-            exact_prompt_groups[(group_id, tuple(prompt))].append(segment)
+            exact_prompt_groups[(group_id, tuple(prompt))].append((trajectory, segment))
             prompt_tokens += len(prompt)
             suffix_tokens += segment["response_suffix_tokens"]
             segment_count += 1
 
+    for group in initial_prompt_groups.values():
+        if len(group) >= 2:
+            shared_length = len(group[0]["_initial_prompt_ids"])
+            for trajectory in group:
+                trajectory["_shared_length"] = shared_length
+
     shared = [segments for segments in exact_prompt_groups.values() if len(segments) >= 2]
-    shareable_occurrences = sum(len(segments[0]["prompt_ids"]) * len(segments) for segments in shared)
-    shared_once = sum(len(segments[0]["prompt_ids"]) for segments in shared)
+    for group in shared:
+        shared_length = len(group[0][1]["prompt_ids"])
+        for trajectory, _ in group:
+            trajectory["_training_shared_length"] += shared_length
+    shareable_occurrences = sum(len(segments[0][1]["prompt_ids"]) * len(segments) for segments in shared)
+    shared_once = sum(len(segments[0][1]["prompt_ids"]) for segments in shared)
     reducible_duplicates = shareable_occurrences - shared_once
     independent_tokens = prompt_tokens + suffix_tokens
     grouped_tokens = independent_tokens - reducible_duplicates
@@ -289,7 +311,46 @@ def analyze_sharing(trajectories: list[dict[str, Any]], requested_group_key: str
     }
 
 
-def analyze(path: Path, role: str, group_key: str, include_trajectories: bool) -> dict[str, Any]:
+def trajectory_record(trajectory: dict[str, Any]) -> dict[str, Any]:
+    """Build the required per-trajectory record plus training diagnostics."""
+    initial_prompt_length = len(trajectory["_initial_prompt_ids"])
+    response_length = trajectory["_logical_response_tokens"]
+    total_length = trajectory["_logical_total_tokens"]
+    shared_length = trajectory["_shared_length"]
+    training = trajectory["training_trajectory"]
+    training_shared_length = trajectory["_training_shared_length"]
+    return {
+        "trajectory_id": trajectory["trajectory_id"],
+        "group_key": trajectory["group_key"],
+        "group_id": trajectory["group_id"],
+        "turns": trajectory["turns"],
+        "sharing_ratio": share(shared_length, total_length) if shared_length is not None else None,
+        "response_length": response_length,
+        "initial_prompt_length": initial_prompt_length,
+        "shared_length": shared_length,
+        "total_length": total_length,
+        "model_response_length": training["model_response_tokens"],
+        "prefix_breaks": trajectory["prefix_breaks"],
+        "training_segments": trajectory["segments"],
+        "training_prompt_length": training["prompt_tokens"],
+        "training_response_length": training["response_suffix_tokens"],
+        "training_shared_length": training_shared_length,
+        "training_total_length": training["total_tokens"],
+        "training_sharing_ratio": (
+            share(training_shared_length, training["total_tokens"])
+            if training_shared_length is not None
+            else None
+        ),
+    }
+
+
+def field_mean(records: list[dict[str, Any]], field: str) -> float | None:
+    """Return the arithmetic mean for a numeric per-trajectory field."""
+    values = [record[field] for record in records if record[field] is not None]
+    return mean(values) if values else None
+
+
+def analyze(path: Path, role: str, group_key: str) -> dict[str, Any]:
     """Load calls, group turns, and aggregate weighted and per-trajectory statistics."""
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     selected_records = 0
@@ -324,6 +385,20 @@ def analyze(path: Path, role: str, group_key: str, include_trajectories: bool) -
     environment_tokens = sum(row["training_trajectory"]["environment_tokens"] for row in trajectories)
 
     sharing = analyze_sharing(trajectories, group_key)
+    per_trajectory = [trajectory_record(trajectory) for trajectory in trajectories]
+    mean_fields = (
+        "sharing_ratio",
+        "response_length",
+        "initial_prompt_length",
+        "shared_length",
+        "total_length",
+        "model_response_length",
+        "training_prompt_length",
+        "training_response_length",
+        "training_shared_length",
+        "training_total_length",
+        "training_sharing_ratio",
+    )
     report = {
         "input": str(path.resolve()),
         "role": role,
@@ -343,6 +418,7 @@ def analyze(path: Path, role: str, group_key: str, include_trajectories: bool) -
             },
         },
         "prefix_sharing": sharing,
+        "per_trajectory_mean": {field: field_mean(per_trajectory, field) for field in mean_fields},
         "per_trajectory_distribution": {
             "api_prompt_to_model_response_ratio": distribution(
                 row["api_call"]["prompt_to_response_ratio"] for row in trajectories
@@ -370,13 +446,19 @@ def analyze(path: Path, role: str, group_key: str, include_trajectories: bool) -
             "shareable_ratio": (
                 "Duplicate prompt tokens removable by exact-prefix sharing, divided by independent prompt + suffix tokens."
             ),
+            "per_trajectory.response_length": (
+                "Final full-history prompt plus final response, minus the first-turn prompt; includes model and environment tokens."
+            ),
+            "per_trajectory.shared_length": (
+                "Initial-prompt tokens shared when at least two trajectories in the same group have exactly equal prompts."
+            ),
+            "per_trajectory.sharing_ratio": "shared_length / total_length for that logical trajectory.",
+            "per_trajectory.training_*": (
+                "Exact-prefix-segment metrics matching PrefixGrouper's untruncated training representation."
+            ),
         },
+        "per_trajectory": per_trajectory,
     }
-    if include_trajectories:
-        report["per_trajectory"] = [
-            {key: value for key, value in trajectory.items() if not key.startswith("_")}
-            for trajectory in trajectories
-        ]
     return report
 
 
@@ -384,7 +466,7 @@ def main() -> None:
     """Run the analyzer and emit a reproducible JSON report."""
     args = parse_args()
     input_path = args.input / "calls.jsonl" if args.input.is_dir() else args.input
-    report = analyze(input_path, args.role, args.group_key, args.include_trajectories)
+    report = analyze(input_path, args.role, args.group_key)
     rendered = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     print(rendered, end="")
     if args.output is not None:
