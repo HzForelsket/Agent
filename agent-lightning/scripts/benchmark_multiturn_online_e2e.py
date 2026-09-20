@@ -34,6 +34,7 @@ from verl.workers.rollout.utils import get_max_position_embeddings
 
 import agentlightning as agl
 from agentlightning.verl.accelerator import AcceleratorRuntime, Backend, select_accelerator
+from agentlightning.verl.daemon import AgentModeDaemon
 from agentlightning.verl.trainer import AgentLightningTrainer
 from prefix_grouper_stack import NPU_CANN_VERSION, REQUIRED_STACKS
 
@@ -107,6 +108,29 @@ class BenchmarkTrainer(AgentLightningTrainer):
         return metrics
 
 
+class LocalModelEnvironmentDaemon(AgentModeDaemon):
+    """Expose the single local rollout model as an untraced environment LLM."""
+
+    def _build_rollout_resources(
+        self,
+        llm_resource: agl.LLM,
+        server_addresses: list[str],
+        is_train: bool,
+    ) -> agl.NamedResources:
+        resources = super()._build_rollout_resources(llm_resource, server_addresses, is_train)
+        if len(server_addresses) != 1:
+            raise RuntimeError(
+                "The pure-local Q20 answerer requires exactly one rollout-model server; "
+                "set tensor model parallel size equal to devices per node."
+            )
+        resources["environment_llm"] = agl.LLM(
+            endpoint=f"http://{server_addresses[0]}/v1",
+            model=self.model_name,
+            sampling_parameters={"temperature": 0.0},
+        )
+        return resources
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", choices=("sql", "q20", "web"), required=True)
@@ -139,10 +163,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--web-data-dir", type=Path)
     parser.add_argument("--web-embedding-model", default="BAAI/bge-large-en-v1.5")
     parser.add_argument("--web-embedding-cache", type=Path)
-    parser.add_argument("--q20-answerer-model", default=os.getenv("ANSWERER_LLM", "gpt-5-mini"))
-    parser.add_argument("--q20-answerer-base-url", default=os.getenv("OPENAI_BASE_URL"))
     parser.add_argument("--q20-search", action="store_true")
-    parser.add_argument("--q20-search-model", default=os.getenv("SEARCH_LLM", "gpt-4.1"))
     parser.add_argument("--npu-attention-backend", choices=("fusion", "custom"), default="fusion")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--insecure-download", action="store_true")
@@ -225,6 +246,11 @@ def validate_args(args: argparse.Namespace) -> None:
     if tensor_parallel <= 0 or args.n_devices_per_node % tensor_parallel:
         raise ValueError("--tensor-model-parallel-size must be positive and divide --n-devices-per-node.")
     args.tensor_model_parallel_size = tensor_parallel
+    if args.task == "q20" and tensor_parallel != args.n_devices_per_node:
+        raise ValueError(
+            "Pure-local Q20 requires --tensor-model-parallel-size to equal --n-devices-per-node "
+            "so player and untraced answerer share one local model server."
+        )
     if args.temperature <= 0 or args.learning_rate <= 0:
         raise ValueError("--temperature and --learning-rate must be positive.")
     if args.save_freq == 0 or args.save_freq < -1:
@@ -386,38 +412,45 @@ def build_config(
 
 
 class Q20Agent(agl.LitAgent[dict[str, Any]]):
-    """Train only the player; answerer/search calls use a fixed external model."""
+    """Train only the player; answerer/search reuse the untraced local model."""
 
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(self, search_enabled: bool) -> None:
         super().__init__()
-        self.args = args
+        self.search_enabled = search_enabled
 
     async def rollout_async(self, task: dict[str, Any], resources: Any, rollout: Any) -> float:
         sys.path.insert(0, str(Q20_DIR))
         from crewai import LLM as CrewLLM
+        from opentelemetry.instrumentation.utils import suppress_instrumentation
         from q20_agent import AnswererResponse, SearchTool, TwentyQuestionsFlow
 
+        class UntracedCrewLLM(CrewLLM):
+            """Keep local environment-model calls out of the policy trace."""
+
+            def call(self, *call_args: Any, **call_kwargs: Any) -> Any:
+                with suppress_instrumentation():
+                    return super().call(*call_args, **call_kwargs)
+
         llm = resources["main_llm"]
+        environment_llm = resources["environment_llm"]
         base_url = llm.get_base_url(rollout.rollout_id, rollout.attempt.attempt_id)
         player = CrewLLM(model="openai/" + llm.model, base_url=base_url, api_key="dummy", timeout=120.0)
-        answerer = CrewLLM(
-            model="openai/" + self.args.q20_answerer_model,
-            base_url=self.args.q20_answerer_base_url,
-            api_key=os.environ["OPENAI_API_KEY"],
+        answerer = UntracedCrewLLM(
+            model="openai/" + environment_llm.model,
+            base_url=environment_llm.endpoint,
+            api_key="dummy",
             temperature=0.0,
-            reasoning_effort="low",
             response_format=AnswererResponse,
             timeout=120.0,
         )
         search = None
-        if self.args.q20_search:
+        if self.search_enabled:
             search = SearchTool(
-                model=CrewLLM(
-                    model="openai/" + self.args.q20_search_model,
-                    base_url=self.args.q20_answerer_base_url,
-                    api_key=os.environ["OPENAI_API_KEY"],
+                model=UntracedCrewLLM(
+                    model="openai/" + environment_llm.model,
+                    base_url=environment_llm.endpoint,
+                    api_key="dummy",
                     temperature=0.0,
-                    reasoning_effort="none",
                     timeout=120.0,
                 )
             )
@@ -440,7 +473,7 @@ def make_agent(args: argparse.Namespace, tasks: list[dict[str, Any]], mcp_url: s
         agent.spider_dir = roots.pop()
         return agent
     if args.task == "q20":
-        return Q20Agent(args)
+        return Q20Agent(args.q20_search)
     if not mcp_url:
         raise ValueError("Web RAG requires an MCP URL.")
     sys.path.insert(0, str(RAG_DIR))
@@ -569,7 +602,11 @@ def run_training(
             json.dumps(launch, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
         agent = make_agent(args, tasks, mcp_url)
-        algorithm = agl.VERL(config, trainer_cls=BenchmarkTrainer)
+        algorithm = agl.VERL(
+            config,
+            trainer_cls=BenchmarkTrainer,
+            daemon_cls=LocalModelEnvironmentDaemon if args.task == "q20" else None,
+        )
         trainer = agl.Trainer(
             n_runners=args.n_runners,
             algorithm=algorithm,
@@ -611,10 +648,8 @@ def run_training(
                 "sql_max_turns": args.sql_max_turns if args.task == "sql" else None,
                 "web_max_turns": args.web_max_turns if args.task == "web" else None,
                 "web_mcp_url": mcp_url if args.task == "web" else None,
-                "q20_answerer_model": args.q20_answerer_model if args.task == "q20" else None,
-                "q20_answerer_base_url": args.q20_answerer_base_url if args.task == "q20" else None,
+                "q20_environment_model": "local_actor_backend" if args.task == "q20" else None,
                 "q20_search": args.q20_search if args.task == "q20" else None,
-                "q20_search_model": args.q20_search_model if args.task == "q20" else None,
             },
             "npu_attention_backend": args.npu_attention_backend if args.mode == "simple" else None,
             "stack": stack,
@@ -640,8 +675,6 @@ def main() -> None:
         raise ValueError("--npu-attention-backend custom requires --device npu --mode simple.")
     stack = installed_stack(backend)
     check_stack(backend, stack)
-    if not args.dry_run and args.task == "q20" and not os.getenv("OPENAI_API_KEY"):
-        raise ValueError("Q20 requires OPENAI_API_KEY; credentials are not accepted on CLI.")
     if not args.dry_run and args.output_dir.expanduser().resolve().exists():
         raise FileExistsError(f"Output directory already exists: {args.output_dir.expanduser().resolve()}")
     resolve_model_limits(args)
@@ -650,7 +683,11 @@ def main() -> None:
     config = build_config(args, backend, metrics_path, len(tasks))
 
     if args.dry_run:
-        merged = agl.VERL(config, trainer_cls=BenchmarkTrainer).config
+        merged = agl.VERL(
+            config,
+            trainer_cls=BenchmarkTrainer,
+            daemon_cls=LocalModelEnvironmentDaemon if args.task == "q20" else None,
+        ).config
         print(
             json.dumps(
                 {

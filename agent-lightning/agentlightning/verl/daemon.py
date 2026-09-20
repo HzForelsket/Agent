@@ -495,6 +495,16 @@ class AgentModeDaemon:
             # Start proxy server in _async_set_up
             pass
 
+    def _build_rollout_resources(
+        self,
+        llm_resource: LLM,
+        server_addresses: List[str],
+        is_train: bool,
+    ) -> NamedResources:
+        """Build resources published to rollout workers for the current batch."""
+        del server_addresses, is_train
+        return {"main_llm": llm_resource}
+
     async def _async_set_up(self, data: Dict[str, Any], server_addresses: List[str], is_train: bool = True):
         """Async helper to set up data and resources on the server."""
         self.clear_data_and_server()
@@ -520,7 +530,7 @@ class AgentModeDaemon:
                 },
             )
 
-        resources: NamedResources = {"main_llm": llm_resource}
+        resources = self._build_rollout_resources(llm_resource, server_addresses, is_train)
 
         if self.mode == "v0":
             resources_id = await self.server.update_resources(resources)

@@ -32,11 +32,26 @@ python scripts/benchmark_multiturn_online_e2e.py \
   --output-dir /runs/sql-simple
 ```
 
-把 `--task sql` 分别替换为 `q20` 和 `web` 即可复用同一训练入口。Q20 的固定
-answerer 使用 `OPENAI_API_KEY`，并可通过 `--q20-answerer-base-url` 与
-`--q20-answerer-model` 指向任意 OpenAI 兼容服务；密钥不接受 CLI 参数，避免写入
-`launch.json`。Web 默认自动启动仓库内的 CPU MCP 检索服务，也可通过
+把 `--task sql` 分别替换为 `q20` 和 `web` 即可复用同一训练入口。Q20 的 player、
+answerer 和可选 search 全部复用训练进程启动的本地 Qwen3-8B 服务，不需要任何
+OpenAI Key。只有 player 请求经过 Agent Lightning trace proxy 并进入训练；answerer/search
+通过内部直连资源调用同一本地模型，不进入 policy 轨迹。纯本地 Q20 要求 tensor parallel
+等于设备数，以保证只有一个共享模型服务。Web 默认自动启动仓库内的 CPU MCP 检索服务，也可通过
 `--web-mcp-url http://host:port/sse` 复用已有服务。
+
+纯本地、禁止下载的 Q20 命令如下；baseline 只需更换 `--mode` 和输出目录：
+
+```bash
+python scripts/benchmark_multiturn_online_e2e.py \
+  --task q20 --mode simple --device npu \
+  --model /models/Qwen3-8B --model-name Qwen3-8B \
+  --n-devices-per-node 4 --tensor-model-parallel-size 4 \
+  --rollouts-per-sample 4 --steps 10 --tasks 32 \
+  --local-files-only --output-dir /runs/q20-simple
+```
+
+实现中的 `api_key="dummy"` 只是本地 OpenAI 兼容客户端的必填占位值，不是凭证，
+不会读取 `OPENAI_API_KEY`，也不会连接 OpenAI 服务。
 
 GPU 运行只需把 `--device npu` 改成 `--device gpu`。无硬件检查配置时显式使用
 `--device gpu|npu --dry-run`。NPU 正式运行要求项目固定的 CANN 9.0.0、
