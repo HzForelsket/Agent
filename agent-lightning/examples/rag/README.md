@@ -51,6 +51,7 @@ python train_rag.py
 |----------------|-------------|
 | `rag_agent.py` | RAG agent example using the OpenAI Agents SDK, with debugging utils |
 | `train_rag.py` | Initiates the GRPO training process |
+| `../../scripts/benchmark_multiturn_online_e2e.py` | Unified SQL/Q20/Web online multi-turn baseline/simple training entry for GPU and NPU |
 | `metric_utils.py` | Scoring utilities for exact match, F1 score, and response parsing |
 | `rag_data.py` | Shared automatic data download, checksum verification and cache preparation |
 | `embedding_download.py` | ModelScope embedding model downloads with resume, checksums and optional TLS verification |

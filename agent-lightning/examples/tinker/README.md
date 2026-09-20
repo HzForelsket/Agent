@@ -66,6 +66,7 @@ Agent-lightning hides that translation step: you keep the first style for develo
 | `hello.py` | Minimal end-to-end fine-tuning example. Trains a model to repeat small identity strings. |
 | `q20_agent.py` | CrewAI flow that powers the 20 Questions player, answerer, and mock search tool. Shared by training and evaluation. **Unrelated to Agent-lightning or Tinker.** |
 | `q20_train.py` | Reinforcement-learning driver that adapts the Cookbook loop to Agent-lightning rollouts. Supports dry-run, distributed training, and search tool toggles. **Related to both Agent-lightning and Tinker.** |
+| `../../scripts/benchmark_multiturn_online_e2e.py` | Unified VERL GPU/NPU entry for Q20, SQL, and Web online multi-turn baseline/simple training. |
 | `q20_evaluate.py` | Offline evaluator that reuses the CrewAI flow to benchmark any OpenAI- or Qwen-backed model against the provided dataset. **Related to Tinker only.** |
 | `q20_nouns.csv` | Categories and answers used for training and validation. Contains `split` and `search_enabled` metadata. |
 | `agl_tinker/` | Bridge package for integrating Agent-lightning with Tinker (see breakdown below). |

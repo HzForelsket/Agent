@@ -26,7 +26,7 @@ Detailed dataset preparation instructions are available in the [How to Train a S
 | `sql_agent.py` | SQL agent implementation using LangGraph and LangChain, with debugging capabilities |
 | `data/` | Directory containing the Spider dataset files |
 | `spider_eval/` | Evaluation utilities for assessing SQL agent performance |
-| `../../scripts/train_multiturn_prefix_grouper.py` | Unified GPU/NPU entry for online multi-turn rollout and PrefixGrouper training |
+| `../../scripts/benchmark_multiturn_online_e2e.py` | Unified SQL/Q20/Web, GPU/NPU entry for online multi-turn baseline/simple training |
 
 ## Running Examples
 
@@ -48,27 +48,28 @@ trajectory, and performs GRPO actor/reference updates with PrefixGrouper. GPU an
 NPU use the same command and configuration; only `--device` changes:
 
 ```bash
-python ../../scripts/train_multiturn_prefix_grouper.py \
-  --device gpu \
-  --model /models/Qwen3-30B-A3B-Instruct-2507 \
-  --output-dir /runs/sql-prefix-gpu
+python ../../scripts/benchmark_multiturn_online_e2e.py \
+  --task sql --mode simple --device gpu \
+  --model Qwen/Qwen3-8B --steps 10 --rollouts-per-sample 4 \
+  --output-dir /runs/sql-simple-gpu
 ```
 
 For Ascend, load CANN 9.0.0 and use the pinned NPU package stack, then change
 only the device and output directory:
 
 ```bash
-python ../../scripts/train_multiturn_prefix_grouper.py \
-  --device npu \
-  --model /models/Qwen3-30B-A3B-Instruct-2507 \
-  --output-dir /runs/sql-prefix-npu
+python ../../scripts/benchmark_multiturn_online_e2e.py \
+  --task sql --mode simple --device npu \
+  --model Qwen/Qwen3-8B --steps 10 --rollouts-per-sample 4 \
+  --output-dir /runs/sql-simple-npu
 ```
 
 The output directory must not already exist. Use `--dry-run` to validate the
 selected stack and inspect the fully merged VERL configuration without touching
 an accelerator. By default, the cumulative trajectory response limit is derived
 from the model context window after reserving `--max-prompt-length` tokens. For
-Qwen2.5-1.5B-Instruct this is `32768 - 4096 = 28672` tokens.
+See [MULTITURN_ONLINE_E2E.md](../../scripts/MULTITURN_ONLINE_E2E.md) for the
+matching baseline command and the Q20/Web task-specific dependencies.
 
 ### Debugging
 

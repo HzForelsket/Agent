@@ -359,31 +359,27 @@ For the LLaMA profile, export an `HF_TOKEN` before running so VERL can download 
     python train_sql_agent.py npu
     ```
 
-### Complete multi-turn trajectories with PrefixGrouper
+### Complete multi-turn trajectories with baseline/simple modes
 
 The shared-prefix entry includes live SQL agent rollout, reward collection,
 trajectory-level trace aggregation, GRPO, and actor/reference updates. It uses
 one accelerator-neutral path for both GPU and NPU:
 
 ```bash
-python scripts/train_multiturn_prefix_grouper.py \
-  --device gpu \
-  --model /models/Qwen3-30B-A3B-Instruct-2507 \
-  --train-data examples/spider/data/train_spider.parquet \
-  --val-data examples/spider/data/test_dev_500.parquet \
-  --output-dir /runs/sql-prefix-gpu
+python scripts/benchmark_multiturn_online_e2e.py \
+  --task sql --mode simple --device gpu \
+  --model Qwen/Qwen3-8B --steps 10 --rollouts-per-sample 4 \
+  --output-dir /runs/sql-simple-gpu
 ```
 
 For Ascend, load CANN 9.0.0 and install the pinned PrefixGrouper NPU stack.
 Then change only `--device` and the run-specific output directory:
 
 ```bash
-python scripts/train_multiturn_prefix_grouper.py \
-  --device npu \
-  --model /models/Qwen3-30B-A3B-Instruct-2507 \
-  --train-data examples/spider/data/train_spider.parquet \
-  --val-data examples/spider/data/test_dev_500.parquet \
-  --output-dir /runs/sql-prefix-npu
+python scripts/benchmark_multiturn_online_e2e.py \
+  --task sql --mode simple --device npu \
+  --model Qwen/Qwen3-8B --steps 10 --rollouts-per-sample 4 \
+  --output-dir /runs/sql-simple-npu
 ```
 
 PrefixGrouper shares each group’s identical initial prompt once. The remainder
@@ -394,8 +390,9 @@ the policy-loss mask. Groups do not cross a micro-batch or data-parallel rank,
 so `--micro-batch-size-per-device` must be a multiple of
 `--rollouts-per-sample`. The output directory must be new. The cumulative
 trajectory response limit defaults to the model context window minus
-`--max-prompt-length`; for Qwen2.5-1.5B-Instruct the defaults resolve to
-`32768 - 4096 = 28672`, so `max_model_len` remains within the model limit.
+`--max-prompt-length`. Run `--mode baseline` with the same arguments and a new
+output directory for the controlled comparison. The same entry also supports
+`--task q20` and `--task web`; see `scripts/MULTITURN_ONLINE_E2E.md`.
 
 ### Debugging the Agent without VERL
 
