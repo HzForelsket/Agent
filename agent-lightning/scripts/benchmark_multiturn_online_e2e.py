@@ -22,6 +22,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,7 @@ from verl.workers.rollout.utils import get_max_position_embeddings
 import agentlightning as agl
 from agentlightning.verl.accelerator import AcceleratorRuntime, Backend, select_accelerator
 from agentlightning.verl.daemon import AgentModeDaemon
+from agentlightning.verl.model_download import materialize_model
 from agentlightning.verl.trainer import AgentLightningTrainer
 from prefix_grouper_stack import NPU_CANN_VERSION, REQUIRED_STACKS
 
@@ -140,7 +142,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name", help="Stable logical name exposed to the rollout service.")
     parser.add_argument("--dataset", type=Path, help="Optional task-specific CSV/Parquet dataset.")
     parser.add_argument("--sql-database-dir", type=Path, help="Spider root or database directory.")
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, help="Fresh result directory; generated automatically when omitted.")
+    parser.add_argument("--download-dir", type=Path, default=REPO_ROOT / ".cache" / "multiturn-artifacts")
     parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
     parser.add_argument("--tasks", type=int, default=DEFAULT_TASKS)
     parser.add_argument("--train-batch-size", type=int, default=DEFAULT_TRAIN_BATCH_SIZE)
@@ -242,6 +245,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--train-batch-size must be divisible by --n-devices-per-node.")
     if args.micro_batch_size_per_device % args.rollouts_per_sample:
         raise ValueError("--micro-batch-size-per-device must be a multiple of --rollouts-per-sample.")
+    if (args.train_batch_size * args.rollouts_per_sample) % (
+        args.n_devices_per_node * args.micro_batch_size_per_device
+    ):
+        raise ValueError("The rollout batch must be divisible by devices * micro-batch-size-per-device.")
     tensor_parallel = args.tensor_model_parallel_size or args.n_devices_per_node
     if tensor_parallel <= 0 or args.n_devices_per_node % tensor_parallel:
         raise ValueError("--tensor-model-parallel-size must be positive and divide --n-devices-per-node.")
@@ -260,6 +267,14 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def resolve_model_limits(args: argparse.Namespace) -> None:
+    args.model_ref = args.model
+    model_ref = DEFAULT_MODEL if args.model == "Qwen3-8B" and not Path(args.model).exists() else args.model
+    args.model_name = _logical_model_name(args.model, args.model_name)
+    args.model = materialize_model(
+        model_ref,
+        args.download_dir.expanduser().resolve() / "models",
+        local_files_only=args.local_files_only,
+    ).local_path
     model_config = AutoConfig.from_pretrained(args.model, local_files_only=args.local_files_only)
     context_length = int(get_max_position_embeddings(model_config))
     if args.max_prompt_length >= context_length:
@@ -269,7 +284,6 @@ def resolve_model_limits(args: argparse.Namespace) -> None:
     elif args.max_prompt_length + args.max_response_length > context_length:
         raise ValueError("prompt + response capacity exceeds the model context length.")
     args.model_context_length = context_length
-    args.model_name = _logical_model_name(args.model, args.model_name)
 
 
 def prepare_workload(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -304,7 +318,7 @@ def build_config(
         "agentlightning": {
             "model_name": args.model_name,
             "npu_model_download": {
-                "enabled": True,
+                "enabled": False,
                 "local_files_only": args.local_files_only,
             },
             "trace_aggregator": {
@@ -383,6 +397,7 @@ def build_config(
             },
         },
         "trainer": {
+            "device": "cuda" if backend == "gpu" else "npu",
             "n_gpus_per_node": args.n_devices_per_node,
             "nnodes": 1,
             "balance_batch": False,
@@ -580,7 +595,6 @@ def run_training(
     stack: dict[str, str],
 ) -> None:
     output_dir = args.output_dir.expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=False)
     metrics_path = output_dir / "metrics.jsonl"
     (output_dir / "selected_tasks.json").write_text(
         json.dumps(tasks, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -600,6 +614,7 @@ def run_training(
             "device_name": runtime.device_name(),
             "required_cann": NPU_CANN_VERSION if runtime.backend == "npu" else None,
             "stack": stack,
+            "model_ref": args.model_ref,
             "model_context_length": args.model_context_length,
             "mcp_url": mcp_url,
             "config": config,
@@ -648,6 +663,7 @@ def run_training(
             "save_freq": args.save_freq,
             "seed": args.seed,
             "model": args.model,
+            "model_ref": args.model_ref,
             "model_name": args.model_name,
             "dataset": dataset_metadata,
             "task_settings": {
@@ -667,6 +683,25 @@ def run_training(
 def main() -> None:
     args = parse_args()
     validate_args(args)
+    if args.output_dir is None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        args.output_dir = REPO_ROOT / ".cache" / f"multiturn-{args.task}-{args.mode}-{stamp}-{uuid.uuid4().hex[:8]}"
+    if not args.dry_run:
+        args.output_dir = args.output_dir.expanduser().resolve()
+        args.output_dir.mkdir(parents=True, exist_ok=False)
+        print(f"AGL_MULTITURN_OUTPUT_DIR={args.output_dir}", flush=True)
+        invocation = {
+            "command": sys.argv,
+            "python": sys.executable,
+            "arguments": vars(args),
+            "visible_devices": {
+                name: os.environ.get(name)
+                for name in ("CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES")
+            },
+        }
+        (args.output_dir / "invocation.json").write_text(
+            json.dumps(invocation, default=str, indent=2) + "\n", encoding="utf-8"
+        )
 
     runtime: AcceleratorRuntime | None = None
     if args.dry_run:
@@ -681,8 +716,6 @@ def main() -> None:
         raise ValueError("--npu-attention-backend custom requires --device npu --mode simple.")
     stack = installed_stack(backend)
     check_stack(backend, stack)
-    if not args.dry_run and args.output_dir.expanduser().resolve().exists():
-        raise FileExistsError(f"Output directory already exists: {args.output_dir.expanduser().resolve()}")
     resolve_model_limits(args)
     tasks, dataset_metadata = prepare_workload(args)
     metrics_path = args.output_dir.expanduser().resolve() / "metrics.jsonl"

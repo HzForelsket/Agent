@@ -11,6 +11,31 @@
 保持独立。两个模式都使用轨迹级聚合，覆盖实时 rollout、GRPO、old/reference
 log-prob 和 actor update。
 
+## 四卡最小流程验证：八条轨迹、一个训练步
+
+GRPO 需要同题至少两条 rollout，当前 FSDP 路径要求 prompt batch 能被设备数整除。
+四卡最小配置为四个问题、每题两条轨迹。仅检查流程时显式使用下面的小规模配置，
+不要直接采用后面的 10-step 对比参数：
+
+```bash
+python scripts/benchmark_multiturn_online_e2e.py \
+  --task q20 --mode simple --device gpu --model Qwen3-8B \
+  --tasks 4 --train-batch-size 4 --rollouts-per-sample 2 --steps 1 \
+  --n-runners 8 --n-devices-per-node 4 --micro-batch-size-per-device 2
+```
+
+NPU 使用同一组参数，仅替换 `--device npu`。这只验证一个完整训练步，
+不能据此给出性能对比结论；若同题的两条轨迹奖励相同，GRPO advantage 为零，
+也不能据此声称策略获得了有效学习更新。
+
+Q20 每轮会重建提示，因此一个 rollout 可能拆成多个无法按 token 前缀合并的训练片段。
+trainer 在 old/reference log-prob 前按设备数与静态 micro-batch 的公倍数补齐，
+在 GRPO advantage 前移除补齐项；actor update 使用完整的
+`ppo_mini_batch_size × rollouts-per-sample` 批次。`training/n_logprob_padding`
+记录推理补齐数量，`training/n_triplets_dropped_remainder` 记录训练尾批丢弃数量。
+长 prompt 超出 prompt 区的部分保留在 suffix 中作为上下文，其 loss mask 为零；
+模型回复按实际回复长度标记，避免把 padding 或历史上下文计入策略损失。
+
 ## 10 step 对比
 
 以下命令使用 Qwen3-8B、4 张卡、32 个确定性抽样任务、每题 4 条 rollout 和 10 个
@@ -64,6 +89,14 @@ GPU 运行只需把 `--device npu` 改成 `--device gpu`。无硬件检查配置
 `--device gpu|npu --dry-run`。NPU 正式运行要求项目固定的 CANN 9.0.0、
 torch/torch-npu 2.10.0、vLLM 0.22.1、vllm-ascend 0.22.1rc1 和 VERL 0.9.0
 软件栈。
+
+`--output-dir` 省略时，入口会在仓库 `.cache` 下创建带时间和随机标识的新目录，
+并在设备初始化前打印绝对路径、写入 `invocation.json`。`--model Qwen3-8B`
+优先指向当前目录中的同名模型目录；不存在时解析为 `Qwen/Qwen3-8B`。
+GPU/NPU 都在读取模型配置前通过同一个 `materialize_model` 准备本地权重，默认缓存位于
+`.cache/multiturn-artifacts/models`，可用 `--download-dir` 更改；逻辑服务名与权重路径分离。
+两侧共用 Q20 Agent、环境模型服务、trace 转换、轨迹聚合、GRPO 和 PrefixGrouper FSDP worker，
+设备差异保留在运行时、通信和底层 attention 算子。
 
 每个输出目录包含：
 

@@ -174,9 +174,9 @@ def select_accelerator(spec: str = "auto") -> AcceleratorRuntime:
     else:
         index = 0
 
-    npu_module = _npu_module()
+    npu_module = _npu_module() if requested not in {"gpu", "cuda"} else None
     npu_available = bool(npu_module is not None and npu_module.is_available())
-    cuda_available = bool(torch.cuda.is_available())
+    cuda_available = bool(torch.cuda.is_available()) if requested != "npu" else False
     backend = choose_backend(requested, npu_available=npu_available, cuda_available=cuda_available)
     module = npu_module if backend == "npu" else torch.cuda
     assert module is not None

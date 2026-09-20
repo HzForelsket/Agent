@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 from contextlib import contextmanager
 from copy import deepcopy
@@ -301,7 +302,23 @@ class AgentLightningTrainer(RayPPOTrainer):
                 reward_extra_infos_dict = {}
 
             # for agent mode, pad the lengths to calculate old log prob, ref, and values
-            batch, pad_size = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
+            # A rollout can split into several non-prefix-compatible segments.
+            # Static inference micro-batches must divide each rank's segment count.
+            inference_divisor = self.actor_rollout_wg.world_size
+            rollout_config = self.config.actor_rollout_ref.rollout
+            if not rollout_config.log_prob_use_dynamic_bsz:
+                inference_divisor = math.lcm(
+                    inference_divisor,
+                    self.actor_rollout_wg.world_size * rollout_config.log_prob_micro_batch_size_per_gpu,
+                )
+            ref_config = self.config.actor_rollout_ref.ref
+            if self.use_reference_policy and not ref_config.log_prob_use_dynamic_bsz:
+                inference_divisor = math.lcm(
+                    inference_divisor,
+                    self.actor_rollout_wg.world_size * ref_config.log_prob_micro_batch_size_per_gpu,
+                )
+            batch, pad_size = pad_dataproto_to_divisor(batch, inference_divisor)
+            metrics["training/n_logprob_padding"] = pad_size
 
             # recompute old_log_probs
             with _timer("old_log_prob", timing_raw):
@@ -374,7 +391,11 @@ class AgentLightningTrainer(RayPPOTrainer):
                 )
                 batch = batch[keep_indices]
                 # next, round to minibatch size
-                mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                # VERL's actor multiplies the prompt mini-batch by rollout.n.
+                mini_batch_size = (
+                    self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                    * self.config.actor_rollout_ref.rollout.n
+                )
                 n_transition = len(batch)
                 if self.config.agentlightning.prefix_grouper.enabled:
                     from .prefix_grouper import reorder_by_prompt

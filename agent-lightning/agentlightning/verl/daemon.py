@@ -986,18 +986,19 @@ class AgentModeDaemon:
                     if current_merged_trace_idx[0] > 0 and len(prompt_ids) > max_prompt_length:
                         response_ids = prompt_ids[max_prompt_length:]
                         prompt_ids = prompt_ids[:max_prompt_length]
-                        response_mask = [1] * len(response_ids)
+                        response_mask = [0] * len(response_ids)
                     else:
                         response_ids = []
                         response_mask = []
 
                     prompt_length = len(prompt_ids)
-                    response_ids += sample_info["trace_list"][current_merged_trace_idx[0]]["response_ids"]
-                    response_mask += [1] * len(response_ids)
+                    first_response = sample_info["trace_list"][current_merged_trace_idx[0]]["response_ids"]
+                    response_ids += first_response
+                    response_mask += [1] * len(first_response)
                     for turn_index in current_merged_trace_idx[1:]:
                         trace = sample_info["trace_list"][turn_index]
                         new_prompt_length = len(trace["prompt_ids"]) - len(response_ids) - prompt_length
-                        response_ids += trace["prompt_ids"][-new_prompt_length:]
+                        response_ids += trace["prompt_ids"][prompt_length + len(response_ids) :]
                         response_ids += trace["response_ids"]
                         response_mask += [0] * new_prompt_length
                         response_mask += [1] * len(trace["response_ids"])
