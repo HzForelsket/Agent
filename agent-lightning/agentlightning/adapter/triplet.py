@@ -898,8 +898,8 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
         """Extract token ids from raw_gen_ai_request attributes.
 
         - llm.hosted_vllm.prompt_token_ids: string -> List[int]
-        - llm.hosted_vllm.response_token_ids: string -> List[List[int]] -> take first
-        - llm.hosted_vllm.choices: string -> [{'token_ids': [...]}] -> take first
+        - llm.hosted_vllm.response_token_ids: string -> List[int] or List[List[int]]
+        - llm.hosted_vllm.choices: token ids may be direct or provider-specific
         """
         prompt_ids: List[int] = []
         resp_ids: List[int] = []
@@ -910,7 +910,8 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
         # response preferred path
         r = attrs.get("llm.hosted_vllm.response_token_ids")
         r = self._literal_eval_maybe(r)
-        if isinstance(r, (list, tuple)) and r:
+        resp_ids = self._coerce_token_ids(r)
+        if not resp_ids and isinstance(r, (list, tuple)) and r:
             resp_ids = self._coerce_token_ids(cast(Sequence[Any], r)[0])
 
         # fallback via choices
@@ -922,6 +923,10 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
                 if isinstance(cand, dict):
                     tids = cast(Dict[str, Any], cand).get("token_ids")
                     resp_ids = self._coerce_token_ids(tids)
+                    if not resp_ids:
+                        provider_fields = cast(Dict[str, Any], cand).get("provider_specific_fields")
+                        if isinstance(provider_fields, dict):
+                            resp_ids = self._coerce_token_ids(cast(Dict[str, Any], provider_fields).get("token_ids"))
 
         return prompt_ids, resp_ids
 

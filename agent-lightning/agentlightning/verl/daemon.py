@@ -460,6 +460,10 @@ class AgentModeDaemon:
                         "litellm_params": {
                             "model": "hosted_vllm/" + self.model_name,
                             "api_base": f"http://{address}/v1/",
+                            # Training requires the exact serving token IDs. Keep this
+                            # explicit in the route as well as in the proxy callback so
+                            # LiteLLM callback/version differences cannot silently drop it.
+                            "extra_body": {"return_token_ids": True},
                         },
                     }
                 )
@@ -1041,7 +1045,7 @@ class AgentModeDaemon:
                 "No trainable transitions were produced from "
                 f"{len(self._completed_rollouts_v0)} completed rollouts; "
                 f"{len(finished_id_to_sample_info)} rollouts contained token-bearing triplets. "
-                "Check that the LLM response exposes non-empty prompt_token_ids and response token_ids "
+                "Check that the LLM response exposes non-empty prompt_token_ids and response_token_ids "
                 "and that LiteLLM exported those fields to the rollout trace."
             )
         batch_input_ids = torch.LongTensor(input_ids_list).to(device)

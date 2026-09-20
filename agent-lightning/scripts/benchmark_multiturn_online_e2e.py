@@ -434,7 +434,13 @@ class Q20Agent(agl.LitAgent[dict[str, Any]]):
         llm = resources["main_llm"]
         environment_llm = resources["environment_llm"]
         base_url = llm.get_base_url(rollout.rollout_id, rollout.attempt.attempt_id)
-        player = CrewLLM(model="openai/" + llm.model, base_url=base_url, api_key="dummy", timeout=120.0)
+        player = CrewLLM(
+            model="openai/" + llm.model,
+            base_url=base_url,
+            api_key="dummy",
+            extra_body={"return_token_ids": True},
+            timeout=120.0,
+        )
         answerer = UntracedCrewLLM(
             model="openai/" + environment_llm.model,
             base_url=environment_llm.endpoint,

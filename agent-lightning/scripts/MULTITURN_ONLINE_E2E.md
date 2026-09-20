@@ -53,6 +53,13 @@ python scripts/benchmark_multiturn_online_e2e.py \
 实现中的 `api_key="dummy"` 只是本地 OpenAI 兼容客户端的必填占位值，不是凭证，
 不会读取 `OPENAI_API_KEY`，也不会连接 OpenAI 服务。
 
+若旧版本在首个训练 step 报出 `no trainable transitions` 和
+`0 rollouts contained token-bearing triplets`，说明 rollout 已完成，但 LiteLLM trace
+没有被转换出非空的 prompt/response token IDs。当前入口会在客户端和本地 vLLM 路由两层
+显式请求 `return_token_ids`，并兼容 LiteLLM 将生成 token IDs 放在
+`choices[0].provider_specific_fields.token_ids` 的响应形态。更新代码后应使用新的
+`--output-dir` 重新运行；失败目录不会被续跑。
+
 GPU 运行只需把 `--device npu` 改成 `--device gpu`。无硬件检查配置时显式使用
 `--device gpu|npu --dry-run`。NPU 正式运行要求项目固定的 CANN 9.0.0、
 torch/torch-npu 2.10.0、vLLM 0.22.1、vllm-ascend 0.22.1rc1 和 VERL 0.9.0
