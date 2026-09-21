@@ -645,8 +645,9 @@ class AgentModeDaemon:
         2. Triplets: obtained by querying spans and feeding into the adapter
         3. Final reward: extracted from last triplet's reward, searching backwards if not found
         """
-        # Query spans for this rollout (latest attempt)
-        attempt_id = rollout.attempt.attempt_id if rollout.attempt is not None else "latest"
+        # wait_for_rollouts returns Rollout, not AttemptedRollout. Resolve the
+        # latest attempt through the store instead of accessing rollout.attempt.
+        attempt_id = "latest"
         spans = await self.store.query_spans(rollout.rollout_id, attempt_id=attempt_id)
         self._rollout_statuses[rollout.rollout_id] = rollout.status
 
