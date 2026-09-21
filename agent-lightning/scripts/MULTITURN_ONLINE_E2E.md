@@ -85,6 +85,9 @@ Q20 的 player、answerer 和 search 单次模型请求默认超时 120 秒，�
 带 rollout 标识的 proxy 请求会等待该请求的 trace 写入 Store 后才返回成功，避免
 任务已结束但异步 trace 尚未入库的竞态。导出等待默认上限为 30 秒
 （`LLMProxy.trace_export_timeout`），失败会返回明确的 trace export 错误。
+请求通过上下文显式传递 rollout/attempt/sequence 标识；响应 span 可独立于外部父 span
+入库，不依赖 LiteLLM 的请求头序列化格式。若导出超时，`Last trace stage` 会指出
+是尚未收到响应回调，还是已进入 Store 写入阶段。
 空轨迹诊断会输出 rollout 状态、span 名称及缺失或无效的 token 字段；
 `completed rollouts` 包含失败和取消任务，不表示全部生成成功。
 

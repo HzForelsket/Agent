@@ -13,6 +13,7 @@ import threading
 import time
 from concurrent.futures import Future
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from typing import (
     Any,
@@ -60,6 +61,12 @@ from agentlightning.utils.server_launcher import (
 from .store.base import LightningStore
 
 logger = logging.getLogger(__name__)
+
+# LiteLLM's logging worker copies the request context into its background task.
+# Keep attribution independent of LiteLLM's serialized metadata headers.
+_request_trace_identity: ContextVar[Optional[Tuple[str, str, int]]] = ContextVar(
+    "agentlightning_proxy_request", default=None
+)
 
 __all__ = [
     "LLMProxy",
@@ -199,7 +206,8 @@ class LightningSpanExporter(SpanExporter):
 
     Design:
 
-    * Spans are buffered until a root span's entire subtree is available.
+    * Self-attributed request spans are persisted as soon as they end.
+      Other spans are grouped under an available root for header attribution.
     * A private event loop on a daemon thread runs async flush logic.
     * Rollout/attempt/sequence metadata is reconstructed by merging headers
       from any span within a subtree.
@@ -323,10 +331,9 @@ class LightningSpanExporter(SpanExporter):
         """Flush ready subtrees from the buffer.
 
         Strategy:
-            We consider a subtree "ready" if we can identify a root span. We
-            then take that root and all its descendants out of the buffer and
-            try to reconstruct rollout/attempt/sequence headers by merging any
-            span's `metadata.requester_custom_headers` within the subtree.
+            A root or a span carrying explicit rollout/attempt/sequence IDs
+            is ready without waiting for its parent. Group its buffered
+            descendants and resolve attribution from explicit IDs or headers.
 
         Required headers:
             `x-rollout-id` (str), `x-attempt-id` (str), `x-sequence-id` (str of int)
@@ -360,6 +367,19 @@ class LightningSpanExporter(SpanExporter):
 
             for span in subtree_spans:
                 if span.attributes is None:
+                    continue
+                attributes = span.attributes
+                direct_rollout = attributes.get(LightningResourceAttributes.ROLLOUT_ID.value)
+                direct_attempt = attributes.get(LightningResourceAttributes.ATTEMPT_ID.value)
+                direct_sequence = attributes.get(LightningResourceAttributes.SPAN_SEQUENCE_ID.value)
+                if direct_rollout and direct_attempt and direct_sequence is not None:
+                    headers_merged.update(
+                        {
+                            "x-rollout-id": direct_rollout,
+                            "x-attempt-id": direct_attempt,
+                            "x-sequence-id": str(direct_sequence),
+                        }
+                    )
                     continue
                 headers_str = span.attributes.get("metadata.requester_custom_headers")
                 if headers_str is None:
@@ -408,6 +428,13 @@ class LightningSpanExporter(SpanExporter):
                 )
                 continue
             sequence_id_decimal = int(sequence_id)
+            has_llm_response = any(
+                span.attributes and span.attributes.get("agentlightning.proxy.response") for span in subtree_spans
+            )
+            if self._store is None and has_llm_response:
+                get_active_llm_proxy().mark_trace_export_stage(
+                    (rollout_id, attempt_id, sequence_id_decimal), "writing spans to LightningStore"
+                )
 
             # Persist each span in the subtree with the resolved identifiers.
             if otlp_enabled:
@@ -439,21 +466,30 @@ class LightningSpanExporter(SpanExporter):
                     fut = asyncio.run_coroutine_threadsafe(add_otel_span_task, loop)
                     fut.result()  # Bubble up any exceptions from the coroutine.
 
-            # The client may finish its rollout as soon as it receives a response.
-            # Acknowledge only after the complete request subtree is in the store.
-            if self._store is None:
+            # An HTTP/root span alone does not mean the LLM response was exported.
+            if self._store is None and has_llm_response:
                 get_active_llm_proxy().acknowledge_trace_export(rollout_id, attempt_id, sequence_id_decimal)
 
     def _get_root_span_ids(self) -> Iterable[int]:
         """Yield span_ids for root spans currently in the buffer.
 
-        A root span is defined as one with `parent is None`.
+        Self-attributed request spans can be exported independently of their
+        parent, which may live in another process or may already have ended.
 
         Yields:
             int: Span id for each root span found.
         """
         for span in self._buffer:
-            if span.parent is None:
+            attrs = span.attributes or {}
+            attributed = all(
+                key.value in attrs
+                for key in (
+                    LightningResourceAttributes.ROLLOUT_ID,
+                    LightningResourceAttributes.ATTEMPT_ID,
+                    LightningResourceAttributes.SPAN_SEQUENCE_ID,
+                )
+            )
+            if span.parent is None or attributed:
                 span_context = span.get_span_context()
                 if span_context is not None:
                     yield span_context.span_id
@@ -566,11 +602,36 @@ class LightningOpenTelemetry(OpenTelemetry):
     def set_attributes(self, span: Any, kwargs: Any, response_obj: Optional[Any]) -> None:
         """Add normalized token IDs to LiteLLM's primary request span."""
         super().set_attributes(span, kwargs, response_obj)  # pyright: ignore[reportUnknownMemberType]
+        self._set_response_attributes(span, response_obj)
+
+    def set_raw_request_attributes(self, span: Any, kwargs: Any, response_obj: Any) -> None:
+        """Attribute raw spans too, even when their parent has already been exported."""
+        super().set_raw_request_attributes(span, kwargs, response_obj)
+        self._set_response_attributes(span, response_obj)
+
+    def _set_response_attributes(self, span: Any, response_obj: Any) -> None:
+        identity = _request_trace_identity.get()
+        if identity is not None:
+            if response_obj is not None:
+                get_active_llm_proxy().mark_trace_export_stage(identity, "LLM response callback received")
+            rollout_id, attempt_id, sequence_id = identity
+            span.set_attribute(LightningResourceAttributes.ROLLOUT_ID.value, rollout_id)
+            span.set_attribute(LightningResourceAttributes.ATTEMPT_ID.value, attempt_id)
+            span.set_attribute(LightningResourceAttributes.SPAN_SEQUENCE_ID.value, sequence_id)
+        if response_obj is not None:
+            span.set_attribute("agentlightning.proxy.response", True)
         prompt_ids, response_ids = self._response_token_ids(response_obj)
         if prompt_ids is not None:
             span.set_attribute("prompt_token_ids", prompt_ids)
         if response_ids is not None:
             span.set_attribute("response_token_ids", response_ids)
+
+    def create_litellm_proxy_request_started_span(self, start_time: datetime, headers: dict) -> Any:
+        """Attribute the server span even when its parent belongs to the client."""
+        span = super().create_litellm_proxy_request_started_span(start_time=start_time, headers=headers)
+        if span is not None:
+            self._set_response_attributes(span, None)
+        return span
 
     async def async_pre_call_deployment_hook(
         self, kwargs: Dict[str, Any], call_type: Optional[CallTypes] = None
@@ -639,29 +700,37 @@ class RolloutAttemptMiddleware(BaseHTTPMiddleware):
                     export_done = Future()
                     with proxy._trace_exports_lock:
                         proxy._trace_exports[export_key] = export_done
+                        proxy._trace_export_stages[export_key] = "waiting for LiteLLM response callback"
             else:
                 logger.warning("Store is not set. Skipping sequence id allocation and header injection.")
 
+        identity_token = _request_trace_identity.set(export_key)
         try:
             response = await call_next(request)
             if export_done is not None and 200 <= response.status_code < 300:
+                assert export_key is not None
                 try:
                     await asyncio.wait_for(
                         asyncio.shield(asyncio.wrap_future(export_done)), timeout=proxy.trace_export_timeout
                     )
                 except asyncio.TimeoutError:
+                    with proxy._trace_exports_lock:
+                        stage = proxy._trace_export_stages.get(export_key, "unknown")
                     message = (
                         f"LLM response completed but trace export did not finish within "
                         f"{proxy.trace_export_timeout}s for rollout/attempt/sequence={export_key}. "
+                        f"Last trace stage: {stage}. "
                         "Check LiteLLM callback errors, exporter headers and LightningStore connectivity."
                     )
                     logger.error(message)
                     return JSONResponse(status_code=503, content={"error": {"message": message}})
             return response
         finally:
+            _request_trace_identity.reset(identity_token)
             if export_key is not None:
                 with proxy._trace_exports_lock:
                     proxy._trace_exports.pop(export_key, None)
+                    proxy._trace_export_stages.pop(export_key, None)
 
 
 class MessageInspectionMiddleware(BaseHTTPMiddleware):
@@ -1169,6 +1238,7 @@ class LLMProxy:
             raise ValueError("trace_export_timeout must be positive")
         self.trace_export_timeout = trace_export_timeout
         self._trace_exports: Dict[Tuple[str, str, int], Future[None]] = {}
+        self._trace_export_stages: Dict[Tuple[str, str, int], str] = {}
         self._trace_exports_lock = threading.Lock()
 
         if launcher_args is not None and (
@@ -1231,11 +1301,18 @@ class LLMProxy:
         state = self.__dict__.copy()
         state.pop("_trace_exports_lock")
         state["_trace_exports"] = {}
+        state["_trace_export_stages"] = {}
         return state
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
         self.__dict__.update(state)
         self._trace_exports_lock = threading.Lock()
+
+    def mark_trace_export_stage(self, identity: Tuple[str, str, int], stage: str) -> None:
+        """Record progress for an in-flight request without retaining finished requests."""
+        with self._trace_exports_lock:
+            if identity in self._trace_exports:
+                self._trace_export_stages[identity] = stage
 
     def acknowledge_trace_export(self, rollout_id: str, attempt_id: str, sequence_id: int) -> None:
         """Release a request only after its telemetry has been persisted."""
