@@ -7,8 +7,8 @@ The input is one or more workload-labelled ``calls.jsonl`` exports.  The script
 reconstructs the same untruncated training segments as
 ``analyze_multiturn_token_ratio.py``, groups exact prompts within each task, and
 reports the duplicate prompt-token work removable at each micro-batch size.
-It also exports each rollout's initial-prompt length and final logical
-trajectory length, plus task-level length summaries.
+It also exports each rollout's interaction rounds, initial-prompt length and
+final logical trajectory length, plus task-level summaries.
 
 Example:
     python scripts/analyze_grpo_microbatch_sharing.py \
@@ -152,14 +152,14 @@ def load_trajectories(path: Path, role: str, group_key: str) -> list[dict[str, A
     return [analyze_trajectory(identifier, turns) for identifier, turns in sorted(groups.items())]
 
 
-def trajectory_length_rows(workload: str, trajectories: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Export exact initial and final logical lengths for every trajectory."""
+def trajectory_metric_rows(workload: str, trajectories: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Export interaction-round and length metrics for every trajectory."""
     return [
         {
             "workload": workload,
             "task_id": str(trajectory["group_id"]),
             "trajectory_id": trajectory["trajectory_id"],
-            "turns": trajectory["turns"],
+            "interaction_rounds": trajectory["turns"],
             "prefix_breaks": trajectory["prefix_breaks"],
             "training_segments": trajectory["segments"],
             "initial_prompt_length": len(trajectory["_initial_prompt_ids"]),
@@ -177,6 +177,7 @@ def task_rows(workload: str, trajectories: list[dict[str, Any]], sizes: list[int
 
     rows: list[dict[str, Any]] = []
     for task_id, task_trajectories in sorted(by_task.items()):
+        interaction_rounds = [int(trajectory["turns"]) for trajectory in task_trajectories]
         initial_prompt_lengths = [len(trajectory["_initial_prompt_ids"]) for trajectory in task_trajectories]
         final_trajectory_lengths = [int(trajectory["_logical_total_tokens"]) for trajectory in task_trajectories]
         exact_prompts: dict[tuple[int, ...], int] = defaultdict(int)
@@ -211,6 +212,11 @@ def task_rows(workload: str, trajectories: list[dict[str, Any]], sizes: list[int
                     "task_id": task_id,
                     "micro_batch_size_per_device": size,
                     "trajectories": len(task_trajectories),
+                    "interaction_rounds_min": min(interaction_rounds),
+                    "interaction_rounds_mean": statistics.fmean(interaction_rounds),
+                    "interaction_rounds_p50": percentile([float(value) for value in interaction_rounds], 0.50),
+                    "interaction_rounds_p95": percentile([float(value) for value in interaction_rounds], 0.95),
+                    "interaction_rounds_max": max(interaction_rounds),
                     "initial_prompt_length_min": min(initial_prompt_lengths),
                     "initial_prompt_length_mean": statistics.fmean(initial_prompt_lengths),
                     "initial_prompt_length_max": max(initial_prompt_lengths),
@@ -286,6 +292,7 @@ def render_report(inputs: dict[str, str], rows: list[dict[str, Any]], summaries:
         "",
         "- 共享比例 = 同一 task 内、同一 micro-batch 中可消除的重复 prompt token / 独立执行的训练总 token。",
         "- 训练总 token = 每个 exact-prefix segment 的 prompt token + response suffix token。",
+        "- 交互轮数 = 一条 trajectory 中 policy 模型的调用次数。",
         "- 初始 prompt 长度 = trajectory 第一次 policy 调用的 prompt token 数。",
         "- 最终轨迹长度 = trajectory 最后一次 policy 调用的完整 prompt 加 response token 数。",
         "- 同一 task 的完全相同 prompt 会按生产逻辑连续排列；一个 prompt group 跨越几个 micro-batch，就需计算几次。",
@@ -310,16 +317,18 @@ def render_report(inputs: dict[str, str], rows: list[dict[str, Any]], summaries:
             "",
             "## 每个 task 的结果",
             "",
-            "| 数据集 | task | micro-batch | 初始 prompt 均值 | 最终轨迹均值 | 最终轨迹 P95 | 独立 token | 可省 token | 共享比例 | token work ratio |",
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| 数据集 | task | micro-batch | 交互轮数均值 | 交互轮数 P95 | 初始 prompt 均值 | 最终轨迹均值 | 最终轨迹 P95 | 独立 token | 可省 token | 共享比例 | token work ratio |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in rows:
         lines.append(
             "| {workload} | `{task_id}` | {micro_batch_size_per_device} | "
-            "{initial_mean:.2f} | {final_mean:.2f} | {final_p95:.2f} | "
+            "{rounds_mean:.2f} | {rounds_p95:.2f} | {initial_mean:.2f} | {final_mean:.2f} | {final_p95:.2f} | "
             "{independent_total_tokens} | {reducible_duplicate_prompt_tokens} | {sharing} | {work_ratio:.4f}× |".format(
                 **row,
+                rounds_mean=float(row["interaction_rounds_mean"]),
+                rounds_p95=float(row["interaction_rounds_p95"]),
                 initial_mean=float(row["initial_prompt_length_mean"]),
                 final_mean=float(row["final_trajectory_length_mean"]),
                 final_p95=float(row["final_trajectory_length_p95"]),
@@ -373,19 +382,19 @@ def main() -> None:
     if len(inputs) != len(args.input):
         raise ValueError("workload labels passed to --input must be unique")
     rows: list[dict[str, Any]] = []
-    length_rows: list[dict[str, Any]] = []
+    trajectory_rows: list[dict[str, Any]] = []
     resolved_inputs: dict[str, str] = {}
     for workload, path in args.input:
         path = path.resolve()
         resolved_inputs[workload] = str(path)
         trajectories = load_trajectories(path, args.role, args.group_key)
-        length_rows.extend(trajectory_length_rows(workload, trajectories))
+        trajectory_rows.extend(trajectory_metric_rows(workload, trajectories))
         rows.extend(task_rows(workload, trajectories, args.micro_batch_sizes))
     summaries = summarize_rows(rows)
 
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    write_csv(output_dir / "per_trajectory_lengths.csv", length_rows)
+    write_csv(output_dir / "per_trajectory_metrics.csv", trajectory_rows)
     write_csv(output_dir / "per_task_microbatch_sharing.csv", rows)
     write_csv(output_dir / "task_sharing_distribution.csv", summaries)
     report = {
@@ -401,7 +410,7 @@ def main() -> None:
             "Each task starts at a micro-batch boundary.",
             "Sharing is limited to one task and cannot cross data-parallel rank boundaries.",
         ],
-        "per_trajectory_lengths": length_rows,
+        "per_trajectory_metrics": trajectory_rows,
         "per_task": rows,
         "task_distribution": summaries,
     }
