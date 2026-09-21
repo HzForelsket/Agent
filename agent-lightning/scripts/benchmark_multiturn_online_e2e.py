@@ -167,6 +167,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--web-embedding-model", default="BAAI/bge-large-en-v1.5")
     parser.add_argument("--web-embedding-cache", type=Path)
     parser.add_argument("--q20-search", action="store_true")
+    parser.add_argument(
+        "--q20-request-timeout", type=float, default=120.0, help="Timeout in seconds for each Q20 model request."
+    )
     parser.add_argument("--npu-attention-backend", choices=("fusion", "custom"), default="fusion")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--insecure-download", action="store_true")
@@ -221,6 +224,8 @@ def _logical_model_name(model: str, configured: str | None) -> str:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if not math.isfinite(args.q20_request_timeout) or args.q20_request_timeout <= 0:
+        raise ValueError("--q20-request-timeout must be finite and positive.")
     for name in (
         "steps",
         "tasks",
@@ -429,9 +434,10 @@ def build_config(
 class Q20Agent(agl.LitAgent[dict[str, Any]]):
     """Train only the player; answerer/search reuse the untraced local model."""
 
-    def __init__(self, search_enabled: bool) -> None:
+    def __init__(self, search_enabled: bool, request_timeout: float) -> None:
         super().__init__()
         self.search_enabled = search_enabled
+        self.request_timeout = request_timeout
 
     async def rollout_async(self, task: dict[str, Any], resources: Any, rollout: Any) -> float:
         sys.path.insert(0, str(Q20_DIR))
@@ -454,7 +460,7 @@ class Q20Agent(agl.LitAgent[dict[str, Any]]):
             base_url=base_url,
             api_key="dummy",
             extra_body={"return_token_ids": True},
-            timeout=120.0,
+            timeout=self.request_timeout,
         )
         answerer = UntracedCrewLLM(
             model="openai/" + environment_llm.model,
@@ -462,7 +468,7 @@ class Q20Agent(agl.LitAgent[dict[str, Any]]):
             api_key="dummy",
             temperature=0.0,
             response_format=AnswererResponse,
-            timeout=120.0,
+            timeout=self.request_timeout,
         )
         search = None
         if self.search_enabled:
@@ -472,7 +478,7 @@ class Q20Agent(agl.LitAgent[dict[str, Any]]):
                     base_url=environment_llm.endpoint,
                     api_key="dummy",
                     temperature=0.0,
-                    timeout=120.0,
+                    timeout=self.request_timeout,
                 )
             )
         flow = TwentyQuestionsFlow(player_llm=player, answer_llm=answerer, search_tool=search)
@@ -494,7 +500,7 @@ def make_agent(args: argparse.Namespace, tasks: list[dict[str, Any]], mcp_url: s
         agent.spider_dir = roots.pop()
         return agent
     if args.task == "q20":
-        return Q20Agent(args.q20_search)
+        return Q20Agent(args.q20_search, args.q20_request_timeout)
     if not mcp_url:
         raise ValueError("Web RAG requires an MCP URL.")
     sys.path.insert(0, str(RAG_DIR))
@@ -672,6 +678,7 @@ def run_training(
                 "web_mcp_url": mcp_url if args.task == "web" else None,
                 "q20_environment_model": "local_actor_backend" if args.task == "q20" else None,
                 "q20_search": args.q20_search if args.task == "q20" else None,
+                "q20_request_timeout": args.q20_request_timeout if args.task == "q20" else None,
             },
             "npu_attention_backend": args.npu_attention_backend if args.mode == "simple" else None,
             "stack": stack,
@@ -695,8 +702,7 @@ def main() -> None:
             "python": sys.executable,
             "arguments": vars(args),
             "visible_devices": {
-                name: os.environ.get(name)
-                for name in ("CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES")
+                name: os.environ.get(name) for name in ("CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES")
             },
         }
         (args.output_dir / "invocation.json").write_text(

@@ -11,6 +11,7 @@ import re
 import tempfile
 import threading
 import time
+from concurrent.futures import Future
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import (
@@ -35,7 +36,7 @@ import litellm
 import opentelemetry.trace as trace_api
 import yaml
 from fastapi import Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.opentelemetry import OpenTelemetry, OpenTelemetryConfig
 from litellm.proxy.proxy_server import app, save_worker_config  # pyright: ignore[reportUnknownVariableType]
@@ -438,6 +439,11 @@ class LightningSpanExporter(SpanExporter):
                     fut = asyncio.run_coroutine_threadsafe(add_otel_span_task, loop)
                     fut.result()  # Bubble up any exceptions from the coroutine.
 
+            # The client may finish its rollout as soon as it receives a response.
+            # Acknowledge only after the complete request subtree is in the store.
+            if self._store is None:
+                get_active_llm_proxy().acknowledge_trace_export(rollout_id, attempt_id, sequence_id_decimal)
+
     def _get_root_span_ids(self) -> Iterable[int]:
         """Yield span_ids for root spans currently in the buffer.
 
@@ -600,6 +606,9 @@ class RolloutAttemptMiddleware(BaseHTTPMiddleware):
         # while adding request-scoped headers for trace attribution.
         path = request.url.path
 
+        export_key: Optional[Tuple[str, str, int]] = None
+        export_done: Optional[Future[None]] = None
+        proxy = get_active_llm_proxy()
         match = re.match(r"^/rollout/([^/]+)/attempt/([^/]+)(/.*)?$", path)
         if match:
             rollout_id = match.group(1)
@@ -621,11 +630,38 @@ class RolloutAttemptMiddleware(BaseHTTPMiddleware):
                     (b"x-attempt-id", attempt_id.encode()),
                     (b"x-sequence-id", str(sequence_id).encode()),
                 ]
+                if (
+                    request.method == "POST"
+                    and new_path.rstrip("/").endswith(("/chat/completions", "/completions", "/messages"))
+                    and any(issubclass(cb, LightningOpenTelemetry) for cb in proxy.callbacks)
+                ):
+                    export_key = (rollout_id, attempt_id, sequence_id)
+                    export_done = Future()
+                    with proxy._trace_exports_lock:
+                        proxy._trace_exports[export_key] = export_done
             else:
                 logger.warning("Store is not set. Skipping sequence id allocation and header injection.")
 
-        response = await call_next(request)
-        return response
+        try:
+            response = await call_next(request)
+            if export_done is not None and 200 <= response.status_code < 300:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(asyncio.wrap_future(export_done)), timeout=proxy.trace_export_timeout
+                    )
+                except asyncio.TimeoutError:
+                    message = (
+                        f"LLM response completed but trace export did not finish within "
+                        f"{proxy.trace_export_timeout}s for rollout/attempt/sequence={export_key}. "
+                        "Check LiteLLM callback errors, exporter headers and LightningStore connectivity."
+                    )
+                    logger.error(message)
+                    return JSONResponse(status_code=503, content={"error": {"message": message}})
+            return response
+        finally:
+            if export_key is not None:
+                with proxy._trace_exports_lock:
+                    proxy._trace_exports.pop(export_key, None)
 
 
 class MessageInspectionMiddleware(BaseHTTPMiddleware):
@@ -1110,6 +1146,7 @@ class LLMProxy:
         callbacks: List of LiteLLM callback classes or strings to register. You can specify the class aliases or classes that have been imported.
             If not provided, the default callbacks (AddReturnTokenIds and LightningOpenTelemetry) will be used.
             Available callback aliases are: "return_token_ids", "opentelemetry", "logprobs".
+        trace_export_timeout: Maximum seconds to wait for a rollout request's trace to reach the store.
     """
 
     def __init__(
@@ -1125,8 +1162,14 @@ class LLMProxy:
         launcher_args: PythonServerLauncherArgs | None = None,
         middlewares: Sequence[Union[Type[BaseHTTPMiddleware], str]] | None = None,
         callbacks: Sequence[Union[Type[CustomLogger], str]] | None = None,
+        trace_export_timeout: float = 30.0,
     ):
         self.store = store
+        if trace_export_timeout <= 0:
+            raise ValueError("trace_export_timeout must be positive")
+        self.trace_export_timeout = trace_export_timeout
+        self._trace_exports: Dict[Tuple[str, str, int], Future[None]] = {}
+        self._trace_exports_lock = threading.Lock()
 
         if launcher_args is not None and (
             port is not None or host is not None or launch_mode != "mp" or num_workers != 1
@@ -1183,6 +1226,23 @@ class LLMProxy:
                 self.callbacks.append(callback)
             else:
                 self.callbacks.append(callback)
+
+    def __getstate__(self) -> Dict[str, Any]:
+        state = self.__dict__.copy()
+        state.pop("_trace_exports_lock")
+        state["_trace_exports"] = {}
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._trace_exports_lock = threading.Lock()
+
+    def acknowledge_trace_export(self, rollout_id: str, attempt_id: str, sequence_id: int) -> None:
+        """Release a request only after its telemetry has been persisted."""
+        with self._trace_exports_lock:
+            future = self._trace_exports.get((rollout_id, attempt_id, sequence_id))
+            if future is not None and not future.done():
+                future.set_result(None)
 
     def get_store(self) -> Optional[LightningStore]:
         """Get the store used by the proxy.

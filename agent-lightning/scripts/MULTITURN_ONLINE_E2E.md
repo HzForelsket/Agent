@@ -78,6 +78,16 @@ python scripts/benchmark_multiturn_online_e2e.py \
 实现中的 `api_key="dummy"` 只是本地 OpenAI 兼容客户端的必填占位值，不是凭证，
 不会读取 `OPENAI_API_KEY`，也不会连接 OpenAI 服务。
 
+Q20 的 player、answerer 和 search 单次模型请求默认超时 120 秒，可通过
+`--q20-request-timeout` 调整；该参数不改变
+整条 rollout attempt 默认 1200 秒的总时限。请求超时仍需结合本地模型服务日志排查。
+
+带 rollout 标识的 proxy 请求会等待该请求的 trace 写入 Store 后才返回成功，避免
+任务已结束但异步 trace 尚未入库的竞态。导出等待默认上限为 30 秒
+（`LLMProxy.trace_export_timeout`），失败会返回明确的 trace export 错误。
+空轨迹诊断会输出 rollout 状态、span 名称及缺失或无效的 token 字段；
+`completed rollouts` 包含失败和取消任务，不表示全部生成成功。
+
 若旧版本在首个训练 step 报出 `no trainable transitions` 和
 `0 rollouts contained token-bearing triplets`，说明 rollout 已完成，但 LiteLLM trace
 没有被转换出非空的 prompt/response token IDs。当前入口会在客户端和本地 vLLM 路由两层

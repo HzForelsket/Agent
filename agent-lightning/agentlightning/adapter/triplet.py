@@ -879,9 +879,12 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
 
         if isinstance(v, str):
             try:
-                return ast.literal_eval(v)
-            except Exception:
-                return v
+                return json.loads(v)
+            except (ValueError, TypeError):
+                try:
+                    return ast.literal_eval(v)
+                except (ValueError, SyntaxError):
+                    return v
         return v
 
     def _coerce_token_ids(self, value: Any) -> List[int]:
@@ -962,16 +965,36 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
         # 2) Collect LLM calls with token IDs.
         llm_items: List[Dict[str, Any]] = []
         seen_request_ids: set[str] = set()
+        recognized_spans = 0
+        missing_prompt_tokens = 0
+        missing_response_tokens = 0
         for s in spans:
             attrs = s.attributes or {}
             prompt_ids: List[int] = []
             resp_ids: List[int] = []
 
-            if s.name == "raw_gen_ai_request":
-                prompt_ids, resp_ids = self._extract_tokens_from_raw(attrs)
-            elif s.name == "litellm_request":
-                # Some proxies never include token ids here. Ignore unless present.
-                prompt_ids, resp_ids = self._extract_tokens_from_openai(attrs)
+            # LiteLLM allows metadata.generation_name to rename both spans.
+            # The token schema, rather than the display name, identifies a call.
+            has_token_fields = any(
+                key in attrs
+                for key in (
+                    "prompt_token_ids",
+                    "response_token_ids",
+                    "llm.hosted_vllm.prompt_token_ids",
+                    "llm.hosted_vllm.response_token_ids",
+                    "llm.hosted_vllm.choices",
+                )
+            )
+            if s.name not in ("raw_gen_ai_request", "litellm_request") and not has_token_fields:
+                continue
+            prompt_ids, resp_ids = self._extract_tokens_from_openai(attrs)
+            raw_prompt_ids, raw_resp_ids = self._extract_tokens_from_raw(attrs)
+            prompt_ids = prompt_ids or raw_prompt_ids
+            resp_ids = resp_ids or raw_resp_ids
+
+            recognized_spans += 1
+            missing_prompt_tokens += int(not prompt_ids)
+            missing_response_tokens += int(not resp_ids)
 
             if prompt_ids and resp_ids:
                 rid = self._request_id_from_attrs(attrs)
@@ -989,6 +1012,20 @@ class LlmProxyTraceToTriplet(TraceToTripletBase):
                         request_id=rid,
                     )
                 )
+
+        if spans and not llm_items:
+            logger.warning(
+                "No token-bearing LLM spans for rollout=%s attempt=%s: total_spans=%d, "
+                "recognized_spans=%d, missing_or_invalid_prompt_tokens=%d, "
+                "missing_or_invalid_response_tokens=%d, span_names=%s",
+                spans[0].rollout_id,
+                spans[0].attempt_id,
+                len(spans),
+                recognized_spans,
+                missing_prompt_tokens,
+                missing_response_tokens,
+                sorted({s.name for s in spans}),
+            )
 
         # Order LLM items by sequence only.
         llm_items.sort(key=lambda x: x["seq"])

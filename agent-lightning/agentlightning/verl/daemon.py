@@ -8,7 +8,7 @@ import socket
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Mapping
 from typing import Any, Dict, List, Literal, Optional, Tuple, cast
 
@@ -279,6 +279,7 @@ class AgentModeDaemon:
         self.backend_llm_server_addresses: List[str] = []
         self._total_tasks_queued = 0
         self._completed_rollouts_v0: Dict[str, RolloutLegacy] = {}
+        self._rollout_statuses: Dict[str, str] = {}
         self._task_id_to_original_sample: Dict[str, Dict[str, Any]] = {}
         self._server_thread: Optional[threading.Thread] = None
         self._proxy_thread: Optional[threading.Thread] = None
@@ -645,11 +646,17 @@ class AgentModeDaemon:
         3. Final reward: extracted from last triplet's reward, searching backwards if not found
         """
         # Query spans for this rollout (latest attempt)
-        spans = await self.store.query_spans(rollout.rollout_id, attempt_id="latest")
+        attempt_id = rollout.attempt.attempt_id if rollout.attempt is not None else "latest"
+        spans = await self.store.query_spans(rollout.rollout_id, attempt_id=attempt_id)
+        self._rollout_statuses[rollout.rollout_id] = rollout.status
 
         # Convert spans to triplets using the adapter
         if not spans:
-            # No triplets found, will emit a warning later.
+            print(
+                f"Warning: No spans in store for rollout={rollout.rollout_id}, "
+                f"attempt={attempt_id}, status={rollout.status}. "
+                "Check runner errors and proxy trace export failures."
+            )
             triplets = []
         else:
             triplets = self.adapter.adapt(spans)
@@ -1046,8 +1053,10 @@ class AgentModeDaemon:
                 "No trainable transitions were produced from "
                 f"{len(self._completed_rollouts_v0)} completed rollouts; "
                 f"{len(finished_id_to_sample_info)} rollouts contained token-bearing triplets. "
-                "Check that the LLM response exposes non-empty prompt_token_ids and response_token_ids "
-                "and that LiteLLM exported those fields to the rollout trace."
+                f"Rollout statuses: {dict(Counter(self._rollout_statuses.values()))}. "
+                "Completed includes failed/cancelled rollouts. Check the per-rollout diagnostics for "
+                "missing spans, unrecognized span names, or missing/invalid prompt and response token IDs; "
+                "also check earlier runner and proxy trace export errors."
             )
         batch_input_ids = torch.LongTensor(input_ids_list).to(device)
         input_attention_mask = torch.LongTensor(input_attention_mask_list).to(device)
@@ -1162,6 +1171,7 @@ class AgentModeDaemon:
         """Resets the internal state of the daemon for the next run."""
         self.backend_llm_server_addresses = []
         self._completed_rollouts_v0.clear()
+        self._rollout_statuses.clear()
         self._task_id_to_original_sample.clear()
         self._total_tasks_queued = 0
         # For a true reset, the server's internal queues would also need clearing.
