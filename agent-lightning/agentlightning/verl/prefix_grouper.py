@@ -489,8 +489,28 @@ def _prefix_grouper_forward_step(
     micro_batch: TensorDict,
     loss_function: Any,
     forward_only: bool,
-):
+) -> tuple[torch.Tensor, dict[str, Any]]:
     """FSDP engine hook matching VERL 0.9's ``forward_step`` contract."""
+    loss, metadata = _forward_step_with_grouping(engine, micro_batch, loss_function, forward_only)
+    # VERL concatenates micro-batch results with as_nested_tensor, which does
+    # not promote mixed dtypes. A batch can alternate between grouped FP32
+    # outputs and ordinary BF16 outputs when prompts are no longer shared.
+    # Normalize the small per-token statistics before local or Ray collection;
+    # the trainer's later .float() runs only after that collection succeeds.
+    for name in ("log_probs", "entropy"):
+        value = metadata["model_output"].get(name)
+        if value is not None:
+            metadata["model_output"][name] = value.float()
+    return loss, metadata
+
+
+def _forward_step_with_grouping(
+    engine: FSDPEngineWithLMHead,
+    micro_batch: TensorDict,
+    loss_function: Any,
+    forward_only: bool,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Compute one micro-batch using shared prompts when available."""
     unsupported = (
         tu.get_non_tensor_data(micro_batch, "use_remove_padding", False)
         or tu.get_non_tensor_data(micro_batch, "use_fused_kernels", False)

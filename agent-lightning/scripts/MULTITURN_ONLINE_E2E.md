@@ -82,6 +82,29 @@ Q20 的 player、answerer 和 search 单次模型请求默认超时 120 秒，�
 `--q20-request-timeout` 调整；该参数不改变
 整条 rollout attempt 默认 1200 秒的总时限。请求超时仍需结合本地模型服务日志排查。
 
+训练轨迹长度与在线请求预算分别配置，SQL、Q20、Web 使用同一套规则：
+
+- `--max-prompt-length` 和 `--max-response-length` 只决定训练轨迹的 prompt/suffix 容量。
+  suffix 可以包含历史回复和工具上下文，并非单次生成长度。
+- `--rollout-max-model-len` 决定 vLLM 服务的总上下文容量，默认读取模型配置。
+  对默认 Qwen3-8B 为 40960；将训练 suffix 设为 8192 不再把服务上限降到 12288。
+- `--rollout-max-tokens` 决定每次在线请求的最大输出长度，默认 2048。
+  Q20 的 player、answerer 和可选 search 均显式传入该上限；服务端也会为其他客户端
+  补齐缺省预算，并将更大的请求预算限制在该上限内。客户端更小的预算仍然有效。
+- 所有在线 chat 请求都在服务端预留输出空间，再由 vLLM 对套用聊天模板后的 token
+  序列执行长度限制。超长时默认从左侧截断，保留末尾上下文；这可能丢失早期规则、
+  系统提示或任务信息，影响任务质量。显式指定的更短输入上限和截断方向仍被尊重。
+  训练 trace 使用服务返回的真实 token IDs，不会把截断前的文本当成模型输入。
+
+例如保留训练 prompt 4096、suffix 8192，可在原命令中使用
+`--max-prompt-length 4096 --max-response-length 8192 --rollout-max-tokens 2048`。
+如果还需要降低推理上下文容量，可独立设置 `--rollout-max-model-len 12288`；
+此时默认每次输入最多保留 10240 tokens，为输出预留 2048 tokens。
+服务预算不能保证整段多轮轨迹都落入训练容量；训练转换仍按训练长度截断。
+
+结果 schema 为 2，记录并比较 `rollout_max_model_len` 与 `rollout_max_tokens`。
+baseline/simple 必须使用相同预算；旧 schema 结果不能与本次修改后的结果混合比较。
+
 带 rollout 标识的 proxy 请求会等待该请求的 trace 写入 Store 后才返回成功，避免
 任务已结束但异步 trace 尚未入库的竞态。导出等待默认上限为 30 秒
 （`LLMProxy.trace_export_timeout`），失败会返回明确的 trace export 错误。

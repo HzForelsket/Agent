@@ -3,15 +3,16 @@
 
 r"""Analyze multi-turn prefix sharing through one offline entrypoint.
 
-The default training view reconstructs untruncated exact-prefix segments and
-reports token composition and micro-batch-constrained exact-prompt savings.
+The default view compares the first N collected rollouts of each task. Its
+independent token count sums one final context per selected rollout, not all
+training segments. Training-segment diagnostics are reported separately.
 The calls and trajectory views compare common-prefix and trie sharing using
 explicitly different statistical units. No model or accelerator is required.
 
 Usage:
     python scripts/analyze_multiturn_sharing.py \
         --input sql=/runs/sql/calls.jsonl --input q20=/runs/q20/calls.jsonl \
-        --micro-batch-sizes 1,2,4,8,16,32,64 --output-dir /runs/sharing
+        --rollout-counts 1,2,4,8,16,32,64 --output-dir /runs/sharing
     python scripts/analyze_multiturn_sharing.py \
         --view calls --input /runs/sql --output-dir /runs/sql/analysis
 
@@ -351,6 +352,7 @@ def analyze_trajectory(trajectory: str, turns: list[dict[str, Any]]) -> dict[str
         "_initial_prompt_ids": initial_prompt_ids,
         "_logical_response_tokens": logical_response,
         "_logical_total_tokens": len(final_context_ids),
+        "_final_context_ids": final_context_ids,
         "_sharing_segments": segments,
     }
 
@@ -486,7 +488,7 @@ def distribution(values: Iterable[float | None]) -> dict[str, Any]:
 def load_training_trajectories(
     path: Path, role: str, group_key: str
 ) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
-    """Read ordered token calls once for all training and micro-batch metrics."""
+    """Read token calls, retaining collection order and optional rollout indices."""
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     selected_records = 0
     skipped_roles: dict[str, int] = defaultdict(int)
@@ -500,6 +502,9 @@ def load_training_trajectories(
         resolved_group_key, group_id = sharing_group_id(record, group_key, context)
         if resolved_group_key is None:
             raise ValueError(f"{context} has no task/data group identifier")
+        sample_index = record.get("sample_index", record.get("rollout_index"))
+        if sample_index is not None and (type(sample_index) is not int or sample_index < 0):
+            raise ValueError(f"{context} has an invalid sample_index or rollout_index")
         groups[identifier].append(
             {
                 "turn": turn_index(record, fallback, context),
@@ -507,6 +512,7 @@ def load_training_trajectories(
                 "response_ids": token_ids(record, "response", context),
                 "group_key": resolved_group_key,
                 "group_id": group_id,
+                "sample_index": sample_index,
             }
         )
         selected_records += 1
@@ -514,7 +520,15 @@ def load_training_trajectories(
     if not groups:
         raise ValueError(f"No analyzable records found in {path}")
 
-    trajectories = [analyze_trajectory(identifier, turns) for identifier, turns in sorted(groups.items())]
+    trajectories = []
+    for collection_order, (identifier, turns) in enumerate(groups.items()):
+        indices = {turn["sample_index"] for turn in turns if turn["sample_index"] is not None}
+        if len(indices) > 1:
+            raise ValueError(f"trajectory {identifier!r} changes rollout index across turns")
+        trajectory = analyze_trajectory(identifier, turns)
+        trajectory["sample_index"] = next(iter(indices)) if indices else None
+        trajectory["collection_order"] = collection_order
+        trajectories.append(trajectory)
     return trajectories, selected_records, dict(skipped_roles)
 
 
@@ -611,214 +625,183 @@ def summarize_training(
     return report
 
 
-def parse_micro_batch_sizes(value: str) -> list[int]:
-    """Parse a comma-separated, strictly increasing set of positive sizes."""
+def parse_rollout_counts(value: str) -> list[int]:
+    """Parse positive rollout cohort sizes in ascending order."""
     try:
-        sizes = sorted({int(item.strip()) for item in value.split(",") if item.strip()})
+        counts = sorted({int(item.strip()) for item in value.split(",") if item.strip()})
     except ValueError as error:
-        raise argparse.ArgumentTypeError("micro-batch sizes must be integers") from error
-    if not sizes or sizes[0] <= 0:
-        raise argparse.ArgumentTypeError("micro-batch sizes must be positive")
-    return sizes
+        raise argparse.ArgumentTypeError("rollout counts must be integers") from error
+    if not counts or counts[0] <= 0:
+        raise argparse.ArgumentTypeError("rollout counts must be positive")
+    return counts
 
 
-def task_rows(workload: str, trajectories: list[dict[str, Any]], sizes: list[int]) -> list[dict[str, Any]]:
-    """Compute micro-batch-constrained sharing metrics for every task."""
+def task_rows(
+    workload: str, trajectories: list[dict[str, Any]], counts: list[int]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Select nested rollout cohorts and sum their final contexts exactly once."""
     by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for trajectory in trajectories:
         by_task[str(trajectory["group_id"])].append(trajectory)
-
-    rows: list[dict[str, Any]] = []
+    rows = []
+    skipped = []
     for task_id, task_trajectories in sorted(by_task.items()):
-        interaction_rounds = [int(trajectory["turns"]) for trajectory in task_trajectories]
-        initial_prompt_lengths = [len(trajectory["_initial_prompt_ids"]) for trajectory in task_trajectories]
-        final_trajectory_lengths = [int(trajectory["_logical_total_tokens"]) for trajectory in task_trajectories]
-        exact_prompts: dict[tuple[int, ...], int] = defaultdict(int)
-        prompt_tokens = 0
-        suffix_tokens = 0
-        segment_count = 0
-        for trajectory in task_trajectories:
-            for segment in trajectory["_sharing_segments"]:
-                prompt = tuple(segment["prompt_ids"])
-                exact_prompts[prompt] += 1
-                prompt_tokens += len(prompt)
-                suffix_tokens += int(segment["response_suffix_tokens"])
-                segment_count += 1
-
-        independent_tokens = prompt_tokens + suffix_tokens
-        if independent_tokens <= 0:
-            raise ValueError(f"{workload}/{task_id} has no training tokens")
-        repeated_groups = sum(count >= 2 for count in exact_prompts.values())
-        repeated_segments = sum(count for count in exact_prompts.values() if count >= 2)
-        for size in sizes:
-            # Each prompt group is independently packed into ceil(n / size)
-            # batches. This is an optimistic bound: different groups may
-            # start partway through a batch, and DP ranks split groups.
-            saved_tokens = sum(
-                (count - math.ceil(count / size)) * len(prompt) for prompt, count in exact_prompts.items() if count >= 2
-            )
+        indices = [trajectory["sample_index"] for trajectory in task_trajectories]
+        indexed = all(index is not None for index in indices) and len(set(indices)) == len(indices)
+        order_key = "sample_index" if indexed else "collection_order"
+        ordered = sorted(task_trajectories, key=lambda trajectory: trajectory[order_key])
+        for count in counts:
+            if len(ordered) < count:
+                skipped.append(
+                    {
+                        "workload": workload,
+                        "task_id": task_id,
+                        "rollout_count": count,
+                        "available_rollouts": len(ordered),
+                        "reason": "insufficient_rollouts",
+                    }
+                )
+                continue
+            selected = ordered[:count]
+            rounds = [trajectory["turns"] for trajectory in selected]
+            prompt_lengths = [len(trajectory["_initial_prompt_ids"]) for trajectory in selected]
+            final_lengths = [trajectory["_logical_total_tokens"] for trajectory in selected]
+            exact_prompts: Counter[tuple[int, ...]] = Counter()
+            for trajectory in selected:
+                prompt = trajectory["_initial_prompt_ids"]
+                # A rewritten final context may no longer contain the initial
+                # prompt. Never subtract tokens absent from this denominator.
+                if starts_with(trajectory["_final_context_ids"], prompt):
+                    exact_prompts[tuple(prompt)] += 1
+            independent_tokens = sum(final_lengths)
+            if independent_tokens <= 0:
+                raise ValueError(f"{workload}/{task_id} has no final-context tokens")
+            saved_tokens = sum((occurrences - 1) * len(prompt) for prompt, occurrences in exact_prompts.items())
             grouped_tokens = independent_tokens - saved_tokens
             rows.append(
                 {
                     "workload": workload,
                     "task_id": task_id,
-                    "micro_batch_size_per_device": size,
-                    "trajectories": len(task_trajectories),
-                    "interaction_rounds_min": min(interaction_rounds),
-                    "interaction_rounds_mean": mean(interaction_rounds),
-                    "interaction_rounds_p50": percentile([float(value) for value in interaction_rounds], 0.50),
-                    "interaction_rounds_p95": percentile([float(value) for value in interaction_rounds], 0.95),
-                    "interaction_rounds_max": max(interaction_rounds),
-                    "initial_prompt_length_min": min(initial_prompt_lengths),
-                    "initial_prompt_length_mean": mean(initial_prompt_lengths),
-                    "initial_prompt_length_max": max(initial_prompt_lengths),
-                    "final_trajectory_length_min": min(final_trajectory_lengths),
-                    "final_trajectory_length_mean": mean(final_trajectory_lengths),
-                    "final_trajectory_length_p50": percentile(
-                        [float(value) for value in final_trajectory_lengths], 0.50
-                    ),
-                    "final_trajectory_length_p95": percentile(
-                        [float(value) for value in final_trajectory_lengths], 0.95
-                    ),
-                    "final_trajectory_length_max": max(final_trajectory_lengths),
-                    "training_segments": segment_count,
-                    "exact_prompt_groups": len(exact_prompts),
-                    "repeated_prompt_groups": repeated_groups,
-                    "repeated_prompt_segments": repeated_segments,
-                    "independent_prompt_tokens": prompt_tokens,
-                    "response_suffix_tokens": suffix_tokens,
+                    "rollout_count": count,
+                    "available_rollouts": len(ordered),
+                    "selection_order": order_key,
+                    "selected_rollout_ids": [trajectory["trajectory_id"] for trajectory in selected],
+                    "interaction_rounds_mean": mean(rounds),
+                    "interaction_rounds_p50": percentile([float(value) for value in rounds], 0.50),
+                    "interaction_rounds_p95": percentile([float(value) for value in rounds], 0.95),
+                    "initial_prompt_length_mean": mean(prompt_lengths),
+                    "final_trajectory_length_mean": mean(final_lengths),
+                    "final_trajectory_length_p50": percentile([float(value) for value in final_lengths], 0.50),
+                    "final_trajectory_length_p95": percentile([float(value) for value in final_lengths], 0.95),
+                    "prefix_breaks": sum(trajectory["prefix_breaks"] for trajectory in selected),
+                    "initial_prompt_preserved_rollouts": sum(exact_prompts.values()),
+                    "repeated_prompt_groups": sum(occurrences >= 2 for occurrences in exact_prompts.values()),
                     "independent_total_tokens": independent_tokens,
                     "reducible_duplicate_prompt_tokens": saved_tokens,
                     "grouped_total_tokens": grouped_tokens,
                     "token_reduction": saved_tokens / independent_tokens,
-                    "prompt_deduplication_ratio": saved_tokens / prompt_tokens if prompt_tokens else 0.0,
                     "token_work_ratio": independent_tokens / grouped_tokens,
                 }
             )
-    return rows
+    return rows, skipped
 
 
-def summarize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Build task-distribution statistics for every workload and size."""
+def summarize_rows(rows: list[dict[str, Any]], skipped: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Report coverage and token-weighted savings for every requested cohort size."""
     grouped: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    excluded: Counter[tuple[str, int]] = Counter()
     for row in rows:
-        grouped[(row["workload"], row["micro_batch_size_per_device"])].append(row)
-
-    summaries: list[dict[str, Any]] = []
-    for (workload, size), members in sorted(grouped.items()):
-        stats = distribution(float(row["token_reduction"]) for row in members)
-        total_independent = sum(int(row["independent_total_tokens"]) for row in members)
-        total_saved = sum(int(row["reducible_duplicate_prompt_tokens"]) for row in members)
+        grouped[(row["workload"], row["rollout_count"])].append(row)
+    for row in skipped:
+        excluded[(row["workload"], row["rollout_count"])] += 1
+    summaries = []
+    for workload, count in sorted(set(grouped) | set(excluded)):
+        members = grouped[(workload, count)]
+        stats = distribution(row["token_reduction"] for row in members)
+        independent = sum(row["independent_total_tokens"] for row in members)
+        saved = sum(row["reducible_duplicate_prompt_tokens"] for row in members)
         summaries.append(
             {
                 "workload": workload,
-                "micro_batch_size_per_device": size,
-                **{
-                    ("task_count" if key == "count" else "zero_share_tasks" if key == "zero_count" else key): value
-                    for key, value in stats.items()
-                },
-                "weighted_token_reduction": total_saved / total_independent,
-                "total_independent_tokens": total_independent,
-                "total_saved_tokens": total_saved,
+                "rollout_count": count,
+                "task_count": len(members),
+                "insufficient_tasks": excluded[(workload, count)],
+                "selected_rollouts": len(members) * count,
+                **{key: value for key, value in stats.items() if key != "count"},
+                "weighted_token_reduction": ratio(saved, independent),
+                "total_independent_tokens": independent,
+                "total_saved_tokens": saved,
             }
         )
     return summaries
 
 
-def percent(value: float) -> str:
-    """Format a ratio as a percentage."""
-    return f"{value * 100:.2f}%"
+def percent(value: float | None) -> str:
+    """Format a measured fraction, keeping missing cohorts distinct from zero."""
+    return "N/A" if value is None else f"{value * 100:.2f}%"
 
 
-def render_report(inputs: dict[str, str], rows: list[dict[str, Any]], summaries: list[dict[str, Any]]) -> str:
-    """Render the concise human-readable analysis report."""
+def render_report(workloads: dict[str, Any], rows: list[dict[str, Any]], summaries: list[dict[str, Any]]) -> str:
+    """Explain rollout selection and use one final sequence per selected rollout."""
     lines = [
-        "# GRPO 不同 micro-batch 下的 task 共享比例",
+        "# 不同 rollout 数量下的多轮轨迹共享分析",
         "",
-        "## 口径",
-        "",
-        "- 共享比例 = 同一 task 内、同一 micro-batch 中可消除的重复 prompt token / 独立执行的训练总 token。",
-        "- 训练总 token = 每个 exact-prefix segment 的 prompt token + response suffix token。",
-        "- 交互轮数 = 一条 trajectory 中 policy 模型的调用次数。",
-        "- 初始 prompt 长度 = trajectory 第一次 policy 调用的 prompt token 数。",
-        "- 最终轨迹长度 = trajectory 最后一次 policy 调用的完整 prompt 加 response token 数。",
-        "- 同一 task 的完全相同 prompt 会按生产逻辑连续排列；一个 prompt group 跨越几个 micro-batch，就需计算几次。",
-        "- 结果是每个相同 prompt 组独立对齐 micro-batch 边界时的乐观上界；不模拟实际装箱偏移、DP rank 分配或训练截断，不是实测加速比。",
+        "- 每个 task 固定顺序取前 N 条 rollout；编号完整且唯一时按 sample_index/rollout_index 排序，否则按文件首次出现顺序。",
+        "- 各档重新计算所选 rollout 的轮数、初始 prompt、最终轨迹均值和共享率。",
+        "- 独立 token = 所选 N 条 rollout 的最终轨迹长度之和 = N × 最终轨迹长度均值（未四舍五入）。",
+        "- 最终轨迹长度 = 最后一次调用的 prompt + response 长度；不累加历史调用或训练分段。",
+        "- 仅共享所选 rollout 中完全相同、且仍保留在最终上下文开头的初始 prompt；各相同 prompt 组只保留一份。",
+        "- 本报告比较采集样本数量，不模拟训练 micro-batch、设备分配或截断，不是实测加速比。",
+        "- 前缀中断时，最终上下文不一定包含完整交互历史；训练分段诊断另列于 summary.json，不作为本表分母。",
         "",
         "## 数据覆盖",
         "",
-        "| 数据集 | 原始 calls.jsonl | task 数 | trajectory 数 |",
+        "| 数据集 | 输入 | 已采集 rollout | 调用数 |",
         "|---|---|---:|---:|",
     ]
-    workloads = sorted(inputs)
-    for workload in workloads:
-        selected = [row for row in rows if row["workload"] == workload]
-        first_size = min(int(row["micro_batch_size_per_device"]) for row in selected)
-        base = [row for row in selected if row["micro_batch_size_per_device"] == first_size]
+    for workload, report in workloads.items():
         lines.append(
-            f"| {workload} | `{inputs[workload]}` | {len(base)} | {sum(int(row['trajectories']) for row in base)} |"
+            f"| {workload} | `{report['input']}` | {report['available_rollouts']} | {report['selected_records']} |"
         )
-
     lines.extend(
         [
             "",
             "## 每个 task 的结果",
             "",
-            "| 数据集 | task | micro-batch | 交互轮数均值 | 交互轮数 P95 | 初始 prompt 均值 | 最终轨迹均值 | 最终轨迹 P95 | 独立 token | 可省 token | 共享比例 | token work ratio |",
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| 数据集 | task | rollout 数 | 已采集数 | 交互轮数均值 | 初始 prompt 均值 | 最终轨迹均值 | 最终轨迹 P95 | 独立 token（所选轨迹之和） | 可省 token | 共享比例 |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in rows:
         lines.append(
-            "| {workload} | `{task_id}` | {micro_batch_size_per_device} | "
-            "{rounds_mean:.2f} | {rounds_p95:.2f} | {initial_mean:.2f} | {final_mean:.2f} | {final_p95:.2f} | "
-            "{independent_total_tokens} | {reducible_duplicate_prompt_tokens} | {sharing} | {work_ratio:.4f}× |".format(
-                **row,
-                rounds_mean=float(row["interaction_rounds_mean"]),
-                rounds_p95=float(row["interaction_rounds_p95"]),
-                initial_mean=float(row["initial_prompt_length_mean"]),
-                final_mean=float(row["final_trajectory_length_mean"]),
-                final_p95=float(row["final_trajectory_length_p95"]),
-                sharing=percent(float(row["token_reduction"])),
-                work_ratio=float(row["token_work_ratio"]),
-            )
+            f"| {row['workload']} | `{row['task_id']}` | {row['rollout_count']} | {row['available_rollouts']} | "
+            f"{row['interaction_rounds_mean']:.2f} | {row['initial_prompt_length_mean']:.2f} | "
+            f"{row['final_trajectory_length_mean']:.2f} | {row['final_trajectory_length_p95']:.2f} | "
+            f"{row['independent_total_tokens']} | {row['reducible_duplicate_prompt_tokens']} | {percent(row['token_reduction'])} |"
         )
-
     lines.extend(
         [
             "",
-            "## task 共享比例分布",
+            "## 按 rollout 数量汇总",
             "",
-            "| 数据集 | micro-batch | n | 均值 | P50 | P95 | 最大值 | token 加权值 |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|",
+            "| 数据集 | 每 task 的 rollout 数 | 纳入 task | 数量不足 task | 所选 rollout 总数 | 独立 token 总和 | task 均值 | P50 | P95 | token 加权共享率 |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
-    for summary in summaries:
+    for row in summaries:
         lines.append(
-            "| {workload} | {micro_batch_size_per_device} | {task_count} | {mean} | {p50} | {p95} | {max_value} | {weighted} |".format(
-                workload=summary["workload"],
-                micro_batch_size_per_device=summary["micro_batch_size_per_device"],
-                task_count=summary["task_count"],
-                mean=percent(float(summary["mean"])),
-                p50=percent(float(summary["p50"])),
-                p95=percent(float(summary["p95"])),
-                max_value=percent(float(summary["max"])),
-                weighted=percent(float(summary["weighted_token_reduction"])),
-            )
+            f"| {row['workload']} | {row['rollout_count']} | {row['task_count']} | {row['insufficient_tasks']} | "
+            f"{row['selected_rollouts']} | {row['total_independent_tokens']} | {percent(row['mean'])} | "
+            f"{percent(row['p50'])} | {percent(row['p95'])} | {percent(row['weighted_token_reduction'])} |"
         )
-
-    task_counts = {summary["workload"]: int(summary["task_count"]) for summary in summaries}
-    insufficient = sorted(workload for workload, count in task_counts.items() if count < 2)
-    if insufficient:
-        lines.extend(
-            [
-                "",
-                "## 限制",
-                "",
-                f"以下数据集不足 2 个 task：{', '.join(insufficient)}。其分位数、均值、最小值和最大值会退化为单个观测值。",
-                "这些数据集的结果可以比较 micro-batch 对现有 task 的影响，但不能代表完整数据集的 task 分布。",
-            ]
-        )
+    lines.extend(
+        [
+            "",
+            "数量不足的 task 跳过该档位，不复制样本或用较小数量冒充；无可用 task 时共享率为 N/A。",
+            "不同档位可能覆盖不同 task，须结合纳入 task 数比较；单 task 的分位数不能代表完整数据集。",
+            "所选 rollout ID 和不足数量明细见 summary.json；采集调用不等于已验证正常完成的轨迹。",
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -1289,58 +1272,74 @@ def write_sequence_report(root: Path, output: Path, view: str) -> None:
     (output / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def write_training_report(inputs: dict[str, Path], output: Path, role: str, group_key: str, sizes: list[int]) -> None:
-    """Write token composition and micro-batch savings from the same loaded calls."""
+def write_rollout_report(inputs: dict[str, Path], output: Path, role: str, group_key: str, counts: list[int]) -> None:
+    """Write nested rollout-count comparisons with separate training diagnostics."""
     workloads = {}
     task_metrics = []
     trajectory_metrics = []
+    skipped_cohorts = []
     for workload, source in inputs.items():
         path = source / "calls.jsonl" if source.is_dir() else source
-        trajectories, count, skipped = load_training_trajectories(path, role, group_key)
-        report = summarize_training(path, role, group_key, trajectories, count, skipped)
-        report["validation_source"] = "token_calls_only; completion and sampling-group coverage are not validated"
-        workloads[workload] = report
-        trajectory_metrics.extend({"workload": workload, **row} for row in report["per_trajectory"])
-        task_metrics.extend(task_rows(workload, trajectories, sizes))
-    summaries = summarize_rows(task_metrics)
-    resolved_inputs = {label: str(path) for label, path in inputs.items()}
+        trajectories, count, skipped_roles = load_training_trajectories(path, role, group_key)
+        diagnostics = summarize_training(path, role, group_key, trajectories, count, skipped_roles)
+        workloads[workload] = {
+            "input": str(path),
+            "available_rollouts": len(trajectories),
+            "selected_records": count,
+            "skipped_roles": skipped_roles,
+            "validation_source": "token_calls_only; completion and sampling-group coverage are not validated",
+            "training_segment_diagnostics": diagnostics,
+        }
+        for trajectory in trajectories:
+            trajectory_metrics.append(
+                {
+                    "workload": workload,
+                    "task_id": trajectory["group_id"],
+                    "trajectory_id": trajectory["trajectory_id"],
+                    "sample_index": trajectory["sample_index"],
+                    "collection_order": trajectory["collection_order"],
+                    "interaction_rounds": trajectory["turns"],
+                    "initial_prompt_length": len(trajectory["_initial_prompt_ids"]),
+                    "final_trajectory_length": trajectory["_logical_total_tokens"],
+                    "prefix_breaks": trajectory["prefix_breaks"],
+                }
+            )
+        rows, skipped = task_rows(workload, trajectories, counts)
+        task_metrics.extend(rows)
+        skipped_cohorts.extend(skipped)
+    summaries = summarize_rows(task_metrics, skipped_cohorts)
     summary = {
         "view": "training",
-        "statistics_unit": "untruncated_training_segments",
+        "statistics_unit": "selected_rollout_final_contexts",
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "inputs": resolved_inputs,
         "role": role,
         "group_key": group_key,
-        "micro_batch_sizes_per_device": sizes,
-        "metric": "token_reduction = reducible_duplicate_prompt_tokens / independent_total_tokens",
-        "assumptions": [
-            "Each exact-prompt group is independently aligned to a micro-batch boundary: optimistic upper bound.",
-            "No sharing across tasks or data-parallel ranks; actual packing, rank splits and truncation are not simulated.",
-            "All supplied token calls are included; this view does not validate completed trajectories or full sampling groups.",
-            "Structural token work only, not measured training speedup or memory savings.",
-        ],
+        "rollout_counts": counts,
+        "definitions": {
+            "selection": "First N rollouts per task; unique complete sample indices first, otherwise first appearance in the input file. Larger cohorts contain smaller cohorts.",
+            "independent_total_tokens": "Sum of final prompt+response lengths for exactly N selected rollouts; never a sum over training segments.",
+            "sharing": "Identical initial prompts within the selected task cohort are counted once, only for rollouts whose final context still starts with that prompt.",
+            "token_reduction": "reducible_duplicate_prompt_tokens / independent_total_tokens",
+            "coverage": "Tasks with fewer than N rollouts are excluded from that cohort size, without replacement.",
+            "scope": "Rollout-count comparison, not a micro-batch or DP-rank simulation. Final contexts may omit earlier history after prefix breaks. No measured speedup claim.",
+            "training_segment_diagnostics": "All-input training-segment statistics, provided separately; these are not the denominators of the rollout-count report.",
+        },
         "workloads": workloads,
         "per_task": task_metrics,
         "task_distribution": summaries,
+        "skipped_cohorts": skipped_cohorts,
     }
-    text = render_report(resolved_inputs, task_metrics, summaries)
-    text += "\n## 轨迹 token 构成\n\n"
-    text += "训练视图纳入提供的 token 调用，不检查题组是否完整或轨迹是否正常完成。\n\n"
-    text += "| 工作负载 | 轨迹数 | policy 调用数 | 前缀中断 | 训练分段 | prompt token | suffix token |\n"
-    text += "|---|---:|---:|---:|---:|---:|---:|\n"
-    for label, report in workloads.items():
-        training = report["overall_weighted"]["training_trajectory"]
-        text += f"| {label} | {report['trajectories']} | {report['turns']} | {report['prefix_breaks']} | {report['prefix_sharing']['training_segments']} | {training['prompt_tokens']} | {training['response_suffix_tokens']} |\n"
-    text += "\n逐轨迹的 shared_prompt_fraction 是 prompt 占比；token_reduction 才是消除重复计算的比例，二者不能互换。\n"
     output.mkdir(parents=True, exist_ok=True)
     write_json(output / "summary.json", summary)
-    for filename, rows in (
-        ("per_trajectory.csv", trajectory_metrics),
-        ("per_task_microbatch.csv", task_metrics),
-        ("task_distribution.csv", summaries),
-    ):
-        write_csv(output / filename, rows, list(rows[0]))
-    (output / "report.md").write_text(text, encoding="utf-8")
+    write_csv(output / "per_trajectory.csv", trajectory_metrics, list(trajectory_metrics[0]))
+    csv_tasks = [{**row, "selected_rollout_ids": json.dumps(row["selected_rollout_ids"])} for row in task_metrics]
+    write_csv(
+        output / "per_task_rollout_counts.csv",
+        csv_tasks,
+        list(csv_tasks[0]) if csv_tasks else ["workload", "task_id", "rollout_count", "independent_total_tokens"],
+    )
+    write_csv(output / "task_distribution.csv", summaries, list(summaries[0]))
+    (output / "report.md").write_text(render_report(workloads, task_metrics, summaries), encoding="utf-8")
 
 
 def parse_input(value: str) -> tuple[str, Path]:
@@ -1361,7 +1360,9 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--view", choices=("training", "calls", "trajectory"), default="training")
     parser.add_argument(
-        "--micro-batch-sizes", type=parse_micro_batch_sizes, help="Training only; default: 1,2,4,8,16,32,64"
+        "--rollout-counts",
+        type=parse_rollout_counts,
+        help="Number of collected rollouts per task; default: 1,2,4,8,16,32,64",
     )
     parser.add_argument("--role", help="Training only; default: policy; use all to retain all roles")
     parser.add_argument("--group-key", choices=("auto", "data_id", "task_id"), help="Training only; default: auto")
@@ -1370,7 +1371,7 @@ def main() -> None:
     if len(inputs) != len(args.input):
         parser.error("input labels must be unique; use LABEL=PATH for repeated directory names")
     if args.view != "training" and (
-        len(inputs) != 1 or any(value is not None for value in (args.role, args.group_key, args.micro_batch_sizes))
+        len(inputs) != 1 or any(value is not None for value in (args.role, args.group_key, args.rollout_counts))
     ):
         parser.error("calls/trajectory views take one input and no training-only options")
     output = args.output_dir.expanduser().resolve()
@@ -1380,12 +1381,12 @@ def main() -> None:
         parser.error("output already contains a report; choose a fresh --output-dir")
     try:
         if args.view == "training":
-            write_training_report(
+            write_rollout_report(
                 inputs,
                 output,
                 args.role or "policy",
                 args.group_key or "auto",
-                args.micro_batch_sizes or [1, 2, 4, 8, 16, 32, 64],
+                args.rollout_counts or [1, 2, 4, 8, 16, 32, 64],
             )
         else:
             write_sequence_report(next(iter(inputs.values())), output, args.view)

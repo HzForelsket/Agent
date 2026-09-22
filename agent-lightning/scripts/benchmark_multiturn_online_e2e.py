@@ -41,7 +41,7 @@ from agentlightning.verl.trainer import AgentLightningTrainer
 from prefix_grouper_stack import NPU_CANN_VERSION, REQUIRED_STACKS
 
 BENCHMARK_ID = "agl-multiturn-online-e2e"
-RESULT_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 2
 DEFAULT_MODEL = "Qwen/Qwen3-8B"
 DEFAULT_STEPS = 10
 DEFAULT_TASKS = 32
@@ -152,8 +152,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-runners", type=int, default=DEFAULT_RUNNERS)
     parser.add_argument("--n-devices-per-node", type=int, default=4)
     parser.add_argument("--tensor-model-parallel-size", type=int)
-    parser.add_argument("--max-prompt-length", type=int, default=4096)
-    parser.add_argument("--max-response-length", type=int)
+    parser.add_argument("--max-prompt-length", type=int, default=4096, help="Training trajectory prompt capacity.")
+    parser.add_argument("--max-response-length", type=int, help="Training trajectory suffix capacity.")
+    parser.add_argument(
+        "--rollout-max-model-len", type=int, help="Serving context capacity; defaults to the model context length."
+    )
+    parser.add_argument(
+        "--rollout-max-tokens", type=int, default=2048, help="Maximum output tokens per online model request."
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
@@ -235,6 +241,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "n_runners",
         "n_devices_per_node",
         "max_prompt_length",
+        "rollout_max_tokens",
         "sql_max_turns",
         "web_max_turns",
         "web_mcp_port",
@@ -269,6 +276,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--save-freq must be -1 (disabled) or a positive integer.")
     if args.max_response_length is not None and args.max_response_length <= 0:
         raise ValueError("--max-response-length must be positive.")
+    if args.rollout_max_model_len is not None and args.rollout_max_model_len <= 0:
+        raise ValueError("--rollout-max-model-len must be positive.")
 
 
 def resolve_model_limits(args: argparse.Namespace) -> None:
@@ -289,6 +298,12 @@ def resolve_model_limits(args: argparse.Namespace) -> None:
     elif args.max_prompt_length + args.max_response_length > context_length:
         raise ValueError("prompt + response capacity exceeds the model context length.")
     args.model_context_length = context_length
+    if args.rollout_max_model_len is None:
+        args.rollout_max_model_len = context_length
+    elif args.rollout_max_model_len > context_length:
+        raise ValueError("--rollout-max-model-len exceeds the model context length.")
+    if args.rollout_max_tokens >= args.rollout_max_model_len:
+        raise ValueError("--rollout-max-tokens must be smaller than --rollout-max-model-len.")
 
 
 def prepare_workload(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -351,9 +366,17 @@ def build_config(
                 "log_prob_micro_batch_size_per_gpu": args.micro_batch_size_per_device,
                 "multi_turn": {"enable": False, "format": "hermes"},
                 "gpu_memory_utilization": 0.35,
-                "max_model_len": args.max_prompt_length + args.max_response_length,
+                "max_model_len": args.rollout_max_model_len,
+                "prompt_length": args.rollout_max_model_len - args.rollout_max_tokens,
+                "response_length": args.rollout_max_tokens,
                 "prometheus": {"served_model_name": args.model_name},
-                "engine_kwargs": {"vllm": {"enable_auto_tool_choice": True, "tool_call_parser": "hermes"}},
+                "engine_kwargs": {
+                    "vllm": {
+                        "enable_auto_tool_choice": True,
+                        "tool_call_parser": "hermes",
+                        "middleware": ["agentlightning.verl.rollout_context.RolloutContextMiddleware"],
+                    }
+                },
             },
             "actor": {
                 "strategy": "fsdp",
@@ -434,10 +457,11 @@ def build_config(
 class Q20Agent(agl.LitAgent[dict[str, Any]]):
     """Train only the player; answerer/search reuse the untraced local model."""
 
-    def __init__(self, search_enabled: bool, request_timeout: float) -> None:
+    def __init__(self, search_enabled: bool, request_timeout: float, max_tokens: int) -> None:
         super().__init__()
         self.search_enabled = search_enabled
         self.request_timeout = request_timeout
+        self.max_tokens = max_tokens
 
     async def rollout_async(self, task: dict[str, Any], resources: Any, rollout: Any) -> float:
         sys.path.insert(0, str(Q20_DIR))
@@ -460,6 +484,7 @@ class Q20Agent(agl.LitAgent[dict[str, Any]]):
             base_url=base_url,
             api_key="dummy",
             extra_body={"return_token_ids": True},
+            max_tokens=self.max_tokens,
             timeout=self.request_timeout,
         )
         answerer = UntracedCrewLLM(
@@ -468,6 +493,7 @@ class Q20Agent(agl.LitAgent[dict[str, Any]]):
             api_key="dummy",
             temperature=0.0,
             response_format=AnswererResponse,
+            max_tokens=self.max_tokens,
             timeout=self.request_timeout,
         )
         search = None
@@ -478,6 +504,7 @@ class Q20Agent(agl.LitAgent[dict[str, Any]]):
                     base_url=environment_llm.endpoint,
                     api_key="dummy",
                     temperature=0.0,
+                    max_tokens=self.max_tokens,
                     timeout=self.request_timeout,
                 )
             )
@@ -500,7 +527,7 @@ def make_agent(args: argparse.Namespace, tasks: list[dict[str, Any]], mcp_url: s
         agent.spider_dir = roots.pop()
         return agent
     if args.task == "q20":
-        return Q20Agent(args.q20_search, args.q20_request_timeout)
+        return Q20Agent(args.q20_search, args.q20_request_timeout, args.rollout_max_tokens)
     if not mcp_url:
         raise ValueError("Web RAG requires an MCP URL.")
     sys.path.insert(0, str(RAG_DIR))
@@ -664,6 +691,8 @@ def run_training(
             "n_runners": args.n_runners,
             "max_prompt_length": args.max_prompt_length,
             "max_response_length": args.max_response_length,
+            "rollout_max_model_len": args.rollout_max_model_len,
+            "rollout_max_tokens": args.rollout_max_tokens,
             "temperature": args.temperature,
             "learning_rate": args.learning_rate,
             "save_freq": args.save_freq,

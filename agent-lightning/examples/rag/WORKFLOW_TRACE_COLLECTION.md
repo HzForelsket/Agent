@@ -130,7 +130,7 @@ causal attention pairs 按每次调用的完整三角注意力结构计算，再
 ## 已有轨迹重算与跨任务对比
 
 所有多轮分析使用 [统一入口](../../scripts/MULTITURN_SHARING.md)。下面的 `--view calls` 保留逐调用统计单位；
-训练分段及 micro-batch 收益使用默认的 `training` 视图。`--output-dir` 必须指定尚无报告的目录。
+前 N 条 rollout 的长度与共享潜力使用默认的 `training` 视图。`--output-dir` 必须指定尚无报告的目录。
 
 ```bash
 python ../../scripts/analyze_multiturn_sharing.py --view calls --input traces/sql-30b-run01 --output-dir traces/sql-30b-run01/analysis

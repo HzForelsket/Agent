@@ -1,10 +1,10 @@
 # 统一多轮共享分析
 
-唯一入口是 `scripts/analyze_multiturn_sharing.py`。默认分析 PrefixGrouper 训练分段和
-micro-batch 共享潜力；其他统计单位通过 `--view` 明确选择。分析仅使用 Python 标准库，
-不加载模型、不连接服务、不运行训练。
+唯一入口是 `scripts/analyze_multiturn_sharing.py`。默认视图（`--view training`）按
+**采集 rollout 数量**比较轨迹长度和初始 prompt 共享潜力，不按训练 micro-batch 大小统计。
+其他统计单位通过 `--view` 明确选择。分析仅使用 Python 标准库，不加载模型或运行训练。
 
-## 训练分析（默认）
+## 按 rollout 数量分析（默认）
 
 从仓库根目录运行：
 
@@ -12,59 +12,74 @@ micro-batch 共享潜力；其他统计单位通过 `--view` 明确选择。分�
 conda run -n agent --no-capture-output python scripts/analyze_multiturn_sharing.py \
   --input sql=/runs/sql/calls.jsonl \
   --input q20=/runs/q20/calls.jsonl \
-  --micro-batch-sizes 1,2,4,8,16,32,64 \
+  --rollout-counts 1,2,4,8,16,32,64 \
   --output-dir /runs/multiturn-sharing
 ```
 
-单个输入可以省略标签，也可传包含 `calls.jsonl` 的目录。多个输入的标签必须唯一；
-每个输入独立统计，不跨工作负载共享或混合百分比。
+例如每个 task 采集了 64 条轨迹，七档分别分析前 1、2、4、8、16、32、64 条。
+同一个 task 只确定一次顺序，大档包含小档所选的全部轨迹；不会每档重新随机抽样。
+编号完整且唯一时按 `sample_index`（或 `rollout_index`）升序；否则按轨迹在输入文件中
+首次出现的顺序。输出保存实际选择顺序和每档 rollout ID，可复核选样。
 
-每条记录需要：
+每一档的所有统计都针对该档实际选中的 N 条轨迹重新计算：
 
-- `trajectory_id` 或 `rollout_id`，标识一条轨迹。
-- `data_id` 或 `task_id`，标识同题采样组。`--group-key auto` 优先使用 `data_id`；
-  也可以显式指定 `--group-key task_id` 或 `data_id`。
-- 实际 prompt/response token ID，支持 `prompt_token_ids` / `response_token_ids`、
-  `prompt_ids` / `response_ids`、`prompt.token_ids` / `response.token_ids`。
-- 可选 `turn` / `turn_index`；缺省按文件顺序排列。同一轨迹不能有重复轮次。
-- 可选 `role`。默认保留 policy 以及未标注角色的记录；`--role` 可指定其他角色。
+`独立 token = sum(这 N 条 rollout 的最终轨迹长度) = N × 最终轨迹长度均值`
 
-训练视图纳入输入中的 token 调用，**不验证轨迹完成状态、finish reason 或采样组覆盖率**。
-需要完整组对照时使用 calls/trajectory 视图及采集元数据，或先提供已经筛选的 token 调用。
+均值取未四舍五入的值。每条轨迹的最终长度是最后一次调用的 prompt + response token 数。
+**不累计该轨迹所有调用的上下文长度，也不累计全部训练分段。**
+如果这 N 条轨迹的均值都是 1396 token，则 N=1 时独立 token 是 1396，N=4 时是 5584。
+真实数据的均值可以随选中的轨迹改变。
 
-## 指标和输出
+不足 N 条的 task 跳过该档并记录在 `skipped_cohorts` 中，不复制样本补齐，不用较少样本冒充 N 条。
+没有任何可用 task 的档位显示共享率 N/A；报告同时显示各档纳入和数量不足的 task 数。
+多 task 数据的档位覆盖率可能不同，不能只比较汇总百分比。
 
-训练重建以相邻完整 token 上下文的前缀连续性为准；前缀中断则拆为独立 segment。
-每段的第一轮 prompt 是训练 prompt，之后的模型输出和工具/环境新增 token 都属于 response suffix。
-不模拟训练长度截断，也不把没有 policy loss 的上下文 token 从工作量中删除。
+单个输入可省略标签，也可传包含 `calls.jsonl` 的目录。多个输入标签必须唯一，独立统计。
+每条记录需要轨迹 ID（`trajectory_id` / `rollout_id`）、题组 ID（`data_id` / `task_id`），
+以及实际 prompt/response token ID。支持 `prompt_token_ids` / `response_token_ids`、
+`prompt_ids` / `response_ids`、`prompt.token_ids` / `response.token_ids` 三种 token 字段形式。
+`--group-key auto` 优先使用 `data_id`，也可指定 `task_id` 或 `data_id`。
+`turn` / `turn_index` 可选，缺省按文件顺序；同一轨迹的轮次不能重复。
+默认保留 policy 和未标注角色的调用；可用 `--role` 指定角色。
+
+默认视图纳入提供的 token 调用，不验证轨迹正常完成、finish reason 或完整采样组覆盖率。
+缺失的早期历史不能从最后一次上下文恢复；有前缀中断的轨迹会在输出中记录。
+
+## 共享口径和输出
+
+在所选 N 条 rollout 中，对完全相同的初始 prompt 分组，每组只保留一份 prompt：
+
+`可省 token = sum((组内 rollout 数 - 1) × 相同初始 prompt 长度)`
+
+只有最终上下文仍以该初始 prompt 开头的 rollout 才参与此共享；历史重写后已不存在的
+prompt 不能从最终轨迹总长度中扣除。后缀独立，不对生成输出建树，也不跨 task 共享。
+这是对所选轨迹的结构共享潜力估算，不模拟实际训练分段、micro-batch、DP rank 或截断。
 
 | 字段 | 含义 |
 |---|---|
-| `token_reduction` | 可消除的重复 prompt token / 独立训练总 token，衡量省掉的工作量 |
-| `weighted_token_reduction` | 同一工作负载、同一 micro-batch 大小下，所有 task 的可省 token 总和 / 独立 token 总和 |
-| `shared_prompt_fraction` | 每条逻辑轨迹可共享的初始 prompt 长度 / 最终轨迹长度；是占比，不是节省率 |
-| `training_shared_prompt_fraction` | 可共享的训练 prompt 长度 / 所有训练 segments 的总长度 |
-| `shareable_prompt_fraction` | 属于重复 prompt 组的 prompt token 出现次数 / 所有 prompt token 出现次数 |
-| `prompt_deduplication_ratio` | 可省 prompt token / 所有 prompt token |
-| `token_work_ratio` | 独立 token 工作量 / 去重后的 token 工作量，不是实测加速比 |
-| `prefix_breaks` / `training_segments` | 轨迹的前缀中断次数 / 训练分段数 |
+| `rollout_count` | 当前 task 当前档位实际选择的 rollout 数量 N |
+| `available_rollouts` | 当前 task 采集到的 rollout 总数 |
+| `selected_rollout_ids` | 当前档位所选轨迹的 ID，按实际选择顺序列出 |
+| `independent_total_tokens` | 所选 N 条轨迹的最终长度之和 |
+| `reducible_duplicate_prompt_tokens` | 所选轨迹中可消除的重复初始 prompt token |
+| `grouped_total_tokens` | 独立 token 减去可省 token |
+| `token_reduction` | 可省 token / 独立 token |
+| `weighted_token_reduction` | 相同 N 下所有纳入 task 的可省 token 总和 / 独立 token 总和 |
+| `initial_prompt_preserved_rollouts` | 最终上下文仍保留初始 prompt 前缀的 rollout 数 |
+| `prefix_breaks` | 所选轨迹的相邻调用发生 token 前缀中断的总次数 |
+| `token_work_ratio` | 独立 token / 共享后 token，不是实测加速比 |
 
-同 task 内相同 prompt 出现 n 次、长度 P、micro-batch 大小 B 时，可省 token 上界为：
+输出包括：
 
-`(n - ceil(n / B)) * P`
+- `report.md`：每 task、每 rollout 数量档位的长度、共享率和覆盖率。
+- `summary.json`：完整计算结果、选样 ID、跳过的档位及定义。
+- `per_trajectory.csv`：所有已采集轨迹的编号、采集顺序、轮数、初始 prompt 和最终长度。
+- `per_task_rollout_counts.csv`：每个 task 在各 rollout 数量下的统计。
+- `task_distribution.csv`：各档位的 task 分布、覆盖率和 token 加权共享率。
 
-该公式让每个相同 prompt 组独立对齐 batch 边界；**实际装箱偏移、DP rank 拆分和截断可能降低收益**。
-共享仅限相同 task 内完全相同的训练 prompt，不对生成后缀建树。`summary.json` 中
-每个工作负载的 `prefix_sharing` 是不受 batch 大小约束的潜力，`per_task` 和
-`task_distribution` 才是指定 micro-batch 大小下的上界。
-
-输出目录包含：
-
-- `report.md`：各 task、各 micro-batch 的收益、分布和轨迹构成。
-- `summary.json`：所有工作负载的 API/训练 token 比例、共享潜力、逐轨迹指标、逐 task 指标及定义。
-- `per_trajectory.csv`：轮数、初始 prompt、最终轨迹长度、训练分段及 prompt 占比。
-- `per_task_microbatch.csv`：逐 task、逐 micro-batch 的 token 节省和长度统计。
-- `task_distribution.csv`：task 分布的均值、分位数、零共享数和 token 加权比例。
+原有 API token 比例、训练分段重建和分段共享潜力保留在
+`workloads.<工作负载>.training_segment_diagnostics`，仅供解释训练数据结构。
+该诊断针对全部输入，**不是 rollout 数量表的统计分母**。
 
 ## 其他统计视图
 
@@ -99,5 +114,5 @@ calls 视图只在相同调用序号之间共享，不跨序号或在轨迹内�
 SQL/Q20 报告仍可由 `examples/rag/compare_trace_reports.py` 汇总。
 
 所有视图必须显式提供 `--output-dir`，不能覆盖原始采集目录或已有报告。
-calls/trajectory 视图不接受训练专用的 `--role`、`--group-key`、`--micro-batch-sizes`。
+calls/trajectory 视图不接受默认视图专用的 `--role`、`--group-key`、`--rollout-counts`。
 这些指标是结构工作量估算，不是训练耗时、显存或数值等价性的实测结果。

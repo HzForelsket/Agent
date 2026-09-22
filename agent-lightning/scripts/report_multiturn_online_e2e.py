@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 BENCHMARK_ID = "agl-multiturn-online-e2e"
-RESULT_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 2
 Direction = Literal["higher", "lower", "neutral"]
 Record = dict[str, Any]
 IDENTITY_FIELDS = {
@@ -41,6 +41,8 @@ COMPARABLE_FIELDS = (
     "n_runners",
     "max_prompt_length",
     "max_response_length",
+    "rollout_max_model_len",
+    "rollout_max_tokens",
     "temperature",
     "learning_rate",
     "save_freq",
@@ -193,7 +195,7 @@ def build_report(
     baseline_wall = float(baseline_run["wall_seconds"])
     simple_wall = float(simple_run["wall_seconds"])
     return {
-        "schema_version": 1,
+        "schema_version": RESULT_SCHEMA_VERSION,
         "benchmark_id": BENCHMARK_ID,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "comparison_valid": True,
@@ -222,6 +224,7 @@ def build_report(
             "lower 指标的 speedup=baseline/simple；higher 指标的 speedup=simple/baseline",
             "reward 为 neutral，只报告原始统计和差值，不声明性能改善",
             "在线 rollout 使用相同 seed 和采样配置，但随机生成可能产生不同响应；报告同时保留 reward",
+            "在线请求预留输出预算，超长输入默认从左侧截断；训练使用实际服务 token IDs",
         ],
     }
 
