@@ -829,7 +829,13 @@ class AgentModeDaemon:
         return metric_dict
 
     def get_train_data_batch(
-        self, max_prompt_length: int, max_response_length: int, device: torch.device, global_steps: int
+        self,
+        max_prompt_length: int,
+        max_response_length: int,
+        device: torch.device,
+        global_steps: int,
+        *,
+        prepare_prefix_groups: bool = False,
     ):
         """
         Processes completed rollouts to generate a training data batch.
@@ -1125,6 +1131,21 @@ class AgentModeDaemon:
             batch_size=n_transition,
         )
         data_proto = DataProto(batch=batch)
+
+        if prepare_prefix_groups:
+            # GRPO data IDs identify sibling rollouts, but trajectory splitting can
+            # produce different prompts within a family. Refine each family once
+            # using the final, masked token lists already available on the host.
+            # Per-row non-tensor IDs survive reorder, filtering and micro-batching
+            # without copying prompts back from the accelerator in every forward.
+            prefix_groups: Dict[tuple[str, tuple[int, ...]], int] = {}
+            prefix_group_ids: List[int] = []
+            for data_id, tokens, mask in zip(
+                data_id_list, input_ids_list, input_attention_mask_list, strict=True
+            ):
+                key = (data_id, tuple(token for token, valid in zip(tokens, mask, strict=True) if valid))
+                prefix_group_ids.append(prefix_groups.setdefault(key, len(prefix_groups)))
+            data_proto.non_tensor_batch["prefix_group_id"] = np.asarray(prefix_group_ids, dtype=np.int64)
 
         data_metrics = {
             "training/reward": np.mean(list(finished_id_to_final_reward.values())),

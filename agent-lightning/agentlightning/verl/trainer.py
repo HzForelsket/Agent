@@ -251,6 +251,7 @@ class AgentLightningTrainer(RayPPOTrainer):
                             ),
                             device=gen_batch.batch["fake_ids"].device,
                             global_steps=self.global_steps,
+                            prepare_prefix_groups=self.config.agentlightning.prefix_grouper.enabled,
                         )
                     metrics.update(agent_metrics)
                     with _timer("rollout_cleanup", timing_raw):

@@ -385,8 +385,9 @@ def forward_with_prefix_grouper(
 ) -> dict[str, torch.Tensor] | None:
     """Run a shared-prefix forward and return VERL-compatible model outputs.
 
-    ``None`` means that the batch has no repeated prompt and should use VERL's
-    standard forward path. The full suffix attention mask is intentionally
+    ``prefix_group_id`` carries the verified GRPO prompt groups prepared by the
+    daemon. ``None`` means that no group repeats within this micro-batch and it
+    should use VERL's standard forward path. The full suffix attention mask is intentionally
     distinct from ``response_mask``: trajectory aggregation inserts environment
     tokens that must stay in the causal context while remaining outside policy
     loss.
@@ -414,10 +415,16 @@ def forward_with_prefix_grouper(
         raise ValueError("PrefixGrouper requires response IDs, attention mask and response mask to have equal shapes.")
     if (response_mask & ~suffix_mask).any():
         raise ValueError("PrefixGrouper response_mask cannot select padded suffix positions.")
-    grouped: OrderedDict[tuple[int, ...], list[int]] = OrderedDict()
-    for row, prompt in enumerate(prompts):
-        key = tuple(prompt[prompt_mask[row]].detach().cpu().tolist())
-        grouped.setdefault(key, []).append(row)
+    group_ids = (
+        tu.get(micro_batch, "prefix_group_id")
+        if isinstance(micro_batch, TensorDict)
+        else micro_batch.get("prefix_group_id")
+    )
+    if group_ids is None or len(group_ids) != prompts.shape[0]:
+        raise ValueError("PrefixGrouper requires one verified prefix_group_id per sample from the data daemon.")
+    grouped: OrderedDict[int, list[int]] = OrderedDict()
+    for row, group_id in enumerate(group_ids):
+        grouped.setdefault(int(group_id), []).append(row)
     groups = list(grouped.values())
     if all(len(group) == 1 for group in groups):
         return None
@@ -602,15 +609,10 @@ class PrefixGrouperActorRolloutRefWorker(ActorRolloutRefWorker):
 
 
 def reorder_by_prompt(batch: Any) -> None:
-    """Place equal prompts contiguously before VERL partitions the batch."""
-    responses = batch.batch["responses"]
-    response_length = responses.shape[-1]
-    prompts = batch.batch.get("prompts", batch.batch["input_ids"][:, :-response_length])
-    attention_mask = batch.batch["attention_mask"][:, :-response_length]
-    grouped: OrderedDict[tuple[int, ...], list[int]] = OrderedDict()
-    for row, prompt in enumerate(prompts):
-        key = tuple(prompt[attention_mask[row].bool()].detach().cpu().tolist())
-        grouped.setdefault(key, []).append(row)
+    """Keep verified GRPO prompt groups adjacent before VERL partitions the batch."""
+    grouped: OrderedDict[int, list[int]] = OrderedDict()
+    for row, group_id in enumerate(batch.non_tensor_batch["prefix_group_id"]):
+        grouped.setdefault(int(group_id), []).append(row)
     groups = list(grouped.values())
     groups.sort(key=len, reverse=True)
     order = torch.tensor([row for group in groups for row in group], dtype=torch.int64)
