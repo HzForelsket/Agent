@@ -34,6 +34,7 @@ python collect_traces.py \
   --model-path /实际模型路径/Qwen3-30B-A3B-Instruct-2507 \
   --npu-devices 0,1,2,3 \
   --tasks 32 --rollouts-per-task 4 --concurrency 4 \
+  --trajectory-timeout 3600 \
   --insecure-download \
   --output traces/sql-30b-run01
 
@@ -57,6 +58,33 @@ SQL 固定 max_tokens=2048；`--temperature` 用于 SQL/RAG。Q20 保留原 Crew
 Q20 的 Player、Answerer、可选 Search 均配置为本次本地 30B 服务；这是本次模型配置，
 不表示与原示例默认的云端 Answerer 模型有相同质量。Answerer 保留原结构化输出和 reasoning_effort 配置。
 `--q20-search` 打开原示例已有的可选模拟搜索工具，默认关闭；其输出仍由模型生成，并非真实联网搜索。
+
+### 轨迹超时排查
+
+`--trajectory-timeout` 默认 900 秒，限制的是**单条完整轨迹**，包含所有模型请求、SQL 执行和最终评分，
+不是单次请求，也不是整次采集的时长。上面的 SQL/Q20 命令显式使用 3600 秒；这只是放宽预算，
+不能解决 SQL 或评分卡住的问题。
+
+若日志出现 `asyncio.to_thread` 的 `CancelledError`，接着是 `wait_for` 的 `TimeoutError`，
+表示采集器等到轨迹期限后取消了等待。`calls=6` 是收到的 policy 请求数，不保证六次都有有效回复；
+SQL 默认三轮生成/改写各带一次检查，正常情况下也可能有六次模型调用。
+
+超时记录会在 `trajectories.jsonl` 保存耗时、配置上限及有效回复数，worker 日志还会打印所有线程栈。
+结合该轨迹在 `calls.jsonl` 的 `started_at/finished_at`、`http_status`、`error` 判断：
+
+- 请求耗时已接近总预算：查看 `vllm.log` 的排队和推理情况，再考虑增加轨迹上限或降低并发。
+- 模型调用早已结束：查看线程栈是否停在 SQL 执行、结果读取或 Spider evaluator；单纯增大上限可能只会延后失败。
+- 已收到请求却没有对应的落盘调用记录：可能仍在请求中，记录是在请求结束时写入的。
+
+取消协程不能终止 SQL/Q20 的同步工作线程，因此超时后 worker 会先保存失败轨迹和继续位置，再以专用退出码退出。
+父进程只清理该 worker 的进程组，重建 worker 后从它负责的下一条轨迹继续；其他 worker 和模型服务继续运行。
+超时轨迹不自动重试，已完成轨迹不重复采集。每次替换记录在 `worker_restarts.jsonl`，原 worker 日志追加保留。
+`worker-N-resume.json` 是本次运行内部重建 worker 使用的检查点，不是跨运行恢复入口；`--output` 仍须为新目录。
+
+全部剩余轨迹处理后照常分析，`completion.json` 保存超时次数、轨迹状态计数，并用 `partial` 标识存在未完成或截断轨迹。
+超时轨迹仍为失败，其所属题组不会进入完整轨迹统计。模型服务退出、worker 非超时崩溃或继续位置无效，
+仍会终止采集；已有有效调用会保留，并写入 `failure.json`。已有轨迹可用下文的离线分析命令重算，
+只有同题所有 rollout 齐全且有效的组会纳入统计。
 
 ## 自动数据准备与缓存
 

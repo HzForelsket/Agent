@@ -5,6 +5,7 @@
 import argparse
 import asyncio
 import contextvars
+import faulthandler
 import fcntl
 import hashlib
 import importlib.metadata
@@ -17,12 +18,12 @@ import signal
 import subprocess
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
 from rag_data import DEFAULT_DATA_DIR, add_download_argument
-from trace_services import Processes, check_ports, service_commands
+from trace_services import WORKER_TIMEOUT_EXIT_CODE, Processes, check_ports, service_commands
 from trace_tasks import prepare_tasks
 
 CURRENT: contextvars.ContextVar[str] = contextvars.ContextVar("trajectory_id")
@@ -98,7 +99,12 @@ def arguments() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=20260914)
     parser.add_argument("--proxy-port", type=positive, default=18031)
-    parser.add_argument("--trajectory-timeout", type=positive, default=900)
+    parser.add_argument(
+        "--trajectory-timeout",
+        type=positive,
+        default=900,
+        help="Seconds for a whole trajectory, including all model calls, tools and evaluation (default: 900).",
+    )
     parser.add_argument(
         "--server-metadata", type=Path, help="JSON describing serving hardware, versions and launch command."
     )
@@ -294,9 +300,13 @@ async def run_worker(root: Path, config: dict[str, Any], worker_id: int) -> None
         runner.init(agent)
         runner.init_worker(worker_id, store)
         tasks = json.loads((root / "selected_tasks.json").read_text())
+        resume_path = root / f"worker-{worker_id}-resume.json"
+        next_sample = json.loads(resume_path.read_text())["next_sample"] if resume_path.exists() else worker_id
+        print(f"Worker {worker_id}: starting at sample index {next_sample}", flush=True)
         for task_index, task in enumerate(tasks):
             for sample_index in range(config["rollouts_per_task"]):
-                if (task_index * config["rollouts_per_task"] + sample_index) % config["concurrency"] != worker_id:
+                sample = task_index * config["rollouts_per_task"] + sample_index
+                if sample < next_sample or sample % config["concurrency"] != worker_id:
                     continue
                 trajectory_id = f"q{task_index:03d}-r{sample_index}"
                 CURRENT.set(trajectory_id)
@@ -321,6 +331,7 @@ async def run_worker(root: Path, config: dict[str, Any], worker_id: int) -> None
                         "max_tokens": config["max_tokens_per_call"],
                     },
                 )
+                trajectory_started = time.monotonic()
                 try:
                     rollout = await asyncio.wait_for(
                         runner.step(task, resources={"main_llm": resource}), timeout=config["trajectory_timeout"]
@@ -333,6 +344,23 @@ async def run_worker(root: Path, config: dict[str, Any], worker_id: int) -> None
                         append(
                             root, "spans.jsonl", {"trajectory_id": trajectory_id, "span": span.model_dump(mode="json")}
                         )
+                except asyncio.TimeoutError as error:
+                    elapsed = time.monotonic() - trajectory_started
+                    info["status"] = "failed"
+                    info["error_type"] = type(error).__name__
+                    info["timeout_seconds"] = config["trajectory_timeout"]
+                    info["error"] = (
+                        f"Trajectory timed out after {elapsed:.1f}s "
+                        f"(whole-trajectory limit: {config['trajectory_timeout']}s; "
+                        f"policy requests received: {counts[trajectory_id]}, "
+                        f"valid responses: {valid_counts[trajectory_id]}). "
+                        f"Cause: {error!r}. Inspect calls.jsonl and worker log thread stacks "
+                        "for model, tool or evaluation delays."
+                    )
+                    logging.exception("Trajectory stopped: %s: %s", trajectory_id, info["error"])
+                    # Cancellation of to_thread leaves the original workflow running. Capture its
+                    # actual stack before exiting, rather than only the cancelled await's traceback.
+                    faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
                 except BaseException as error:
                     info["error_type"] = type(error).__name__
                     info["error"] = str(error)
@@ -343,6 +371,7 @@ async def run_worker(root: Path, config: dict[str, Any], worker_id: int) -> None
                 finally:
                     info.update(
                         finished_at=time.time(),
+                        elapsed_seconds=time.monotonic() - trajectory_started,
                         model_calls=counts[trajectory_id],
                         valid_model_calls=valid_counts[trajectory_id],
                         role_model_calls={
@@ -352,10 +381,20 @@ async def run_worker(root: Path, config: dict[str, Any], worker_id: int) -> None
                     append(root, "trajectories.jsonl", info)
                     print(f"{trajectory_id}: {info['status']}, calls={counts[trajectory_id]}", flush=True)
                 if info.get("error_type") == "TimeoutError" and config["agent"] != "rag":
-                    # A cancelled await cannot stop a synchronous graph/flow thread. The parent owns
-                    # this process group and will clean up descendants after seeing the nonzero exit.
-                    print("Original workflow timed out; terminating this isolated worker", flush=True)
-                    os._exit(1)
+                    # Persist progress only after the failed trajectory is durable. A new process
+                    # must replace this one because cancellation cannot stop its workflow thread.
+                    write_json(
+                        resume_path,
+                        {
+                            "worker_id": worker_id,
+                            "trajectory_id": trajectory_id,
+                            "next_sample": sample + config["concurrency"],
+                        },
+                    )
+                    print(
+                        "Original workflow timed out; requesting worker replacement for remaining samples", flush=True
+                    )
+                    os._exit(WORKER_TIMEOUT_EXIT_CODE)
                 if valid_counts[trajectory_id] == 0:
                     raise RuntimeError(f"No valid model call for {trajectory_id}; inspect worker log and calls.jsonl")
     finally:
@@ -470,24 +509,60 @@ async def collect(args: argparse.Namespace) -> None:
             root / "services_ready.json",
             {"time": time.time(), "pids": {name: child.pid for name, child in processes.children.items()}},
         )
-        workers = []
-        for worker_id in range(args.concurrency):
-            workers.append(
-                await processes.start(
-                    f"worker-{worker_id}",
-                    [
-                        sys.executable,
-                        "-u",
-                        str(Path(__file__).resolve()),
-                        "--output",
-                        str(root),
-                        "--worker",
-                        str(worker_id),
-                    ],
-                )
+
+        async def start_worker(worker_id: int) -> asyncio.subprocess.Process:
+            return await processes.start(
+                f"worker-{worker_id}",
+                [
+                    sys.executable,
+                    "-u",
+                    str(Path(__file__).resolve()),
+                    "--output",
+                    str(root),
+                    "--worker",
+                    str(worker_id),
+                ],
             )
-        codes = await processes.wait_workers(workers)
-        write_json(root / "completion.json", {"worker_exit_codes": codes, "finished_at": time.time()})
+
+        next_samples = list(range(args.concurrency))
+        worker_timeout_counts = [0] * args.concurrency
+
+        async def restart_worker(worker_id: int) -> asyncio.subprocess.Process:
+            resume = json.loads((root / f"worker-{worker_id}-resume.json").read_text())
+            next_sample = resume["next_sample"]
+            # Require durable forward progress so a stale checkpoint cannot cause a restart loop.
+            if (
+                resume["worker_id"] != worker_id
+                or type(next_sample) is not int
+                or next_sample <= next_samples[worker_id]
+                or next_sample >= len(tasks) * args.rollouts_per_task + args.concurrency
+                or next_sample % args.concurrency != worker_id
+            ):
+                raise RuntimeError(f"Invalid timeout checkpoint for worker {worker_id}: {resume}")
+            await processes.stop([f"worker-{worker_id}"])
+            processes.check_services()
+            next_samples[worker_id] = next_sample
+            worker_timeout_counts[worker_id] += 1
+            append(
+                root, "worker_restarts.jsonl", {**resume, "exit_code": WORKER_TIMEOUT_EXIT_CODE, "time": time.time()}
+            )
+            print(f"Skipping timed-out trajectory {resume['trajectory_id']}; replacing worker {worker_id}", flush=True)
+            return await start_worker(worker_id)
+
+        workers = [await start_worker(worker_id) for worker_id in range(args.concurrency)]
+        codes = await processes.wait_workers(workers, restart_worker)
+        with (root / "trajectories.jsonl").open() as handle:
+            trajectory_status = Counter(json.loads(line)["status"] for line in handle)
+        write_json(
+            root / "completion.json",
+            {
+                "worker_exit_codes": codes,
+                "worker_timeout_counts": worker_timeout_counts,
+                "trajectory_status": dict(trajectory_status),
+                "partial": any(status != "completed" for status in trajectory_status),
+                "finished_at": time.time(),
+            },
+        )
         await processes.stop()
         analyzer = "analyze_traces.py" if args.agent == "rag" else "analyze_call_traces.py"
         analysis = await processes.start(

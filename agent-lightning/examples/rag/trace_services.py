@@ -7,8 +7,11 @@ import os
 import signal
 import socket
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
+
+WORKER_TIMEOUT_EXIT_CODE = 75
 
 
 def check_ports(ports: list[int]) -> None:
@@ -31,14 +34,16 @@ class Processes:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.children: dict[str, asyncio.subprocess.Process] = {}
-        self.logs: list[Any] = []
+        self.logs: dict[str, Any] = {}
 
     async def start(
         self, name: str, command: list[str], env: dict[str, str] | None = None
     ) -> asyncio.subprocess.Process:
         """Launch one owned process group with a continuously written log."""
-        log = (self.root / f"{name}.log").open("w")
-        self.logs.append(log)
+        if name in self.children or name in self.logs:
+            raise RuntimeError(f"Stop {name} before reusing its process slot")
+        log = (self.root / f"{name}.log").open("a")
+        self.logs[name] = log
         # Collection children are noninteractive. Inheriting the terminal can leave
         # CrewAI's trace-viewing input thread holding stdin during interpreter exit.
         process = await asyncio.create_subprocess_exec(
@@ -109,20 +114,31 @@ class Processes:
                         next_report = time.monotonic() + 30
                     await asyncio.sleep(2)
 
-    async def wait_workers(self, workers: list[asyncio.subprocess.Process]) -> list[int]:
-        """Watch services and worker failures while trajectories are being collected."""
+    async def wait_workers(
+        self,
+        workers: list[asyncio.subprocess.Process],
+        restart_worker: Callable[[int], Awaitable[asyncio.subprocess.Process]],
+    ) -> list[int]:
+        """Replace workers after recorded trajectory timeouts; fail on other process errors."""
         while True:
             self.check_services()
             codes = [worker.returncode for worker in workers]
-            if any(code is not None and code != 0 for code in codes):
+            if any(code is not None and code not in (0, WORKER_TIMEOUT_EXIT_CODE) for code in codes):
                 raise RuntimeError(f"Worker exit codes: {codes}")
+            if WORKER_TIMEOUT_EXIT_CODE in codes:
+                for worker_id, code in enumerate(codes):
+                    if code == WORKER_TIMEOUT_EXIT_CODE:
+                        workers[worker_id] = await restart_worker(worker_id)
+                continue
             if all(code is not None for code in codes):
                 return [await worker.wait() for worker in workers]
             await asyncio.sleep(1)
 
-    async def stop(self) -> None:
-        """Terminate all owned groups, including vLLM workers whose parent has already exited."""
-        groups = {process.pid for process in self.children.values()}
+    async def stop(self, names: list[str] | None = None) -> None:
+        """Terminate selected owned groups and descendants, or all groups when names is omitted."""
+        selected = set(names) if names is not None else self.children.keys() | self.logs.keys()
+        children = {name: self.children[name] for name in selected if name in self.children}
+        groups = {process.pid for process in children.values()}
         for pid in groups:
             try:
                 os.killpg(pid, signal.SIGTERM)
@@ -142,13 +158,14 @@ class Processes:
                 os.killpg(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-        await asyncio.gather(*(process.wait() for process in self.children.values()))
-        self.children.clear()
-        for log in self.logs:
-            log.flush()
-            os.fsync(log.fileno())
-            log.close()
-        self.logs.clear()
+        await asyncio.gather(*(process.wait() for process in children.values()))
+        for name in selected:
+            self.children.pop(name, None)
+            log = self.logs.pop(name, None)
+            if log is not None:
+                log.flush()
+                os.fsync(log.fileno())
+                log.close()
 
 
 def service_commands(config: dict[str, Any]) -> tuple[dict[str, list[str]], dict[str, str]]:
