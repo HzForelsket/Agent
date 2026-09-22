@@ -129,9 +129,12 @@ causal attention pairs 按每次调用的完整三角注意力结构计算，再
 
 ## 已有轨迹重算与跨任务对比
 
+所有多轮分析使用 [统一入口](../../scripts/MULTITURN_SHARING.md)。下面的 `--view calls` 保留逐调用统计单位；
+训练分段及 micro-batch 收益使用默认的 `training` 视图。`--output-dir` 必须指定尚无报告的目录。
+
 ```bash
-python analyze_call_traces.py --input traces/sql-30b-run01
-python analyze_call_traces.py --input traces/q20-30b-run01
+python ../../scripts/analyze_multiturn_sharing.py --view calls --input traces/sql-30b-run01 --output-dir traces/sql-30b-run01/analysis
+python ../../scripts/analyze_multiturn_sharing.py --view calls --input traces/q20-30b-run01 --output-dir traces/q20-30b-run01/analysis
 
 python compare_trace_reports.py \
   --inputs traces/sql-30b-run01/analysis traces/q20-30b-run01/analysis \
@@ -147,7 +150,7 @@ python compare_trace_reports.py \
 也支持只拷贝多上下文分析目录后重算：
 
 ```bash
-python analyze_call_traces.py --input /已有分析目录 --output /新的分析目录
+python ../../scripts/analyze_multiturn_sharing.py --view calls --input /已有分析目录 --output-dir /新的分析目录
 ```
 
 该目录须保留 `summary.json` 与 `call_sequences.jsonl`。离线分析无需模型、NPU、CrewAI、LangChain 或 OpenAI SDK。

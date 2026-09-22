@@ -8,7 +8,6 @@ import hashlib
 import json
 import math
 import os
-import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -36,11 +35,9 @@ def file_hash(path: Path) -> str:
 
 def prepare_workload(root: Path, *, steps: int, world_size: int) -> dict[str, Any]:
     """Reuse capture validation and retain original SQL rewards and loss boundaries."""
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples" / "rag"))
-    from analyze_call_traces import raw_sequences
-    from analyze_traces import lcp, read_records
+    from analyze_multiturn_sharing import lcp, load_call_sequences, read_records
 
-    records, context = raw_sequences(root)
+    records, context = load_call_sequences(root)
     if context["agent"] != "sql" or context["group_size"] != 4:
         raise ValueError("SQL replay requires original SQL capture with exactly four trajectories per question")
     diagnostics: list[str] = []

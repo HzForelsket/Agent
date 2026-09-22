@@ -159,21 +159,22 @@ python embedding_download.py --insecure-download
 重算或分析中断采集的已保存数据，不需要模型、NPU 或 SDK，只需 Python 标准库：
 
 ```bash
-python analyze_traces.py --input traces/npu-qwen30b-run01
+python ../../scripts/analyze_multiturn_sharing.py --view trajectory --input traces/npu-qwen30b-run01 --output-dir traces/npu-qwen30b-run01/analysis
 ```
 
 也可直接读取已有 `analysis` 目录（支持把该目录独立拷贝到另一台机器），无需原始采集目录或模型：
 
 ```bash
-python analyze_traces.py \
+python ../../scripts/analyze_multiturn_sharing.py --view trajectory \
   --input traces/npu-qwen30b-run01/analysis \
-  --output traces/npu-qwen30b-run01/analysis-comparison
+  --output-dir traces/npu-qwen30b-run01/analysis-comparison
 ```
 
 输入分析目录必须包含 `summary.json`、`per_task.csv` 和 `trajectory_sequences.jsonl`；
 只有 Markdown/CSV 汇总表无法恢复公共前缀，必须保留完整 token 序列。
-不传 `--output` 时，原始轨迹输入默认写到其 `analysis/`，分析目录输入则更新该分析目录的派生文件。
-传入新的 `--output` 可保留旧报告。原始 `calls.jsonl` 等采集记录不修改，也不启动 MCP 或 vLLM。
+使用统一入口的 `--view trajectory` 明确选择完整序列口径；默认的 `training` 视图用于训练分段及 micro-batch 分析。
+必须用 `--output-dir` 指定尚无报告的输出目录。原始 `calls.jsonl` 等采集记录不修改，也不启动 MCP 或 vLLM。
+完整用法见 [统一多轮分析入口](../../scripts/MULTITURN_SHARING.md)。
 分析目录输入复用此前完整组的筛选结果，检查组内编号、计数及独立基线，不重新验证缺失的原始调用。
 
 

@@ -4,10 +4,11 @@
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
-from analyze_call_traces import UNIT
-from analyze_traces import write_csv
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+from analyze_multiturn_sharing import CALL_UNIT, write_csv
 
 
 def main() -> None:
@@ -23,7 +24,7 @@ def main() -> None:
         if (root / "config.json").exists():
             root = root / "analysis"
         summary = json.loads((root / "summary.json").read_text())
-        if summary.get("statistics_unit") != UNIT:
+        if summary.get("statistics_unit") != CALL_UNIT:
             raise ValueError(f"{root} has a different statistics unit; do not mix RAG flattened-sequence reports")
         summaries.append({"source": str(root), "summary": summary})
         simple, tree, extra = (

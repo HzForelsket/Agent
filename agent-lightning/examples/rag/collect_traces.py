@@ -564,9 +564,19 @@ async def collect(args: argparse.Namespace) -> None:
             },
         )
         await processes.stop()
-        analyzer = "analyze_traces.py" if args.agent == "rag" else "analyze_call_traces.py"
+        analyzer = Path(__file__).resolve().parents[2] / "scripts" / "analyze_multiturn_sharing.py"
         analysis = await processes.start(
-            "analysis", [sys.executable, str(Path(__file__).with_name(analyzer)), "--input", str(root)]
+            "analysis",
+            [
+                sys.executable,
+                str(analyzer),
+                "--view",
+                "trajectory" if args.agent == "rag" else "calls",
+                "--input",
+                str(root),
+                "--output-dir",
+                str(root / "analysis"),
+            ],
         )
         if await analysis.wait():
             raise RuntimeError("Capture finished, but analysis failed; raw traces are retained")

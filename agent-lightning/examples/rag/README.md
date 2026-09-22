@@ -59,12 +59,11 @@ python train_rag.py
 | `collect_traces.py` | Automatically start NPU vLLM and CPU MCP, collect complete trajectories, and generate a benefit table |
 | `trace_tasks.py` | Cached real RAG/Spider/Q20 inputs, database paths and data-only preparation CLI |
 | `trace_workflows.py` | Outer adapters calling unchanged SQL and CrewAI Q20 workflows |
-| `analyze_call_traces.py` | Independent-context call-slot sharing analysis without within-trajectory deduplication |
+| `../../scripts/analyze_multiturn_sharing.py` | Unified offline training-segment, call-slot and complete-trajectory sharing analysis; see [usage](../../scripts/MULTITURN_SHARING.md) |
 | `compare_trace_reports.py` | Cross-workload summary from SQL/Q20 analysis directories |
 | `requirements-workflow-traces.txt` | Additional SQL and CrewAI client dependencies |
 | `WORKFLOW_TRACE_COLLECTION.md` | Original-workflow NPU collection commands, metadata and statistical scope |
 | `trace_services.py` | Owned service process groups, port checks, readiness, failure monitoring and shutdown |
-| `analyze_traces.py` | Reanalyze raw traces or saved analysis directories; independent, single-prefix and trie sharing comparisons |
 | `requirements-traces.txt` | Application dependencies for the separate trace collection client |
 | `TRACE_COLLECTION.md` | Chinese instructions for NPU serving integration, saved traces and metric definitions |
 
