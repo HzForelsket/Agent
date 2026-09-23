@@ -102,8 +102,8 @@ Q20 的 player、answerer 和 search 单次模型请求默认超时 120 秒，�
 此时默认每次输入最多保留 10240 tokens，为输出预留 2048 tokens。
 服务预算不能保证整段多轮轨迹都落入训练容量；训练转换仍按训练长度截断。
 
-结果 schema 为 2，记录并比较 `rollout_max_model_len` 与 `rollout_max_tokens`。
-baseline/simple 必须使用相同预算；旧 schema 结果不能与本次修改后的结果混合比较。
+结果 schema 为 3，记录并比较 `rollout_max_model_len`、`rollout_max_tokens` 和 profile
+采集配置。baseline/simple 必须使用相同预算与采集配置；报告只接受当前 schema。
 
 带 rollout 标识的 proxy 请求会等待该请求的 trace 写入 Store 后才返回成功，避免
 任务已结束但异步 trace 尚未入库的竞态。导出等待默认上限为 30 秒
@@ -134,12 +134,44 @@ GPU/NPU 都在读取模型配置前通过同一个 `materialize_model` 准备本
 两侧共用 Q20 Agent、环境模型服务、trace 转换、轨迹聚合、GRPO 和 PrefixGrouper FSDP worker，
 设备差异保留在运行时、通信和底层 attention 算子。
 
+## 算子 Profile
+
+在现有训练命令后追加 `--profile`，默认采集第 1 个完整训练步、所有 rank，输出到
+`<output-dir>/profile`。例如追加：
+
+```text
+--profile --profile-steps 2 3 --profile-memory
+```
+
+这会采集第 2、3 步，因此 `--steps` 至少为 3。`--profile-dir /absolute/path`
+可指定输出目录；baseline/simple 应分别使用独立目录。`--profile-record-shapes`
+默认开启，可用 `--no-profile-record-shapes` 关闭；`--profile-memory` 默认关闭。
+这些开关沿用 `benchmark_prefix_grouper.py` 的命名，但这里采集真实在线训练步。
+2WikiMQA E2E 脚本目前没有独立的 profile CLI 开关。
+
+采集复用生产 `AgentLightningTrainer` 的 VERL profiler 生命周期：worker 在选定步
+开始前启动、actor update 后停止，覆盖 old/reference log-prob 与 actor 前向、反向和更新；
+独立的 vLLM 服务在该步 rollout 期间启动／停止采集。验证与 checkpoint 保存不在范围内。
+Agent runner 和外部工具进程不会因此生成完整 CPU 算子轨迹；其端到端耗时仍由
+`metrics.jsonl` 的阶段指标记录。Q20 的环境模型与 player 共用服务，因此 rollout
+profile 也包含 answerer/search 的模型计算。
+
+GPU 使用 torch profiler，导出可供 Perfetto 等工具查看的 Chrome trace；NPU 使用固定栈的
+原生 profiler，训练 worker 为 Level1。与 `benchmark_prefix_grouper.py` 一样，NPU
+训练 worker 先保存原始数据，训练完成后复用 `AcceleratorRuntime.analyse_profiles`
+统一导出 Text 和 Db；解析不计入 `wall_seconds`。actor、ref、rollout 的输出分别位于
+profile 根目录下的同名子目录。这里由 VERL 管理分布式 profiler，文件命名和低层
+采集选项遵循 VERL；没有复制微基准的手动 profiler 上下文或额外重跑一个训练 step。
+`launch.json` 保存具体 profiler 配置，最终 run 记录保存采集选项和绝对输出路径。
+采集会引入额外开销，正式速度测量应关闭 profile；报告拒绝比较采集配置不同的两次运行。
+
 每个输出目录包含：
 
 - `launch.json`：完整合并前的训练配置、软件栈和命令；
 - `selected_tasks.json`：本次确定性选中的任务；
 - `dataset_metadata.json`：数据文件、校验和及 SQL 数据库校验和；
 - `metrics.jsonl`：每个训练 step 的阶段耗时、吞吐、显存和 reward，以及最终 run 记录；
+- `profile/`：启用 `--profile` 且未指定其他目录时的各 worker 算子轨迹；
 - `web_mcp.log`：仅自动启动 Web MCP 时生成。
 
 两种模式完成后，使用统一报告入口生成严格可比的 JSON 和 Markdown：

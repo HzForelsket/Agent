@@ -41,7 +41,7 @@ from agentlightning.verl.trainer import AgentLightningTrainer
 from prefix_grouper_stack import NPU_CANN_VERSION, REQUIRED_STACKS
 
 BENCHMARK_ID = "agl-multiturn-online-e2e"
-RESULT_SCHEMA_VERSION = 2
+RESULT_SCHEMA_VERSION = 3
 DEFAULT_MODEL = "Qwen/Qwen3-8B"
 DEFAULT_STEPS = 10
 DEFAULT_TASKS = 32
@@ -179,6 +179,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--npu-attention-backend", choices=("fusion", "custom"), default="fusion")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--insecure-download", action="store_true")
+    parser.add_argument(
+        "--profile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Capture selected complete training steps with VERL's worker and rollout profilers.",
+    )
+    parser.add_argument("--profile-steps", type=int, nargs="+", help="1-based steps to capture; default: 1.")
+    parser.add_argument("--profile-dir", type=Path, help="Trace directory; default: <output-dir>/profile.")
+    parser.add_argument(
+        "--profile-record-shapes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Record operator input shapes when profiling (default: enabled).",
+    )
+    parser.add_argument(
+        "--profile-memory",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Record operator memory when profiling (default: disabled).",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Prepare data and print config without hardware use.")
     return parser.parse_args()
 
@@ -230,6 +250,12 @@ def _logical_model_name(model: str, configured: str | None) -> str:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if not args.profile and (args.profile_steps is not None or args.profile_dir is not None or args.profile_memory):
+        raise ValueError("--profile-steps, --profile-dir and --profile-memory require --profile.")
+    if args.profile:
+        args.profile_steps = sorted(set(args.profile_steps or [1]))
+        if any(step < 1 or step > args.steps for step in args.profile_steps):
+            raise ValueError("--profile-steps must be between 1 and --steps (inclusive).")
     if not math.isfinite(args.q20_request_timeout) or args.q20_request_timeout <= 0:
         raise ValueError("--q20-request-timeout must be finite and positive.")
     for name in (
@@ -323,6 +349,36 @@ def prepare_workload(args: argparse.Namespace) -> tuple[list[dict[str, Any]], di
         for task in tasks:
             task["search_enabled"] = args.q20_search
     return tasks, metadata
+
+
+def configure_profiler(args: argparse.Namespace, backend: Backend, config: dict[str, Any]) -> None:
+    """Use the production trainer's step boundaries for all worker processes."""
+    if not args.profile:
+        return
+    tool = "npu" if backend == "npu" else "torch"
+    output_dir = (args.profile_dir or (args.output_dir / "profile")).expanduser().resolve()
+    contents = ["cpu", "npu" if backend == "npu" else "cuda"]
+    if args.profile_record_shapes:
+        contents.append("shapes")
+    if args.profile_memory:
+        contents.append("memory")
+    config["global_profiler"] = {
+        "tool": tool,
+        "steps": args.profile_steps,
+        "profile_continuous_steps": False,
+        "save_path": str(output_dir),
+    }
+    for role in ("actor", "ref", "rollout"):
+        tool_config: dict[str, Any] = {"contents": list(contents), "discrete": role == "rollout"}
+        if backend == "npu":
+            tool_config.update(level="level1", analysis=False)
+        config["actor_rollout_ref"][role]["profiler"] = {
+            "tool": tool,
+            "enable": True,
+            "all_ranks": True,
+            "save_path": str(output_dir / role),
+            "tool_config": {tool: tool_config},
+        }
 
 
 def build_config(
@@ -451,6 +507,7 @@ def build_config(
         config["actor_rollout_ref"]["model"]["override_config"][
             "prefix_grouper_npu_backend"
         ] = args.npu_attention_backend
+    configure_profiler(args, backend, config)
     return config
 
 
@@ -711,9 +768,21 @@ def run_training(
             },
             "npu_attention_backend": args.npu_attention_backend if args.mode == "simple" else None,
             "stack": stack,
+            "profile": {
+                "enabled": args.profile,
+                "steps": args.profile_steps if args.profile else [],
+                "record_shapes": args.profile_record_shapes if args.profile else False,
+                "profile_memory": args.profile_memory if args.profile else False,
+                "scope": "selected-online-training-steps",
+            },
+            "profile_output_dir": config.get("global_profiler", {}).get("save_path"),
         }
         _append_jsonl(metrics_path, run_record)
         print("AGL_MULTITURN_RUN=" + json.dumps(run_record, ensure_ascii=False, sort_keys=True), flush=True)
+        if args.profile and runtime.backend == "npu":
+            profile_dir = str(config["global_profiler"]["save_path"])
+            print(f"解析 NPU profile：{profile_dir}", flush=True)
+            runtime.analyse_profiles(profile_dir)
 
 
 def main() -> None:
@@ -755,6 +824,8 @@ def main() -> None:
     tasks, dataset_metadata = prepare_workload(args)
     metrics_path = args.output_dir.expanduser().resolve() / "metrics.jsonl"
     config = build_config(args, backend, metrics_path, len(tasks))
+    if args.profile:
+        print(f"AGL_MULTITURN_PROFILE_DIR={config['global_profiler']['save_path']}", flush=True)
 
     if args.dry_run:
         merged = agl.VERL(

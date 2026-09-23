@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 BENCHMARK_ID = "agl-multiturn-online-e2e"
-RESULT_SCHEMA_VERSION = 2
+RESULT_SCHEMA_VERSION = 3
 Direction = Literal["higher", "lower", "neutral"]
 Record = dict[str, Any]
 IDENTITY_FIELDS = {
@@ -52,6 +52,7 @@ COMPARABLE_FIELDS = (
     "dataset",
     "task_settings",
     "stack",
+    "profile",
 )
 
 
