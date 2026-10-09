@@ -219,8 +219,9 @@ def span_token_ids(value: Any) -> list[int]:
 def read_swebench_stream(path: Path, diagnostics: list[str]) -> Iterable[tuple[str, dict[str, Any]]]:
     """Read the actual stream_<instance_id>.json Span export from Claude Code.
 
-    Match ExtendedLlmProxyTraceToTriplet's token extraction, sequence ordering
-    and request-ID deduplication. Keep the offline reader standard-library-only.
+    Match ExtendedLlmProxyTraceToTriplet's token extraction and sequence ordering.
+    The proxy assigns one sequence ID to all spans of one request, so deduplicate
+    that identity as well as response IDs, checking token consistency first.
     """
     instance_id = path.name.removeprefix("stream_").removesuffix(".json")
     if not instance_id:
@@ -230,7 +231,8 @@ def read_swebench_stream(path: Path, diagnostics: list[str]) -> Iterable[tuple[s
         if type(span.get("sequence_id")) is not int or span["sequence_id"] < 0:
             raise ValueError(f"{path}:{line_number} has invalid Span.sequence_id")
     spans.sort(key=lambda item: (item[1]["sequence_id"], item[1].get("start_time", 0)))
-    seen: set[tuple[str, str, str]] = set()
+    seen_sequences: dict[tuple[str, str, int], tuple[list[int], list[int], str]] = {}
+    seen_requests: dict[tuple[str, str, str], tuple[list[int], list[int], str]] = {}
     attempts: dict[str, str] = {}
     missing_tokens = duplicates = selected = 0
     for line_number, span in spans:
@@ -276,12 +278,24 @@ def read_swebench_stream(path: Path, diagnostics: list[str]) -> Iterable[tuple[s
                 f"{path}: rollout {rollout} contains multiple attempts; select one attempt before analysis"
             )
         request_id = attrs.get("gen_ai.response.id") or attrs.get("llm.hosted_vllm.id")
+        sequence_key = (rollout, attempt, span["sequence_id"])
+        previous_sequence = seen_sequences.get(sequence_key)
+        previous_request = None
         if isinstance(request_id, str) and request_id:
-            key = (rollout, attempt, request_id)
-            if key in seen:
-                duplicates += 1
-                continue
-            seen.add(key)
+            previous_request = seen_requests.get((rollout, attempt, request_id))
+        for previous in (previous_sequence, previous_request):
+            if previous is not None and (previous[0] != prompt or previous[1] != response):
+                raise ValueError(
+                    f"{context}: conflicting token IDs for rollout={rollout}, attempt={attempt}, "
+                    f"sequence_id={span['sequence_id']}; earlier span at {previous[2]}"
+                )
+        entry = (prompt, response, context)
+        seen_sequences[sequence_key] = entry
+        if isinstance(request_id, str) and request_id:
+            seen_requests[(rollout, attempt, request_id)] = entry
+        if previous_sequence is not None or previous_request is not None:
+            duplicates += 1
+            continue
         selected += 1
         yield context, {
             "instance_id": instance_id,

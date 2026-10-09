@@ -114,6 +114,7 @@ Use these artifacts to fine-tune models, debug Claude Code behavior, or replay r
 For offline token-length and prefix-sharing analysis, pass the collected output directory to
 `scripts/analyze_multiturn_sharing.py --input swebench=/path/to/collection --output-dir /path/to/new-report`
 from the repository root. The analyzer reads the actual `stream_<instance_id>.json` JSONL spans,
-orders calls by `sequence_id`, and deduplicates request IDs; it does not require the derived HuggingFace dataset.
+orders calls by `sequence_id`, and deduplicates request sequences and response IDs after checking token consistency;
+it does not require the derived HuggingFace dataset.
 See [SWE-bench input details](../../scripts/MULTITURN_SHARING.md#swe-bench-原始采集结果).
 Keep repeated collections in separate directories because the collector overwrites the same instance's stream filename.

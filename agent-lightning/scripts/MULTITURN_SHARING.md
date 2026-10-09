@@ -110,9 +110,12 @@ stream 文件名不含 rollout ID，同目录重跑同题会覆盖旧文件，�
 | 轮次顺序 | Span 的 `sequence_id`；同序号按 `start_time` 排序 |
 | prompt tokens | `attributes.prompt_token_ids` 或 `attributes.llm.hosted_vllm.prompt_token_ids` |
 | response tokens | `attributes.response_token_ids` 或 `attributes.llm.hosted_vllm.response_token_ids`；也支持 raw `choices[0].token_ids` / `provider_specific_fields.token_ids` |
-| 请求去重 | 同 rollout/attempt 内的 `gen_ai.response.id` 或 `llm.hosted_vllm.id` |
+| 请求去重 | 首先按 `(rollout_id, attempt_id, sequence_id)`，同时识别 `gen_ai.response.id` 或 `llm.hosted_vllm.id` |
 
-token 提取和请求去重规则参照当前 `ExtendedLlmProxyTraceToTriplet`。序列化的 token
+token 提取规则参照当前 `ExtendedLlmProxyTraceToTriplet`。当前代理为一次请求的整棵
+Span 子树写入同一个 `sequence_id`，主 Span 与 raw Span 都可能携带 token，因此同序号
+且 token 一致的记录只计一次，不依赖 response ID 是否存在。相同请求身份的 token 内容
+不一致时，分析器报出冲突序号及两条记录的位置，不静默选择或改写轮次。序列化的 token
 数组会解码，但不会重新分词文本或用 usage token 数替代 token IDs。非 LLM span 不计入；
 缺少有效 token 的 LLM span 和重复请求分别计数，写入 `summary.json` 的
 `input_diagnostics` 及 `report.md`。某个 stream 完全没有有效 token 调用时明确报错。
