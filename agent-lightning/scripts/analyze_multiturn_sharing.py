@@ -22,6 +22,7 @@ See MULTITURN_SHARING.md for input contracts and metric definitions.
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import json
 import math
@@ -194,6 +195,129 @@ def read_jsonl(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
             yield line_number, value
 
 
+def span_value(value: Any) -> Any:
+    """Decode the JSON/Python-literal attributes emitted by the LLM proxy."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            try:
+                return ast.literal_eval(value)
+            except (ValueError, SyntaxError):
+                return value
+    return value
+
+
+def span_token_ids(value: Any) -> list[int]:
+    """Normalize serialized token IDs without tokenizing text or using counts."""
+    value = span_value(value)
+    if isinstance(value, (list, tuple)) and all(type(token) is int and token >= 0 for token in value):
+        return list(value)
+    return []
+
+
+def read_swebench_stream(path: Path, diagnostics: list[str]) -> Iterable[tuple[str, dict[str, Any]]]:
+    """Read the actual stream_<instance_id>.json Span export from Claude Code.
+
+    Match ExtendedLlmProxyTraceToTriplet's token extraction, sequence ordering
+    and request-ID deduplication. Keep the offline reader standard-library-only.
+    """
+    instance_id = path.name.removeprefix("stream_").removesuffix(".json")
+    if not instance_id:
+        raise ValueError(f"{path} has no instance_id in its filename")
+    spans = list(read_jsonl(path))
+    for line_number, span in spans:
+        if type(span.get("sequence_id")) is not int or span["sequence_id"] < 0:
+            raise ValueError(f"{path}:{line_number} has invalid Span.sequence_id")
+    spans.sort(key=lambda item: (item[1]["sequence_id"], item[1].get("start_time", 0)))
+    seen: set[tuple[str, str, str]] = set()
+    attempts: dict[str, str] = {}
+    missing_tokens = duplicates = selected = 0
+    for line_number, span in spans:
+        context = f"{path}:{line_number}"
+        attrs = span.get("attributes") or {}
+        if not isinstance(attrs, dict):
+            raise ValueError(f"{context} has invalid Span.attributes")
+        token_fields = (
+            "prompt_token_ids",
+            "response_token_ids",
+            "llm.hosted_vllm.prompt_token_ids",
+            "llm.hosted_vllm.response_token_ids",
+            "llm.hosted_vllm.choices",
+        )
+        if span.get("name") not in {"litellm_request", "raw_gen_ai_request"} and not any(
+            key in attrs for key in token_fields
+        ):
+            continue
+        prompt = span_token_ids(attrs.get("prompt_token_ids")) or span_token_ids(
+            attrs.get("llm.hosted_vllm.prompt_token_ids")
+        )
+        response = span_token_ids(attrs.get("response_token_ids"))
+        raw_response = span_value(attrs.get("llm.hosted_vllm.response_token_ids"))
+        if not response:
+            response = span_token_ids(raw_response)
+        if not response and isinstance(raw_response, (list, tuple)) and raw_response:
+            response = span_token_ids(raw_response[0])
+        if not response:
+            choices = span_value(attrs.get("llm.hosted_vllm.choices"))
+            if isinstance(choices, (list, tuple)) and choices and isinstance(choices[0], dict):
+                response = span_token_ids(choices[0].get("token_ids"))
+                provider_fields = choices[0].get("provider_specific_fields")
+                if not response and isinstance(provider_fields, dict):
+                    response = span_token_ids(provider_fields.get("token_ids"))
+        if not prompt or not response:
+            missing_tokens += 1
+            continue
+        rollout, attempt = span.get("rollout_id"), span.get("attempt_id")
+        if not isinstance(rollout, str) or not rollout or not isinstance(attempt, str) or not attempt:
+            raise ValueError(f"{context} has no valid Span rollout_id/attempt_id")
+        if attempts.setdefault(rollout, attempt) != attempt:
+            raise ValueError(
+                f"{path}: rollout {rollout} contains multiple attempts; select one attempt before analysis"
+            )
+        request_id = attrs.get("gen_ai.response.id") or attrs.get("llm.hosted_vllm.id")
+        if isinstance(request_id, str) and request_id:
+            key = (rollout, attempt, request_id)
+            if key in seen:
+                duplicates += 1
+                continue
+            seen.add(key)
+        selected += 1
+        yield context, {
+            "instance_id": instance_id,
+            "rollout_id": rollout,
+            "turn": span["sequence_id"],
+            "prompt_token_ids": prompt,
+            "response_token_ids": response,
+        }
+    diagnostics.append(
+        f"{path}: selected {selected} token calls; skipped {missing_tokens} LLM spans without valid token IDs "
+        f"and {duplicates} duplicate request spans. Completion and policy/environment roles are not validated."
+    )
+    if not selected:
+        raise ValueError(f"{path} contains no LLM calls with actual prompt/response token IDs")
+
+
+def read_training_records(source: Path, diagnostics: list[str]) -> Iterable[tuple[str, dict[str, Any]]]:
+    """Read call JSONL or recursively discover the collector's SWE-bench streams."""
+    if source.is_file():
+        if source.name.startswith("stream_") and source.suffix == ".json":
+            yield from read_swebench_stream(source, diagnostics)
+            return
+        for line_number, record in read_jsonl(source):
+            yield f"{source}:{line_number}", record
+        return
+    calls = source / "calls.jsonl"
+    if calls.is_file():
+        yield from read_training_records(calls, diagnostics)
+        return
+    streams = sorted(source.rglob("stream_*.json"))
+    if not streams:
+        raise ValueError(f"{source} contains neither calls.jsonl nor SWE-bench stream_*.json exports")
+    for path in streams:
+        yield from read_swebench_stream(path, diagnostics)
+
+
 def token_ids(record: dict[str, Any], side: str, context: str) -> list[int]:
     """Read and validate prompt or response token IDs from supported schemas."""
     value = record.get(f"{side}_token_ids")
@@ -216,7 +340,7 @@ def trajectory_id(record: dict[str, Any], context: str) -> str:
 
 def sharing_group_id(record: dict[str, Any], group_key: str, context: str) -> tuple[str | None, str | None]:
     """Resolve the task/data group used to keep sibling rollouts together."""
-    keys = ("data_id", "task_id") if group_key == "auto" else (group_key,)
+    keys = ("data_id", "task_id", "instance_id") if group_key == "auto" else (group_key,)
     for key in keys:
         value = record.get(key)
         if isinstance(value, (str, int)) and str(value) != "":
@@ -486,22 +610,22 @@ def distribution(values: Iterable[float | None]) -> dict[str, Any]:
 
 
 def load_training_trajectories(
-    path: Path, role: str, group_key: str
+    path: Path, role: str, group_key: str, diagnostics: list[str] | None = None
 ) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
     """Read token calls, retaining collection order and optional rollout indices."""
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     selected_records = 0
     skipped_roles: dict[str, int] = defaultdict(int)
-    for fallback, (line_number, record) in enumerate(read_jsonl(path)):
+    input_diagnostics = diagnostics if diagnostics is not None else []
+    for fallback, (context, record) in enumerate(read_training_records(path, input_diagnostics)):
         record_role = record.get("role")
         if role != "all" and record_role is not None and record_role != role:
             skipped_roles[str(record_role)] += 1
             continue
-        context = f"{path}:{line_number}"
         identifier = trajectory_id(record, context)
         resolved_group_key, group_id = sharing_group_id(record, group_key, context)
         if resolved_group_key is None:
-            raise ValueError(f"{context} has no task/data group identifier")
+            raise ValueError(f"{context} has no data_id, task_id or instance_id sharing group")
         sample_index = record.get("sample_index", record.get("rollout_index"))
         if sample_index is not None and (type(sample_index) is not int or sample_index < 0):
             raise ValueError(f"{context} has an invalid sample_index or rollout_index")
@@ -802,6 +926,11 @@ def render_report(workloads: dict[str, Any], rows: list[dict[str, Any]], summari
             "所选 rollout ID 和不足数量明细见 summary.json；采集调用不等于已验证正常完成的轨迹。",
         ]
     )
+    if any(report.get("input_diagnostics") for report in workloads.values()):
+        lines.extend(["", "## 输入解析诊断", ""])
+        for workload, report in workloads.items():
+            for diagnostic in report.get("input_diagnostics", []):
+                lines.append(f"- {workload}: {diagnostic}")
     return "\n".join(lines) + "\n"
 
 
@@ -1279,14 +1408,16 @@ def write_rollout_report(inputs: dict[str, Path], output: Path, role: str, group
     trajectory_metrics = []
     skipped_cohorts = []
     for workload, source in inputs.items():
-        path = source / "calls.jsonl" if source.is_dir() else source
-        trajectories, count, skipped_roles = load_training_trajectories(path, role, group_key)
+        path = source / "calls.jsonl" if (source / "calls.jsonl").is_file() else source
+        input_diagnostics: list[str] = []
+        trajectories, count, skipped_roles = load_training_trajectories(path, role, group_key, input_diagnostics)
         diagnostics = summarize_training(path, role, group_key, trajectories, count, skipped_roles)
         workloads[workload] = {
             "input": str(path),
             "available_rollouts": len(trajectories),
             "selected_records": count,
             "skipped_roles": skipped_roles,
+            "input_diagnostics": input_diagnostics,
             "validation_source": "token_calls_only; completion and sampling-group coverage are not validated",
             "training_segment_diagnostics": diagnostics,
         }
@@ -1365,7 +1496,9 @@ def main() -> None:
         help="Number of collected rollouts per task; default: 1,2,4,8,16,32,64",
     )
     parser.add_argument("--role", help="Training only; default: policy; use all to retain all roles")
-    parser.add_argument("--group-key", choices=("auto", "data_id", "task_id"), help="Training only; default: auto")
+    parser.add_argument(
+        "--group-key", choices=("auto", "data_id", "task_id", "instance_id"), help="Training only; default: auto"
+    )
     args = parser.parse_args()
     inputs = dict(args.input)
     if len(inputs) != len(args.input):
@@ -1375,7 +1508,7 @@ def main() -> None:
     ):
         parser.error("calls/trajectory views take one input and no training-only options")
     output = args.output_dir.expanduser().resolve()
-    if (output / "config.json").exists() or (output / "calls.jsonl").exists():
+    if (output / "config.json").exists() or (output / "calls.jsonl").exists() or any(output.glob("stream_*.json")):
         parser.error("output cannot be a raw collection directory")
     if (output / "summary.json").exists():
         parser.error("output already contains a report; choose a fresh --output-dir")

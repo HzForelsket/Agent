@@ -38,7 +38,7 @@ conda run -n agent --no-capture-output python scripts/analyze_multiturn_sharing.
 每条记录需要轨迹 ID（`trajectory_id` / `rollout_id`）、题组 ID（`data_id` / `task_id`），
 以及实际 prompt/response token ID。支持 `prompt_token_ids` / `response_token_ids`、
 `prompt_ids` / `response_ids`、`prompt.token_ids` / `response.token_ids` 三种 token 字段形式。
-`--group-key auto` 优先使用 `data_id`，也可指定 `task_id` 或 `data_id`。
+`--group-key auto` 依次使用 `data_id`、`task_id`、`instance_id`，也可显式指定其中一个。
 `turn` / `turn_index` 可选，缺省按文件顺序；同一轨迹的轮次不能重复。
 默认保留 policy 和未标注角色的调用；可用 `--role` 指定角色。
 
@@ -80,6 +80,54 @@ prompt 不能从最终轨迹总长度中扣除。后缀独立，不对生成输�
 原有 API token 比例、训练分段重建和分段共享潜力保留在
 `workloads.<工作负载>.training_segment_diagnostics`，仅供解释训练数据结构。
 该诊断针对全部输入，**不是 rollout 数量表的统计分母**。
+
+## SWE-bench 原始采集结果
+
+接入依据是当前 `examples/claude_code/claude_code_agent.py` 的
+`run_instance_async`：它先将 `store.query_spans(rollout.rollout_id)` 返回的 Span
+逐行写入 `<output-dir>/stream_<instance_id>.json`。虽然扩展名是 `.json`，内容是
+JSONL，不是一个 JSON 数组。分析直接读取这些原始文件，不依赖派生的 HuggingFace
+`dataset-<instance_id>/`，也不读取题目输入 `swebench_samples.jsonl` 或 Docker 日志。
+
+在保存采集结果的机器上，从仓库根目录运行（替换实际路径）：
+
+```bash
+conda run -n agent --no-capture-output python scripts/analyze_multiturn_sharing.py \
+  --input swebench=/runs/swebench-collected \
+  --group-key instance_id --rollout-counts 1,2,4,8,16,32,64 \
+  --output-dir /runs/swebench-sharing
+```
+
+输入可以是单个 `stream_<instance_id>.json`、采集目录，或包含多次独立采集目录的父目录；
+目录递归查找 `stream_*.json`，按路径排序。若目录直接包含 `calls.jsonl`，则继续使用
+原有 calls 格式，不将两种表示重复计入。同题的多次采集必须放在不同目录：当前采集器的
+stream 文件名不含 rollout ID，同目录重跑同题会覆盖旧文件，分析器无法恢复已覆盖轨迹。
+
+| 分析字段 | 当前采集文件中的来源 |
+|---|---|
+| 题组 | 文件名中的完整 `instance_id` |
+| 轨迹 ID | Span 的 `rollout_id`，不从目录名虚构 |
+| 轮次顺序 | Span 的 `sequence_id`；同序号按 `start_time` 排序 |
+| prompt tokens | `attributes.prompt_token_ids` 或 `attributes.llm.hosted_vllm.prompt_token_ids` |
+| response tokens | `attributes.response_token_ids` 或 `attributes.llm.hosted_vllm.response_token_ids`；也支持 raw `choices[0].token_ids` / `provider_specific_fields.token_ids` |
+| 请求去重 | 同 rollout/attempt 内的 `gen_ai.response.id` 或 `llm.hosted_vllm.id` |
+
+token 提取和请求去重规则参照当前 `ExtendedLlmProxyTraceToTriplet`。序列化的 token
+数组会解码，但不会重新分词文本或用 usage token 数替代 token IDs。非 LLM span 不计入；
+缺少有效 token 的 LLM span 和重复请求分别计数，写入 `summary.json` 的
+`input_diagnostics` 及 `report.md`。某个 stream 完全没有有效 token 调用时明确报错。
+同一 rollout 有多个带 token 的 attempt 时拒绝混合，不能把重试当成额外采样。
+
+当前采集入口每次对每个输入问题执行一次 rollout，没有写入 sample index；因此按目录路径
+和 Span 顺序确定嵌套选样顺序，并在结果中保留实际 rollout ID。单次采集通常只有 N=1
+档位可用；更高档位需要已保存的独立同题采样，不会复制轨迹补齐。
+
+此接入只用于默认 `--view training`，复用现有最终上下文长度、初始 prompt 共享和
+训练分段诊断算法。原始 Span 不提供现有 calls/trajectory 视图要求的完整采样清单与
+完成状态合同，因此不冒充这两个视图的完整输入。未标注角色的 token 调用会全部纳入，
+不能据此认定它们都是 policy 调用；高低价模型应使用相同的实际模型和 tokenizer，
+不同模型的 token IDs 不能放在同一个共享比较中。输入缺失调用、历史压缩或重写时，
+报告仅反映可见 token 序列，不证明完整轨迹、任务成功率或实测训练收益。
 
 ## 其他统计视图
 
