@@ -72,6 +72,10 @@ DP rank 或截断。`summary.json` 用 `sharing_method=final_trajectory_prefix_t
 | `selected_rollout_ids` | 当前档位所选轨迹的 ID，按实际选择顺序列出 |
 | `independent_total_tokens` | 所选 N 条轨迹的最终长度之和 |
 | `shared_prefix_saved_tokens` | 最终轨迹前缀树共享可消除的重复 token 数 |
+| `initial_prompt_saved_tokens` | 所有出现位置均位于各自初始 prompt 内的可省 token |
+| `other_saved_tokens` | 所有出现位置均位于各自初始 prompt 之后的可省 token |
+| `mixed_saved_tokens` | 同一共享节点在不同轨迹中分别属于初始 prompt 和后续部分的可省 token |
+| `unattributed_saved_tokens` | 至少一条参与轨迹无法确认初始 prompt 边界的可省 token |
 | `grouped_total_tokens` | 独立 token 减去可省 token |
 | `token_reduction` | 可省 token / 独立 token |
 | `weighted_token_reduction` | 相同 N 下所有纳入 task 的可省 token 总和 / 独立 token 总和 |
@@ -89,6 +93,14 @@ DP rank 或截断。`summary.json` 用 `sharing_method=final_trajectory_prefix_t
 - `per_trajectory.csv`：所有已采集轨迹的编号、采集顺序、轮数、初始 prompt 和最终长度。
 - `per_task_rollout_counts.csv`：每个 task 在各 rollout 数量下的统计。
 - `task_distribution.csv`：各档位的 task 分布、覆盖率和 token 加权共享率。
+
+报告同时展示每 task 和每 rollout 档位的共享来源。归属统计以**省下的重复 token**为单位：
+一个被 k 条轨迹共用的前缀树节点贡献 k−1，不是把 k 个出现位置全部算作节省。
+仅当最终轨迹以完整初始 prompt 开头时，才确认该轨迹的初始 prompt 边界。
+对于同一共享节点，全部出现位置在边界内归入初始 prompt，全部在边界后归入后续部分；
+出现位置归属不一致归入 mixed，任一边界未确认归入 unattributed。四类互斥且合计
+等于 `shared_prefix_saved_tokens`；统计不依赖轨迹输入顺序，也不会改变总共享率。
+“后续部分”包括后续模型回复、工具结果和消息模板 token，当前不再细分来源。
 
 原有 API token 比例、训练分段重建和分段共享潜力保留在
 `workloads.<工作负载>.training_segment_diagnostics`，仅供解释训练数据结构。

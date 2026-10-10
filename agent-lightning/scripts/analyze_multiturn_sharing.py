@@ -776,6 +776,53 @@ def parse_rollout_counts(value: str) -> list[int]:
     return counts
 
 
+def shared_token_attribution(trajectories: list[dict[str, Any]]) -> dict[str, int]:
+    """Attribute saved trie nodes using all occurrences, independent of input order.
+
+    A compressed trie edge contributes (occurrences - 1) times its length.
+    Boundaries are known only when the complete initial prompt is preserved.
+    """
+    sequences = sorted(
+        ((row["_final_context_ids"], row["_initial_prompt_ids"]) for row in trajectories),
+        key=lambda item: item[0],
+    )
+    boundaries = [len(prompt) if starts_with(sequence, prompt) else None for sequence, prompt in sequences]
+    totals = {f"{kind}_saved_tokens": 0 for kind in ("initial_prompt", "other", "mixed", "unattributed")}
+    pending = [(0, len(sequences), 0)]
+    while pending:
+        lo, hi, depth = pending.pop()
+        if hi - lo < 2:
+            continue
+        first, last = sequences[lo][0], sequences[hi - 1][0]
+        end = depth
+        while end < min(len(first), len(last)) and first[end] == last[end]:
+            end += 1
+        multiplier = hi - lo - 1
+        limits = boundaries[lo:hi]
+        if any(limit is None for limit in limits):
+            totals["unattributed_saved_tokens"] += multiplier * (end - depth)
+        else:
+            known = [limit for limit in limits if limit is not None]
+            prompt_end, other_start = min(known), max(known)
+            initial_length = max(0, min(end, prompt_end) - depth)
+            other_length = max(0, end - max(depth, other_start))
+            totals["initial_prompt_saved_tokens"] += multiplier * initial_length
+            totals["other_saved_tokens"] += multiplier * other_length
+            totals["mixed_saved_tokens"] += multiplier * (end - depth - initial_length - other_length)
+        index = lo
+        while index < hi:
+            if len(sequences[index][0]) == end:
+                index += 1
+                continue
+            stop = index + 1
+            token = sequences[index][0][end]
+            while stop < hi and len(sequences[stop][0]) > end and sequences[stop][0][end] == token:
+                stop += 1
+            pending.append((index, stop, end))
+            index = stop
+    return totals
+
+
 def task_rows(
     workload: str, trajectories: list[dict[str, Any]], counts: list[int]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -837,6 +884,7 @@ def task_rows(
                     "sharing_status": sharing_status,
                     "independent_total_tokens": independent_tokens,
                     "shared_prefix_saved_tokens": saved_tokens,
+                    **shared_token_attribution(selected),
                     "grouped_total_tokens": grouped_tokens,
                     "token_reduction": saved_tokens / independent_tokens,
                     "token_work_ratio": independent_tokens / grouped_tokens,
@@ -873,6 +921,13 @@ def summarize_rows(rows: list[dict[str, Any]], skipped: list[dict[str, Any]]) ->
                 "weighted_token_reduction": ratio(saved, independent),
                 "total_independent_tokens": independent,
                 "total_saved_tokens": saved,
+                **{
+                    field: sum(row[field] for row in members)
+                    for field in (
+                        "initial_prompt_saved_tokens", "other_saved_tokens",
+                        "mixed_saved_tokens", "unattributed_saved_tokens",
+                    )
+                },
             }
         )
     return summaries
@@ -952,6 +1007,23 @@ def render_report(workloads: dict[str, Any], rows: list[dict[str, Any]], summari
             "所选 rollout ID 和不足数量明细见 summary.json；采集调用不等于已验证正常完成的轨迹。",
         ]
     )
+    for title, entries, aggregate in (
+        ("每 task 的共享来源", rows, False),
+        ("按 rollout 数量汇总的共享来源", summaries, True),
+    ):
+        lines.extend([
+            "", f"## {title}", "",
+            "以下均为省下的重复 token 数，四类之和等于总可省 token；不改变最终轨迹共享率。", "",
+            "| 数据集 | task | rollout 数 | 初始 prompt | 后续部分 | 混合归属 | 无法归属 |",
+            "|---|---|---:|---:|---:|---:|---:|---:|",
+        ])
+        for entry in entries:
+            task = "全部纳入 task" if aggregate else str(entry["task_id"])
+            lines.append(
+                f"| {entry['workload']} | {task} | {entry['rollout_count']} | "
+                f"{entry['initial_prompt_saved_tokens']} | {entry['other_saved_tokens']} | "
+                f"{entry['mixed_saved_tokens']} | {entry['unattributed_saved_tokens']} |"
+            )
     if any(report.get("input_diagnostics") for report in workloads.values()):
         lines.extend(["", "## 输入解析诊断", ""])
         for workload, report in workloads.items():
@@ -1478,6 +1550,7 @@ def write_rollout_report(inputs: dict[str, Path], output: Path, role: str, group
             "independent_total_tokens": "Sum of final prompt+response lengths for exactly N selected rollouts; never a sum over training segments.",
             "sharing": "Build a prefix trie over the selected final prompt+response token sequences; count each trie node once, including shared prefixes within subgroups. Initial prompts do not constrain sharing.",
             "token_reduction": "shared_prefix_saved_tokens / independent_total_tokens",
+            "shared_token_attribution": "Partition saved trie tokens by all occurrences: initial_prompt if every occurrence is inside a preserved initial prompt, other if all are after it, mixed if boundaries disagree, unattributed if any initial-prompt boundary is unverified. The four saved-token counts sum to shared_prefix_saved_tokens.",
             "simple_token_reduction": "Savings from retaining the all-rollout longest common prefix once, divided by independent_total_tokens; reported separately from prefix-tree sharing.",
             "coverage": "Tasks with fewer than N rollouts are excluded from that cohort size, without replacement.",
             "scope": "Rollout-count comparison, not a micro-batch or DP-rank simulation. Final contexts may omit earlier history after prefix breaks. No measured speedup claim.",
