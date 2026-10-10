@@ -93,6 +93,8 @@ DP rank 或截断。`summary.json` 用 `sharing_method=final_trajectory_prefix_t
 - `per_trajectory.csv`：所有已采集轨迹的编号、采集顺序、轮数、初始 prompt 和最终长度。
 - `per_task_rollout_counts.csv`：每个 task 在各 rollout 数量下的统计。
 - `task_distribution.csv`：各档位的 task 分布、覆盖率和 token 加权共享率。
+- `per_task_round.csv`：每个 task、每档 rollout 数量在每轮交互后的轨迹长度和共享率。
+- `round_distribution.csv`：每个 rollout 档位的逐轮汇总、实际参与数量和 token 加权共享率。
 
 报告同时展示每 task 和每 rollout 档位的共享来源。归属统计以**省下的重复 token**为单位：
 一个被 k 条轨迹共用的前缀树节点贡献 k−1，不是把 k 个出现位置全部算作节省。
@@ -111,6 +113,38 @@ N=1 时没有第二条轨迹可以共享，因此这些比例必为零；N>1 但
 均为零时也会全零。查看每 task 的“共享状态”区分原因。没有足够 rollout 的档位显示
 N/A，不应解释成共享率为零。比例按两位百分数显示，极小的非零值也可能显示 0.00%；
 此时以 `summary.json` 的原始比例和 `shared_prefix_saved_tokens` 为准。
+
+## 每轮交互后的共享率和轨迹均值
+
+默认视图自动输出逐轮统计，无需增加命令行参数。`report.md` 包含逐轮汇总和每 task
+明细；JSON 对应 `per_task_round` 和 `round_distribution`，并提供上述两个 CSV。
+
+第 k 轮（从 1 开始）指去重、角色筛选后，按原始轮次排序的第 k 次有效模型调用。
+它不是原始 `sequence_id` 数值，也不保证对应一次工具执行或用户对话。
+原始序号可能有间隔，缺失的调用无法恢复；CSV/JSON 的 `active_rollout_ids` 与
+`source_turn_indices` 按位置对应，保留实际参与轨迹和原始序号以便核查。
+
+每个 task、每个 N 档位沿用最终轨迹统计选中的前 N 条 rollout。第 k 轮只纳入其中
+有第 k 次有效调用的轨迹，不重新选样、不复制样本，也不把已停止调用的轨迹末尾填入后续轮次。
+没有该轮调用可能是结束，也可能是采集不完整，不能据此认定正常完成。
+
+- 当轮轨迹 = 第 k 次调用的 prompt token IDs + response token IDs。
+- 当轮轨迹均值 = 参与轨迹的当轮长度之和 / `active_rollouts`，单位 **token**；不累计历次调用长度。
+- 当轮共享率沿用最终轨迹的前缀树算法：`shared_prefix_saved_tokens / independent_total_tokens`。
+- 仅剩一条参与轨迹时共享率为零；没有参与轨迹的 task 不生成该轮明细，也不计入该轮 task 均值。
+- 共享来源的四类可省 token 同样写入逐轮 CSV/JSON；以当轮上下文是否保留初始 prompt 判断边界。
+
+`rollout_count` 是最初选样档位 N，`active_rollouts` 才是该轮的实际分母数量；
+`inactive_rollouts` 表示入选但没有该轮调用的数量。汇总同时提供 `eligible_tasks`、
+`active_tasks`、`inactive_tasks` 和 `tasks_with_multiple_rollouts`，后者表示仍有至少两条
+轨迹参与、可能产生跨轨迹共享的 task 数。数量不足 N 的 task 仍在 `skipped_cohorts` 中，
+不会通过逐轮统计重新纳入。
+
+汇总轨迹均值按全部实际参与 rollout 加权，不直接平均各 task 的长度均值；
+汇总共享率按各 task 的可省 token 总和 / 独立 token 总和计算，不跨 task 合并前缀。
+`mean`、`p50`、`p95` 则仍是 task 共享率分布，其中包含仅剩一条参与轨迹的零共享率。
+各轮参与样本可能不同，比较趋势时必须同时查看覆盖率；若轨迹轮数不同，最后一轮的参与集合
+也不同于“每条 rollout 各取最终上下文”的最终轨迹表，两者不要求一致。
 
 ## SWE-bench 原始采集结果
 

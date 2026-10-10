@@ -5,7 +5,9 @@ r"""Analyze multi-turn prefix sharing through one offline entrypoint.
 
 The default view compares the first N collected rollouts of each task. Its
 independent token count sums one final context per selected rollout, not all
-training segments. Training-segment diagnostics are reported separately.
+training segments. Per-round results also compare prompt+response contexts at
+each retained call ordinal, using only rollouts that reached that ordinal.
+Training-segment diagnostics are reported separately.
 The calls and trajectory views compare common-prefix and trie sharing using
 explicitly different statistical units. No model or accelerator is required.
 
@@ -493,6 +495,7 @@ def analyze_trajectory(trajectory: str, turns: list[dict[str, Any]]) -> dict[str
         "_logical_response_tokens": logical_response,
         "_logical_total_tokens": len(final_context_ids),
         "_final_context_ids": final_context_ids,
+        "_ordered_calls": ordered,
         "_sharing_segments": segments,
     }
 
@@ -933,12 +936,104 @@ def summarize_rows(rows: list[dict[str, Any]], skipped: list[dict[str, Any]]) ->
     return summaries
 
 
+def round_rows(
+    trajectories: list[dict[str, Any]], cohorts: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Compare observed call ordinals within the already selected rollout cohorts."""
+    by_id = {trajectory["trajectory_id"]: trajectory for trajectory in trajectories}
+    rows = []
+    for cohort in cohorts:
+        selected = [by_id[trajectory_id] for trajectory_id in cohort["selected_rollout_ids"]]
+        for index in range(max(trajectory["turns"] for trajectory in selected)):
+            active = [trajectory for trajectory in selected if trajectory["turns"] > index]
+            snapshots = [
+                {
+                    "_final_context_ids": (
+                        trajectory["_ordered_calls"][index]["prompt_ids"]
+                        + trajectory["_ordered_calls"][index]["response_ids"]
+                    ),
+                    "_initial_prompt_ids": trajectory["_initial_prompt_ids"],
+                }
+                for trajectory in active
+            ]
+            lengths = [len(snapshot["_final_context_ids"]) for snapshot in snapshots]
+            costs = sharing_costs([snapshot["_final_context_ids"] for snapshot in snapshots])
+            independent = costs["separate_tokens"]
+            saved = independent - costs["merged_tokens"]
+            rows.append(
+                {
+                    "workload": cohort["workload"],
+                    "task_id": cohort["task_id"],
+                    "rollout_count": cohort["rollout_count"],
+                    "round": index + 1,
+                    "active_rollouts": len(active),
+                    "inactive_rollouts": len(selected) - len(active),
+                    "active_rollout_ids": [trajectory["trajectory_id"] for trajectory in active],
+                    "source_turn_indices": [trajectory["_ordered_calls"][index]["turn"] for trajectory in active],
+                    "trajectory_length_mean": mean(lengths),
+                    "trajectory_length_p50": percentile([float(length) for length in lengths], 0.50),
+                    "trajectory_length_p95": percentile([float(length) for length in lengths], 0.95),
+                    "independent_total_tokens": independent,
+                    "grouped_total_tokens": costs["merged_tokens"],
+                    "shared_prefix_saved_tokens": saved,
+                    "token_reduction": ratio(saved, independent),
+                    **shared_token_attribution(snapshots),
+                }
+            )
+    return rows
+
+
+def summarize_round_rows(rows: list[dict[str, Any]], cohorts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate each round without sharing across tasks or averaging length means."""
+    eligible = Counter((row["workload"], row["rollout_count"]) for row in cohorts)
+    grouped: dict[tuple[str, int, int], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[(row["workload"], row["rollout_count"], row["round"])].append(row)
+    summaries = []
+    for (workload, count, round_number), members in sorted(grouped.items()):
+        active = sum(row["active_rollouts"] for row in members)
+        independent = sum(row["independent_total_tokens"] for row in members)
+        saved = sum(row["shared_prefix_saved_tokens"] for row in members)
+        summaries.append(
+            {
+                "workload": workload,
+                "rollout_count": count,
+                "round": round_number,
+                "eligible_tasks": eligible[(workload, count)],
+                "active_tasks": len(members),
+                "inactive_tasks": eligible[(workload, count)] - len(members),
+                "tasks_with_multiple_rollouts": sum(row["active_rollouts"] >= 2 for row in members),
+                "active_rollouts": active,
+                "inactive_rollouts": eligible[(workload, count)] * count - active,
+                "trajectory_length_mean": ratio(independent, active),
+                "total_independent_tokens": independent,
+                "total_saved_tokens": saved,
+                "weighted_token_reduction": ratio(saved, independent),
+                **{
+                    key: value for key, value in distribution(row["token_reduction"] for row in members).items()
+                    if key != "count"
+                },
+                **{
+                    field: sum(row[field] for row in members)
+                    for field in (
+                        "initial_prompt_saved_tokens", "other_saved_tokens",
+                        "mixed_saved_tokens", "unattributed_saved_tokens",
+                    )
+                },
+            }
+        )
+    return summaries
+
+
 def percent(value: float | None) -> str:
     """Format a measured fraction, keeping missing cohorts distinct from zero."""
     return "N/A" if value is None else f"{value * 100:.2f}%"
 
 
-def render_report(workloads: dict[str, Any], rows: list[dict[str, Any]], summaries: list[dict[str, Any]]) -> str:
+def render_report(
+    workloads: dict[str, Any], rows: list[dict[str, Any]], summaries: list[dict[str, Any]],
+    rounds: list[dict[str, Any]], round_summaries: list[dict[str, Any]],
+) -> str:
     """Explain rollout selection and use one final sequence per selected rollout."""
     sharing_labels = {
         "single_rollout": "仅选中一条 rollout，无跨轨迹共享",
@@ -1024,6 +1119,37 @@ def render_report(workloads: dict[str, Any], rows: list[dict[str, Any]], summari
                 f"{entry['initial_prompt_saved_tokens']} | {entry['other_saved_tokens']} | "
                 f"{entry['mixed_saved_tokens']} | {entry['unattributed_saved_tokens']} |"
             )
+    lines.extend([
+        "", "## 每轮交互后的统计", "",
+        "轮次从 1 开始，按去重、角色筛选后有效调用的顺序对齐；不是原始 sequence_id，也不保证对应一次工具执行。",
+        "当轮轨迹 = 当次调用的 prompt + response，长度单位为 token；不累加历次调用长度。",
+        "沿用各 task 前 N 条的固定选样，只纳入有第 k 次调用的 rollout；缺失后续调用者不补齐、不沿用最终上下文。",
+        "参与数量可能随轮次下降；仅剩一条时共享率为零，没有参与者的 task 不计入该轮均值。",
+        "汇总轨迹均值按实际参与 rollout 加权，共享率按 token 加权，均不跨 task 共享。", "",
+        "### 按轮次汇总", "",
+        "| 数据集 | 选样 N | 轮次 | 参与 task / 入选 task | 至少两条参与的 task | 参与 rollout | 未参与 rollout | 轨迹均值（token） | task 共享率均值 | 共享率 P50 | 共享率 P95 | token 加权共享率 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ])
+    for row in round_summaries:
+        lines.append(
+            f"| {row['workload']} | {row['rollout_count']} | {row['round']} | "
+            f"{row['active_tasks']} / {row['eligible_tasks']} | {row['tasks_with_multiple_rollouts']} | "
+            f"{row['active_rollouts']} | {row['inactive_rollouts']} | {row['trajectory_length_mean']:.2f} | "
+            f"{percent(row['mean'])} | {percent(row['p50'])} | {percent(row['p95'])} | "
+            f"{percent(row['weighted_token_reduction'])} |"
+        )
+    lines.extend([
+        "", "### 每个 task 的逐轮结果", "",
+        "| 数据集 | task | 选样 N | 轮次 | 参与 rollout | 未参与 rollout | 轨迹均值（token） | 独立 token | 可省 token | 共享率 |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ])
+    for row in rounds:
+        lines.append(
+            f"| {row['workload']} | `{row['task_id']}` | {row['rollout_count']} | {row['round']} | "
+            f"{row['active_rollouts']} | {row['inactive_rollouts']} | {row['trajectory_length_mean']:.2f} | "
+            f"{row['independent_total_tokens']} | {row['shared_prefix_saved_tokens']} | "
+            f"{percent(row['token_reduction'])} |"
+        )
     if any(report.get("input_diagnostics") for report in workloads.values()):
         lines.extend(["", "## 输入解析诊断", ""])
         for workload, report in workloads.items():
@@ -1503,6 +1629,7 @@ def write_rollout_report(inputs: dict[str, Path], output: Path, role: str, group
     """Write nested rollout-count comparisons with separate training diagnostics."""
     workloads = {}
     task_metrics = []
+    round_metrics = []
     trajectory_metrics = []
     skipped_cohorts = []
     for workload, source in inputs.items():
@@ -1534,9 +1661,11 @@ def write_rollout_report(inputs: dict[str, Path], output: Path, role: str, group
                 }
             )
         rows, skipped = task_rows(workload, trajectories, counts)
+        round_metrics.extend(round_rows(trajectories, rows))
         task_metrics.extend(rows)
         skipped_cohorts.extend(skipped)
     summaries = summarize_rows(task_metrics, skipped_cohorts)
+    round_summaries = summarize_round_rows(round_metrics, task_metrics)
     summary = {
         "view": "training",
         "statistics_unit": "selected_rollout_final_contexts",
@@ -1555,10 +1684,16 @@ def write_rollout_report(inputs: dict[str, Path], output: Path, role: str, group
             "coverage": "Tasks with fewer than N rollouts are excluded from that cohort size, without replacement.",
             "scope": "Rollout-count comparison, not a micro-batch or DP-rank simulation. Final contexts may omit earlier history after prefix breaks. No measured speedup claim.",
             "training_segment_diagnostics": "All-input training-segment statistics, provided separately; these are not the denominators of the rollout-count report.",
+            "round": "One-based ordinal of retained valid calls after deduplication and role filtering, not the source turn index or a tool execution count. Each round uses that call's prompt+response token IDs.",
+            "round_coverage": "Keep the same first-N cohort. Only rollouts with an observed kth call participate in round k; never carry forward final contexts or replace missing rollouts. Tasks with no participants are excluded from that round's means. Missing later calls do not prove normal completion.",
+            "round_trajectory_length_mean": "Mean prompt+response token count over active rollouts; aggregate by total independent tokens / active rollouts, not an unweighted mean of task means.",
+            "round_sharing": "Same prefix-trie method within each task at each round. Single-participant tasks have zero savings and remain in task-rate means; aggregate token-weighted sharing is total saved / total independent tokens.",
         },
         "workloads": workloads,
         "per_task": task_metrics,
         "task_distribution": summaries,
+        "per_task_round": round_metrics,
+        "round_distribution": round_summaries,
         "skipped_cohorts": skipped_cohorts,
     }
     output.mkdir(parents=True, exist_ok=True)
@@ -1571,7 +1706,25 @@ def write_rollout_report(inputs: dict[str, Path], output: Path, role: str, group
         list(csv_tasks[0]) if csv_tasks else ["workload", "task_id", "rollout_count", "independent_total_tokens"],
     )
     write_csv(output / "task_distribution.csv", summaries, list(summaries[0]))
-    (output / "report.md").write_text(render_report(workloads, task_metrics, summaries), encoding="utf-8")
+    csv_rounds = [
+        {
+            **row,
+            "active_rollout_ids": json.dumps(row["active_rollout_ids"]),
+            "source_turn_indices": json.dumps(row["source_turn_indices"]),
+        }
+        for row in round_metrics
+    ]
+    write_csv(
+        output / "per_task_round.csv", csv_rounds,
+        list(csv_rounds[0]) if csv_rounds else ["workload", "task_id", "rollout_count", "round", "active_rollouts"],
+    )
+    write_csv(
+        output / "round_distribution.csv", round_summaries,
+        list(round_summaries[0]) if round_summaries else ["workload", "rollout_count", "round", "active_rollouts"],
+    )
+    (output / "report.md").write_text(
+        render_report(workloads, task_metrics, summaries, round_metrics, round_summaries), encoding="utf-8"
+    )
 
 
 def parse_input(value: str) -> tuple[str, Path]:
