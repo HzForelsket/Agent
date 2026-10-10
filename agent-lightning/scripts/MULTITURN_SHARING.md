@@ -1,7 +1,7 @@
 # 统一多轮共享分析
 
 唯一入口是 `scripts/analyze_multiturn_sharing.py`。默认视图（`--view training`）按
-**采集 rollout 数量**比较轨迹长度和初始 prompt 共享潜力，不按训练 micro-batch 大小统计。
+**采集 rollout 数量**比较最终轨迹长度和最终轨迹的前缀树共享率，不按训练 micro-batch 大小统计。
 其他统计单位通过 `--view` 明确选择。分析仅使用 Python 标准库，不加载模型或运行训练。
 
 ## 按 rollout 数量分析（默认）
@@ -47,13 +47,23 @@ conda run -n agent --no-capture-output python scripts/analyze_multiturn_sharing.
 
 ## 共享口径和输出
 
-在所选 N 条 rollout 中，对完全相同的初始 prompt 分组，每组只保留一份 prompt：
+在所选 N 条 rollout 中，每条序列取最后一次调用的完整 prompt + response token IDs，
+对这些最终轨迹构建前缀树，每个树节点只计一次：
 
-`可省 token = sum((组内 rollout 数 - 1) × 相同初始 prompt 长度)`
+`独立 token = sum(所选 N 条最终轨迹长度)`
 
-只有最终上下文仍以该初始 prompt 开头的 rollout 才参与此共享；历史重写后已不存在的
-prompt 不能从最终轨迹总长度中扣除。后缀独立，不对生成输出建树，也不跨 task 共享。
-这是对所选轨迹的结构共享潜力估算，不模拟实际训练分段、micro-batch、DP rank 或截断。
+`共享后 token = 最终轨迹前缀树的节点数（不含根节点）`
+
+`共享率 = (独立 token - 共享后 token) / 独立 token`
+
+不要求初始 prompt 完全相同，也不要求最终轨迹以最初 prompt 开头。共享范围可以包含
+工具结果和模型输出；部分 rollout 共同拥有的前缀也会计入。分叉后再次出现的相同片段
+不合并，不跨 task 共享。这是最终轨迹的结构共享潜力，不模拟实际训练分段、micro-batch、
+DP rank 或截断。`summary.json` 用 `sharing_method=final_trajectory_prefix_tree` 标明口径。
+
+例如最终轨迹为 `[1,2,3,4]`、`[1,2,3,5]`、`[1,2,6]`，独立长度为 11，
+前缀树节点数为 6，可省 5，默认共享率为 5/11。若只共享三条共同的 `[1,2]`，
+则可省 4，另以 `simple_token_reduction=4/11` 记录，不混入默认共享率。
 
 | 字段 | 含义 |
 |---|---|
@@ -61,11 +71,14 @@ prompt 不能从最终轨迹总长度中扣除。后缀独立，不对生成输�
 | `available_rollouts` | 当前 task 采集到的 rollout 总数 |
 | `selected_rollout_ids` | 当前档位所选轨迹的 ID，按实际选择顺序列出 |
 | `independent_total_tokens` | 所选 N 条轨迹的最终长度之和 |
-| `reducible_duplicate_prompt_tokens` | 所选轨迹中可消除的重复初始 prompt token |
+| `shared_prefix_saved_tokens` | 最终轨迹前缀树共享可消除的重复 token 数 |
 | `grouped_total_tokens` | 独立 token 减去可省 token |
 | `token_reduction` | 可省 token / 独立 token |
 | `weighted_token_reduction` | 相同 N 下所有纳入 task 的可省 token 总和 / 独立 token 总和 |
-| `initial_prompt_preserved_rollouts` | 最终上下文仍保留初始 prompt 前缀的 rollout 数 |
+| `common_prefix_tokens` | 所选 N 条最终轨迹的全组最长公共前缀长度 |
+| `simple_grouped_total_tokens` | 仅将全组最长公共前缀保留一次后的 token 数 |
+| `simple_token_reduction` | 仅共享全组最长公共前缀时的节省比例 |
+| `sharing_status` | `single_rollout`：只选中一条；`shared`：最终轨迹有可省 token；`no_shared_final_prefix`：最终轨迹之间无共享前缀 |
 | `prefix_breaks` | 所选轨迹的相邻调用发生 token 前缀中断的总次数 |
 | `token_work_ratio` | 独立 token / 共享后 token，不是实测加速比 |
 
@@ -80,6 +93,12 @@ prompt 不能从最终轨迹总长度中扣除。后缀独立，不对生成输�
 原有 API token 比例、训练分段重建和分段共享潜力保留在
 `workloads.<工作负载>.training_segment_diagnostics`，仅供解释训练数据结构。
 该诊断针对全部输入，**不是 rollout 数量表的统计分母**。
+
+汇总表的 task 共享率均值、P50、P95 统计的是各 task 的 `token_reduction`，不是轨迹长度。
+N=1 时没有第二条轨迹可以共享，因此这些比例必为零；N>1 但所有 task 的可省 token
+均为零时也会全零。查看每 task 的“共享状态”区分原因。没有足够 rollout 的档位显示
+N/A，不应解释成共享率为零。比例按两位百分数显示，极小的非零值也可能显示 0.00%；
+此时以 `summary.json` 的原始比例和 `shared_prefix_saved_tokens` 为准。
 
 ## SWE-bench 原始采集结果
 
@@ -125,7 +144,7 @@ Span 子树写入同一个 `sequence_id`，主 Span 与 raw Span 都可能携带
 和 Span 顺序确定嵌套选样顺序，并在结果中保留实际 rollout ID。单次采集通常只有 N=1
 档位可用；更高档位需要已保存的独立同题采样，不会复制轨迹补齐。
 
-此接入只用于默认 `--view training`，复用现有最终上下文长度、初始 prompt 共享和
+此接入只用于默认 `--view training`，复用现有最终上下文长度、最终轨迹前缀树共享和
 训练分段诊断算法。原始 Span 不提供现有 calls/trajectory 视图要求的完整采样清单与
 完成状态合同，因此不冒充这两个视图的完整输入。未标注角色的 token 调用会全部纳入，
 不能据此认定它们都是 policy 调用；高低价模型应使用相同的实际模型和 tokenizer，

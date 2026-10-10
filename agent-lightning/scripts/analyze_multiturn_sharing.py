@@ -423,9 +423,11 @@ def analyze_trajectory(trajectory: str, turns: list[dict[str, Any]]) -> dict[str
     model_response = sum(len(row["response_ids"]) for row in ordered)
     initial_prompt_ids = ordered[0]["prompt_ids"]
     final_context_ids = ordered[-1]["prompt_ids"] + ordered[-1]["response_ids"]
-    logical_response = len(final_context_ids) - len(initial_prompt_ids)
-    if logical_response < 0:
-        raise ValueError(f"trajectory {trajectory!r} ends with fewer tokens than its initial prompt")
+    logical_response = (
+        len(final_context_ids) - len(initial_prompt_ids)
+        if starts_with(final_context_ids, initial_prompt_ids)
+        else None
+    )
 
     # Match the trajectory aggregator's untruncated representation. The first
     # prompt is the training prompt. Later prompt deltas (tool/environment
@@ -804,18 +806,18 @@ def task_rows(
             rounds = [trajectory["turns"] for trajectory in selected]
             prompt_lengths = [len(trajectory["_initial_prompt_ids"]) for trajectory in selected]
             final_lengths = [trajectory["_logical_total_tokens"] for trajectory in selected]
-            exact_prompts: Counter[tuple[int, ...]] = Counter()
-            for trajectory in selected:
-                prompt = trajectory["_initial_prompt_ids"]
-                # A rewritten final context may no longer contain the initial
-                # prompt. Never subtract tokens absent from this denominator.
-                if starts_with(trajectory["_final_context_ids"], prompt):
-                    exact_prompts[tuple(prompt)] += 1
-            independent_tokens = sum(final_lengths)
+            costs = sharing_costs([trajectory["_final_context_ids"] for trajectory in selected])
+            independent_tokens = costs["separate_tokens"]
             if independent_tokens <= 0:
                 raise ValueError(f"{workload}/{task_id} has no final-context tokens")
-            saved_tokens = sum((occurrences - 1) * len(prompt) for prompt, occurrences in exact_prompts.items())
-            grouped_tokens = independent_tokens - saved_tokens
+            grouped_tokens = costs["merged_tokens"]
+            saved_tokens = independent_tokens - grouped_tokens
+            if count == 1:
+                sharing_status = "single_rollout"
+            elif saved_tokens > 0:
+                sharing_status = "shared"
+            else:
+                sharing_status = "no_shared_final_prefix"
             rows.append(
                 {
                     "workload": workload,
@@ -832,13 +834,15 @@ def task_rows(
                     "final_trajectory_length_p50": percentile([float(value) for value in final_lengths], 0.50),
                     "final_trajectory_length_p95": percentile([float(value) for value in final_lengths], 0.95),
                     "prefix_breaks": sum(trajectory["prefix_breaks"] for trajectory in selected),
-                    "initial_prompt_preserved_rollouts": sum(exact_prompts.values()),
-                    "repeated_prompt_groups": sum(occurrences >= 2 for occurrences in exact_prompts.values()),
+                    "sharing_status": sharing_status,
                     "independent_total_tokens": independent_tokens,
-                    "reducible_duplicate_prompt_tokens": saved_tokens,
+                    "shared_prefix_saved_tokens": saved_tokens,
                     "grouped_total_tokens": grouped_tokens,
                     "token_reduction": saved_tokens / independent_tokens,
                     "token_work_ratio": independent_tokens / grouped_tokens,
+                    "common_prefix_tokens": costs["common_prefix_tokens"],
+                    "simple_grouped_total_tokens": costs["simple_tokens"],
+                    "simple_token_reduction": (independent_tokens - costs["simple_tokens"]) / independent_tokens,
                 }
             )
     return rows, skipped
@@ -857,7 +861,7 @@ def summarize_rows(rows: list[dict[str, Any]], skipped: list[dict[str, Any]]) ->
         members = grouped[(workload, count)]
         stats = distribution(row["token_reduction"] for row in members)
         independent = sum(row["independent_total_tokens"] for row in members)
-        saved = sum(row["reducible_duplicate_prompt_tokens"] for row in members)
+        saved = sum(row["shared_prefix_saved_tokens"] for row in members)
         summaries.append(
             {
                 "workload": workload,
@@ -881,6 +885,11 @@ def percent(value: float | None) -> str:
 
 def render_report(workloads: dict[str, Any], rows: list[dict[str, Any]], summaries: list[dict[str, Any]]) -> str:
     """Explain rollout selection and use one final sequence per selected rollout."""
+    sharing_labels = {
+        "single_rollout": "仅选中一条 rollout，无跨轨迹共享",
+        "shared": "最终轨迹存在共享前缀",
+        "no_shared_final_prefix": "最终轨迹之间无共享前缀",
+    }
     lines = [
         "# 不同 rollout 数量下的多轮轨迹共享分析",
         "",
@@ -888,8 +897,10 @@ def render_report(workloads: dict[str, Any], rows: list[dict[str, Any]], summari
         "- 各档重新计算所选 rollout 的轮数、初始 prompt、最终轨迹均值和共享率。",
         "- 独立 token = 所选 N 条 rollout 的最终轨迹长度之和 = N × 最终轨迹长度均值（未四舍五入）。",
         "- 最终轨迹长度 = 最后一次调用的 prompt + response 长度；不累加历史调用或训练分段。",
-        "- 仅共享所选 rollout 中完全相同、且仍保留在最终上下文开头的初始 prompt；各相同 prompt 组只保留一份。",
+        "- 对所选最终轨迹构建前缀树，所有共同前缀节点只计一次；不要求初始 prompt 相同，也不受初始 prompt 边界限制。",
+        "- 共享率 =（独立 token 总数 - 前缀树节点数）/ 独立 token 总数；只共享前缀，不合并分叉后再次出现的相同片段。",
         "- 本报告比较采集样本数量，不模拟训练 micro-batch、设备分配或截断，不是实测加速比。",
+        "- 汇总表的 task 均值、P50、P95 均为各 task 共享率的统计，不是轨迹长度；N=1 的跨轨迹共享率必为零。",
         "- 前缀中断时，最终上下文不一定包含完整交互历史；训练分段诊断另列于 summary.json，不作为本表分母。",
         "",
         "## 数据覆盖",
@@ -906,8 +917,8 @@ def render_report(workloads: dict[str, Any], rows: list[dict[str, Any]], summari
             "",
             "## 每个 task 的结果",
             "",
-            "| 数据集 | task | rollout 数 | 已采集数 | 交互轮数均值 | 初始 prompt 均值 | 最终轨迹均值 | 最终轨迹 P95 | 独立 token（所选轨迹之和） | 可省 token | 共享比例 |",
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| 数据集 | task | rollout 数 | 已采集数 | 交互轮数均值 | 初始 prompt 均值 | 最终轨迹均值 | 最终轨迹 P95 | 独立 token（所选轨迹之和） | 可省 token | 共享比例 | 共享状态 |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
         ]
     )
     for row in rows:
@@ -915,14 +926,15 @@ def render_report(workloads: dict[str, Any], rows: list[dict[str, Any]], summari
             f"| {row['workload']} | `{row['task_id']}` | {row['rollout_count']} | {row['available_rollouts']} | "
             f"{row['interaction_rounds_mean']:.2f} | {row['initial_prompt_length_mean']:.2f} | "
             f"{row['final_trajectory_length_mean']:.2f} | {row['final_trajectory_length_p95']:.2f} | "
-            f"{row['independent_total_tokens']} | {row['reducible_duplicate_prompt_tokens']} | {percent(row['token_reduction'])} |"
+            f"{row['independent_total_tokens']} | {row['shared_prefix_saved_tokens']} | {percent(row['token_reduction'])} | "
+            f"{sharing_labels[row['sharing_status']]} |"
         )
     lines.extend(
         [
             "",
             "## 按 rollout 数量汇总",
             "",
-            "| 数据集 | 每 task 的 rollout 数 | 纳入 task | 数量不足 task | 所选 rollout 总数 | 独立 token 总和 | task 均值 | P50 | P95 | token 加权共享率 |",
+            "| 数据集 | 每 task 的 rollout 数 | 纳入 task | 数量不足 task | 所选 rollout 总数 | 独立 token 总和 | task 共享率均值 | 共享率 P50 | 共享率 P95 | token 加权共享率 |",
             "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
@@ -1456,6 +1468,7 @@ def write_rollout_report(inputs: dict[str, Path], output: Path, role: str, group
     summary = {
         "view": "training",
         "statistics_unit": "selected_rollout_final_contexts",
+        "sharing_method": "final_trajectory_prefix_tree",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "role": role,
         "group_key": group_key,
@@ -1463,8 +1476,9 @@ def write_rollout_report(inputs: dict[str, Path], output: Path, role: str, group
         "definitions": {
             "selection": "First N rollouts per task; unique complete sample indices first, otherwise first appearance in the input file. Larger cohorts contain smaller cohorts.",
             "independent_total_tokens": "Sum of final prompt+response lengths for exactly N selected rollouts; never a sum over training segments.",
-            "sharing": "Identical initial prompts within the selected task cohort are counted once, only for rollouts whose final context still starts with that prompt.",
-            "token_reduction": "reducible_duplicate_prompt_tokens / independent_total_tokens",
+            "sharing": "Build a prefix trie over the selected final prompt+response token sequences; count each trie node once, including shared prefixes within subgroups. Initial prompts do not constrain sharing.",
+            "token_reduction": "shared_prefix_saved_tokens / independent_total_tokens",
+            "simple_token_reduction": "Savings from retaining the all-rollout longest common prefix once, divided by independent_total_tokens; reported separately from prefix-tree sharing.",
             "coverage": "Tasks with fewer than N rollouts are excluded from that cohort size, without replacement.",
             "scope": "Rollout-count comparison, not a micro-batch or DP-rank simulation. Final contexts may omit earlier history after prefix breaks. No measured speedup claim.",
             "training_segment_diagnostics": "All-input training-segment statistics, provided separately; these are not the denominators of the rollout-count report.",
