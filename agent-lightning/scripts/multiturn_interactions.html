@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>模型交互过程</title>
+<style>
+:root{color-scheme:light;--ink:#182c39;--muted:#566b78;--line:#dce4e8;--accent:#087f79;--paper:#fff}
+*{box-sizing:border-box}body{margin:0;background:#f3f6f7;color:var(--ink);font:15px/1.6 system-ui,sans-serif}
+header{background:#163543;color:white;padding:24px 32px}h1{font-size:25px;margin:0 0 6px}header p{margin:0;color:#c9dee7}
+.controls{display:flex;gap:16px;flex-wrap:wrap;padding:18px 32px;background:white;border-bottom:1px solid var(--line)}
+label{display:flex;flex-direction:column;font-size:12px;color:var(--muted);gap:5px}select,input,button{font:inherit}
+select,input{padding:8px;border:1px solid #bacbd3;border-radius:6px;max-width:360px;background:white;color:var(--ink)}
+button{cursor:pointer;border:1px solid var(--line);background:white;color:var(--ink);border-radius:6px;padding:7px 12px}
+button:hover,button:focus-visible{border-color:var(--accent)}button:disabled{opacity:.45;cursor:default}
+.layout{display:grid;grid-template-columns:210px minmax(0,1fr);max-width:1600px;margin:auto}
+aside{padding:22px 16px;align-self:start;position:sticky;top:0;max-height:100vh;overflow:auto}
+aside button{display:block;width:100%;text-align:left;margin-bottom:8px}aside button.active{background:#087f79;color:white}
+main{padding:22px;min-width:0}h2{font-size:19px;margin:0 0 12px}h3{font-size:16px;margin:0}
+.panel{background:white;border:1px solid var(--line);border-radius:10px;padding:18px;margin-bottom:18px}
+.stats{display:flex;gap:24px;flex-wrap:wrap}.stat small{display:block;color:var(--muted)}.stat strong{font-size:23px}
+.muted{color:var(--muted);font-size:13px}.notice{background:#fff6df;border-left:3px solid #c18b22;padding:10px 14px;margin:12px 0}
+.charts{display:grid;grid-template-columns:1fr 1fr;gap:20px}svg{width:100%;height:145px;display:block}
+.toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:12px 0}.toolbar label{flex-direction:row;align-items:center}
+.columns{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}.message{border:1px solid var(--line);border-left:3px solid #64849b;border-radius:6px;margin:12px 0;overflow:hidden}
+.message.assistant{border-left-color:#087f79}.message.tool{border-left-color:#b37c13}.message.system{border-left-color:#8262a8}
+summary{cursor:pointer;padding:9px 12px;background:#f7f9fa;overflow-wrap:anywhere}.body{padding:12px}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:6px 0;font:13px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace;max-height:550px;overflow:auto}
+.block{border-top:1px solid var(--line);padding:10px 0}.badge{font-size:12px;background:#e7f2ef;color:#266354;padding:2px 7px;border-radius:4px}
+.table-scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:7px 12px;border-bottom:1px solid var(--line)}th:first-child,td:first-child{text-align:left}
+tr.selected{background:#e7f2ef}caption{text-align:left;color:var(--muted);padding:8px 0}
+@media(max-width:900px){.layout{grid-template-columns:1fr}aside{position:static;max-height:160px;display:flex;gap:8px;overflow:auto}aside button{min-width:145px}.columns,.charts{grid-template-columns:1fr}.controls,header{padding:16px}main{padding:12px}}
+</style>
+</head>
+<body>
+<header><h1>模型交互过程</h1><p>沿着每一次模型调用，查看输入、回复与工具交互。</p></header>
+<div class="controls">
+<label>数据集<select id="workload"></select></label>
+<label>Task<select id="task"></select></label>
+<label>Rollout<select id="rollout"></select></label>
+<label>共享统计 · 选样数量 N<select id="cohort"></select></label>
+</div>
+<div class="layout"><aside id="timeline" aria-label="交互轮次"></aside><main>
+<section class="panel"><h2>轨迹概览</h2><div id="overview" class="stats"></div>
+<p class="muted">轮次按分析接受的有效 token 调用和所选角色排列。工具返回出现在携带它的后续输入中。被跳过的调用、缺失文本及未发送给模型的输出不在此页面中。</p>
+<div class="charts"><div><h3>当前 rollout · 逐轮上下文长度</h3><div id="lengthChart"></div></div>
+<div><h3>当前 task / N · 逐轮共享率</h3><div id="sharingChart"></div></div></div>
+<details><summary>展开逐轮共享统计</summary><div id="roundTable" class="table-scroll"></div></details>
+</section>
+<section class="panel"><div class="toolbar"><button id="previous">← 上一轮</button><h2 id="roundTitle"></h2><button id="next">下一轮 →</button></div>
+<div id="roundStats" class="stats"></div><div id="cohortNote" class="muted"></div>
+<div class="toolbar"><label><input type="checkbox" id="full">显示完整输入上下文</label><label>当前轮内容筛选<input id="search" type="search" placeholder="关键词、工具名或调用 ID"></label></div>
+<div id="contextNote" class="muted"></div>
+<div class="columns"><section><h3>模型输入</h3><div id="request"></div></section><section><h3>模型回复</h3><div id="response"></div></section></div>
+<details id="tools"><summary>请求中的工具定义</summary><pre id="toolText"></pre></details>
+<details><summary>原始记录位置与文本字段</summary><pre id="sources"></pre></details>
+</section>
+</main></div>
+<script id="data" type="application/json">__INTERACTION_DATA__</script>
+<script>
+"use strict";
+const data=JSON.parse(document.getElementById("data").textContent);
+const $=id=>document.getElementById(id), el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};
+const fmt=n=>n==null?"N/A":Number(n).toLocaleString("zh-CN",{maximumFractionDigits:2});
+const pct=n=>n==null?"N/A":(n*100).toFixed(2)+"%";
+const pretty=v=>typeof v==="string"?v:JSON.stringify(v,null,2);
+let trajectory=null,round=0,metrics=[];
+function options(id,values){const node=$(id);node.replaceChildren();for(const value of values){const option=el("option",String(value));option.value=String(value);node.append(option);}}
+function stat(parent,label,value){const node=el("div",undefined,"stat");node.append(el("small",label),el("strong",value));parent.append(node);}
+function selectedTask(){return data.trajectories.filter(t=>t.workload===$("workload").value&&String(t.task_id)===$("task").value);}
+function setTasks(){options("task",[...new Set(data.trajectories.filter(t=>t.workload===$("workload").value).map(t=>t.task_id))]);setRollouts();}
+function setRollouts(){options("rollout",selectedTask().map(t=>t.trajectory_id));const counts=[...new Set(data.rounds.filter(r=>r.workload===$("workload").value&&String(r.task_id)===$("task").value).map(r=>r.rollout_count))].sort((a,b)=>a-b);options("cohort",counts);if(counts.length)$("cohort").value=String(counts[counts.length-1]);setTrajectory();}
+function setTrajectory(){trajectory=selectedTask().find(t=>t.trajectory_id===$("rollout").value);round=0;renderOverview();renderRound();}
+function chart(id,values,format,color){const holder=$(id);holder.replaceChildren();if(!values.length){holder.append(el("p","该选样档位没有可用统计。","muted"));return;}
+ const ns="http://www.w3.org/2000/svg",svg=document.createElementNS(ns,"svg");svg.setAttribute("viewBox","0 0 560 145");svg.setAttribute("role","img");svg.setAttribute("aria-label",values.map((v,i)=>`第 ${i+1} 轮 ${format(v)}`).join("；"));
+ const max=Math.max(1,...values.filter(v=>v!=null)),x=i=>48+i*485/Math.max(1,values.length-1),y=v=>108-v/max*85;
+ function shape(tag,attrs,text){const n=document.createElementNS(ns,tag);for(const [k,v]of Object.entries(attrs))n.setAttribute(k,String(v));if(text!==undefined)n.textContent=text;svg.append(n);return n;}
+ shape("line",{x1:48,y1:108,x2:535,y2:108,stroke:"#ccd9de"});shape("text",{x:0,y:18,fill:"#566b78","font-size":11},format(max));shape("text",{x:35,y:125,fill:"#566b78","font-size":11},"1");shape("text",{x:500,y:135,fill:"#566b78","font-size":11},`${values.length} 轮`);
+ // Null measurements break the line instead of becoming zero-valued evidence.
+ let segment=[];function flush(){if(segment.length)shape("polyline",{points:segment.join(" "),fill:"none",stroke:color,"stroke-width":2});segment=[];}
+ values.forEach((v,i)=>{if(v==null){flush();return;}segment.push(`${x(i)},${y(v)}`);const dot=shape("circle",{cx:x(i),cy:y(v),r:3,fill:color});const title=document.createElementNS(ns,"title");title.textContent=`第 ${i+1} 轮：${format(v)}`;dot.append(title);});flush();holder.append(svg);
+}
+function renderOverview(){if(!trajectory)return;metrics=data.rounds.filter(r=>r.workload===trajectory.workload&&String(r.task_id)===String(trajectory.task_id)&&String(r.rollout_count)===$("cohort").value);
+ const calls=trajectory.calls,last=calls[calls.length-1],overview=$("overview");overview.replaceChildren();stat(overview,"已采集交互轮次",fmt(calls.length));stat(overview,"最终上下文 · token",fmt(last.prompt_tokens+last.response_tokens));stat(overview,"有输入消息记录的轮次",`${calls.filter(c=>c.messages!==null).length} / ${calls.length}`);stat(overview,"有回复消息记录的轮次",`${calls.filter(c=>c.outputs!==null).length} / ${calls.length}`);
+ chart("lengthChart",calls.map(c=>c.prompt_tokens+c.response_tokens),fmt,"#087f79");chart("sharingChart",metrics.map(r=>r.token_reduction),pct,"#8262a8");
+ const table=el("table"),head=el("tr");for(const label of ["轮次","参与 rollout","轨迹均值 / token","共享率","初始 prompt 可省","后续可省","混合可省","无法归属可省"])head.append(el("th",label));table.append(head);
+ for(const row of metrics){const tr=el("tr");if(row.round===round+1)tr.className="selected";for(const value of [row.round,row.active_rollouts,fmt(row.trajectory_length_mean),pct(row.token_reduction),row.initial_prompt_saved_tokens,row.other_saved_tokens,row.mixed_saved_tokens,row.unattributed_saved_tokens])tr.append(el("td",String(value)));table.append(tr);}$("roundTable").replaceChildren(table);
+ $("timeline").replaceChildren();calls.forEach((call,i)=>{const button=el("button",`第 ${i+1} 轮 · ${fmt(call.prompt_tokens+call.response_tokens)} tokens`,i===round?"active":"");button.onclick=()=>{round=i;renderRound();};$("timeline").append(button);});
+}
+function block(parent,value){const box=el("div",undefined,"block");if(value&&typeof value==="object"){
+ const type=value.type||"内容";box.append(el("span",type,"badge"));
+ if(type==="text"&&typeof value.text==="string")box.append(el("pre",value.text));
+ else if(type==="tool_use"){box.append(el("h3",value.name||"工具调用"),el("div",`调用 ID：${value.id||"未记录"}`,"muted"),el("pre",pretty(value.input)));}
+ else if(type==="tool_result"){box.append(el("div",`工具返回 · 调用 ID：${value.tool_use_id||"未记录"}`,"muted"),el("pre",pretty(value.content)));if(value.is_error)box.append(el("div","工具报告错误","notice"));}
+ else box.append(el("pre",pretty(value)));
+ }else box.append(el("pre",pretty(value)));parent.append(box);}
+function messageCard(message,index){const role=message.role||"未标注角色",labels={system:"系统",developer:"开发者",user:"用户 / 环境输入",assistant:"模型",tool:"工具返回"};const card=el("details",undefined,"message");if(["assistant","system","tool"].includes(role))card.classList.add(role);card.open=true;
+ card.append(el("summary",`${index+1} · ${labels[role]||role}${message.name?" · "+message.name:""}`));const body=el("div",undefined,"body");
+ if(message.tool_call_id)body.append(el("div",`调用 ID：${message.tool_call_id}`,"muted"));
+ if(Array.isArray(message.content))message.content.forEach(value=>block(body,value));else if(message.content!=null)body.append(el("pre",pretty(message.content)));
+ for(const call of Array.isArray(message.tool_calls)?message.tool_calls:[]){const box=el("div",undefined,"block");box.append(el("span","工具调用","badge"),el("h3",call.function?.name||call.name||"未记录名称"),el("div",`调用 ID：${call.id||"未记录"}`,"muted"),el("pre",pretty(call.function?.arguments??call)));body.append(box);}
+ const extra=Object.fromEntries(Object.entries(message).filter(([key])=>!["role","content","tool_calls","tool_call_id","name"].includes(key)));if(Object.keys(extra).length){const details=el("details");details.append(el("summary","其他已采集字段"),el("pre",pretty(extra)));body.append(details);}
+ if(!body.childNodes.length)body.append(el("p","该消息未记录文本内容。","muted"));card.append(body);return card;
+}
+function renderMessages(id,ids,offset=0){const root=$(id);root.replaceChildren();if(ids===null){root.append(el("p","未采集到文本；token 长度仍可用于统计。","notice"));return;}
+ const query=$("search").value.toLocaleLowerCase();let shown=0;ids.forEach((index,i)=>{const message=data.messages[index];if(query&&!pretty(message).toLocaleLowerCase().includes(query))return;root.append(messageCard(message,i+offset));shown++;});if(!shown)root.append(el("p",query?"当前筛选没有匹配消息。":"没有新增消息。","muted"));}
+function renderRound(){if(!trajectory)return;const call=trajectory.calls[round];$("roundTitle").textContent=`第 ${round+1} 轮`;$("previous").disabled=round===0;$("next").disabled=round===trajectory.calls.length-1;
+ const stats=$("roundStats");stats.replaceChildren();stat(stats,"输入 token",fmt(call.prompt_tokens));stat(stats,"输出 token",fmt(call.response_tokens));stat(stats,"当轮上下文 token",fmt(call.prompt_tokens+call.response_tokens));
+ const metric=metrics.find(r=>r.round===round+1);if(metric){stat(stats,"同 task / N 共享率",pct(metric.token_reduction));stat(stats,"同 task / N 轨迹均值",fmt(metric.trajectory_length_mean));stat(stats,"参与共享统计的 rollout",`${metric.active_rollouts} / ${metric.rollout_count}`);}
+ $("cohortNote").textContent=`模型：${call.model||"未记录"} · 原始调用序号：${call.source_turn}。共享率属于同 task 前 N 条 rollout 的当轮集合，不是当前一条轨迹的共享率。`;
+ let ids=call.messages,hidden=0;const previous=round?trajectory.calls[round-1]:null;const prior=previous&&previous.messages!==null?[...previous.messages,...(previous.outputs||[])]:[];
+ if(ids!==null&&!$("full").checked){while(hidden<ids.length&&hidden<prior.length&&ids[hidden]===prior[hidden])hidden++;ids=ids.slice(hidden);}
+ $("contextNote").textContent=$("full").checked?"显示该次请求中已采集的全部输入消息。":`已折叠与上一轮上下文逐条完全相同的前 ${hidden} 条消息；可勾选显示完整输入。消息折叠仅影响展示，不用于 token 共享率计算。`;
+ renderMessages("request",ids,hidden);renderMessages("response",call.outputs);$("tools").hidden=call.tools==null;$("toolText").textContent=call.tools==null?"":pretty(data.messages[call.tools]);$("sources").textContent=pretty({sources:call.sources,text_fields:call.text_fields||[],source_turn:call.source_turn});
+ for(const [index,button] of [...$("timeline").children].entries()){button.classList.toggle("active",index===round);button.setAttribute("aria-current",index===round?"step":"false");}
+ const tableRows=$("roundTable").querySelectorAll("tr");tableRows.forEach((row,index)=>row.classList.toggle("selected",index>0&&metrics[index-1].round===round+1));
+}
+$("workload").onchange=setTasks;$("task").onchange=setRollouts;$("rollout").onchange=setTrajectory;$("cohort").onchange=()=>{renderOverview();renderRound();};$("full").onchange=renderRound;$("search").oninput=renderRound;$("previous").onclick=()=>{if(round>0){round--;renderRound();}};$("next").onclick=()=>{if(round<trajectory.calls.length-1){round++;renderRound();}};
+options("workload",[...new Set(data.trajectories.map(t=>t.workload))]);if(data.trajectories.length)setTasks();
+</script>
+</body>
+</html>

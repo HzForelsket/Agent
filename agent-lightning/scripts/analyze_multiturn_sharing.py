@@ -218,6 +218,100 @@ def span_token_ids(value: Any) -> list[int]:
     return []
 
 
+def message_list(value: Any) -> list[dict[str, Any]] | None:
+    """Retain captured structured messages without decoding or inventing text."""
+    value = span_value(value)
+    if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+        return value
+    return None
+
+
+def captured_interaction(record: dict[str, Any]) -> dict[str, Any]:
+    """Extract captured request/response messages from a normalized call record."""
+    request = record.get("request") or {}
+    response = record.get("response") or {}
+    request = request if isinstance(request, dict) else {}
+    response = response if isinstance(response, dict) else {}
+    messages = message_list(request.get("messages", record.get("messages")))
+    if "system" in request:
+        messages = [{"role": "system", "content": request["system"]}, *(messages or [])]
+    outputs = None
+    choices = response.get("choices")
+    if isinstance(choices, list):
+        outputs = [
+            choice["message"] for choice in choices
+            if isinstance(choice, dict) and isinstance(choice.get("message"), dict)
+        ] or None
+    if outputs is None and "content" in response:
+        outputs = [{"role": response.get("role", "assistant"), "content": response["content"]}]
+    return {
+        "messages": messages,
+        "outputs": outputs,
+        "tools": request.get("tools"),
+        "model": request.get("model", response.get("model")),
+    }
+
+
+def span_interaction(attributes: dict[str, Any]) -> dict[str, Any]:
+    """Read raw provider messages, then available standard OTEL message fields."""
+    request: dict[str, Any] = {}
+    response: dict[str, Any] = {}
+    sources = []
+    for key, value in attributes.items():
+        if not key.startswith("llm.") or len(key.split(".")) != 3:
+            continue
+        field = key.rsplit(".", 1)[-1]
+        if field not in {"messages", "system", "tools", "model", "choices", "content"}:
+            continue
+        decoded = span_value(value)
+        # Only serialized containers need parsing; preserve literal text such as
+        # "123", "true" and "null" exactly as captured.
+        value = decoded if isinstance(decoded, (dict, list)) else value
+        if field in {"messages", "system", "tools", "model"}:
+            request[field] = value
+            sources.append(key)
+        elif field in {"choices", "content"}:
+            response[field] = value
+            sources.append(key)
+    result = captured_interaction({"request": request, "response": response})
+    result["model"] = result["model"] or attributes.get("gen_ai.request.model")
+    for target, prefix in (("messages", "gen_ai.prompt."), ("outputs", "gen_ai.completion.")):
+        if result[target] is not None:
+            continue
+        messages: dict[int, dict[str, Any]] = defaultdict(dict)
+        for key, value in attributes.items():
+            if not key.startswith(prefix):
+                continue
+            index, separator, field = key[len(prefix):].partition(".")
+            if separator and index.isdigit() and field in {"role", "content", "tool_call_id", "name"}:
+                messages[int(index)][field] = value
+                sources.append(key)
+        if messages:
+            result[target] = [messages[index] for index in sorted(messages)]
+    # LiteLLM's standard span logs function fields by tool index, without IDs.
+    # Keep those fields visible even when no raw choices were recorded.
+    if "choices" not in response:
+        functions: dict[int, dict[str, Any]] = defaultdict(dict)
+        for key, value in attributes.items():
+            parts = key.split(".")
+            if (
+                len(parts) == 5 and parts[:2] == ["gen_ai", "completion"]
+                and parts[2].isdigit() and parts[3] == "function_call"
+            ):
+                functions[int(parts[2])][parts[4]] = value
+                sources.append(key)
+        if functions:
+            result["outputs"] = [
+                *(result["outputs"] or []),
+                {
+                    "role": "assistant",
+                    "tool_calls": [{"function": functions[index]} for index in sorted(functions)],
+                },
+            ]
+    result["text_fields"] = sources
+    return result
+
+
 def read_swebench_stream(path: Path, diagnostics: list[str]) -> Iterable[tuple[str, dict[str, Any]]]:
     """Read the actual stream_<instance_id>.json Span export from Claude Code.
 
@@ -233,6 +327,16 @@ def read_swebench_stream(path: Path, diagnostics: list[str]) -> Iterable[tuple[s
         if type(span.get("sequence_id")) is not int or span["sequence_id"] < 0:
             raise ValueError(f"{path}:{line_number} has invalid Span.sequence_id")
     spans.sort(key=lambda item: (item[1]["sequence_id"], item[1].get("start_time", 0)))
+    # Raw and primary spans share a request sequence. Collect text before token
+    # deduplication so a token-bearing primary span cannot hide its raw messages.
+    request_attributes: dict[tuple[Any, Any, int], dict[str, Any]] = defaultdict(dict)
+    request_sources: dict[tuple[Any, Any, int], list[str]] = defaultdict(list)
+    for line_number, span in spans:
+        key = (span.get("rollout_id"), span.get("attempt_id"), span["sequence_id"])
+        attrs = span.get("attributes") or {}
+        if isinstance(attrs, dict):
+            request_attributes[key].update(attrs)
+            request_sources[key].append(f"{path}:{line_number}")
     seen_sequences: dict[tuple[str, str, int], tuple[list[int], list[int], str]] = {}
     seen_requests: dict[tuple[str, str, str], tuple[list[int], list[int], str]] = {}
     attempts: dict[str, str] = {}
@@ -305,6 +409,10 @@ def read_swebench_stream(path: Path, diagnostics: list[str]) -> Iterable[tuple[s
             "turn": span["sequence_id"],
             "prompt_token_ids": prompt,
             "response_token_ids": response,
+            "interaction": {
+                **span_interaction(request_attributes[sequence_key]),
+                "sources": request_sources[sequence_key],
+            },
         }
     diagnostics.append(
         f"{path}: selected {selected} token calls; skipped {missing_tokens} LLM spans without valid token IDs "
@@ -656,6 +764,9 @@ def load_training_trajectories(
                 "group_key": resolved_group_key,
                 "group_id": group_id,
                 "sample_index": sample_index,
+                "interaction": record.get("interaction") or {
+                    **captured_interaction(record), "sources": [context],
+                },
             }
         )
         selected_records += 1
@@ -1632,6 +1743,7 @@ def write_rollout_report(inputs: dict[str, Path], output: Path, role: str, group
     round_metrics = []
     trajectory_metrics = []
     skipped_cohorts = []
+    interactions = []
     for workload, source in inputs.items():
         path = source / "calls.jsonl" if (source / "calls.jsonl").is_file() else source
         input_diagnostics: list[str] = []
@@ -1647,6 +1759,20 @@ def write_rollout_report(inputs: dict[str, Path], output: Path, role: str, group
             "training_segment_diagnostics": diagnostics,
         }
         for trajectory in trajectories:
+            interactions.append({
+                "workload": workload,
+                "task_id": trajectory["group_id"],
+                "trajectory_id": trajectory["trajectory_id"],
+                "calls": [
+                    {
+                        **call["interaction"],
+                        "source_turn": call["turn"],
+                        "prompt_tokens": len(call["prompt_ids"]),
+                        "response_tokens": len(call["response_ids"]),
+                    }
+                    for call in trajectory["_ordered_calls"]
+                ],
+            })
             trajectory_metrics.append(
                 {
                     "workload": workload,
@@ -1723,8 +1849,45 @@ def write_rollout_report(inputs: dict[str, Path], output: Path, role: str, group
         list(round_summaries[0]) if round_summaries else ["workload", "rollout_count", "round", "active_rollouts"],
     )
     (output / "report.md").write_text(
-        render_report(workloads, task_metrics, summaries, round_metrics, round_summaries), encoding="utf-8"
+        render_report(workloads, task_metrics, summaries, round_metrics, round_summaries)
+        + "\n交互过程可视化：[interactions.html](interactions.html)（离线打开）。\n", encoding="utf-8"
     )
+    write_interaction_view(output / "interactions.html", interactions, round_metrics)
+
+
+def write_interaction_view(path: Path, trajectories: list[dict[str, Any]], rounds: list[dict[str, Any]]) -> None:
+    """Embed captured messages and metrics in a self-contained offline viewer."""
+    pool: list[Any] = []
+    indices: dict[str, int] = {}
+
+    def intern(value: Any) -> int:
+        key = json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        if key not in indices:
+            indices[key] = len(pool)
+            pool.append(value)
+        return indices[key]
+
+    for trajectory in trajectories:
+        for call in trajectory["calls"]:
+            for side in ("messages", "outputs"):
+                if call[side] is not None:
+                    call[side] = [intern(message) for message in call[side]]
+            if call["tools"] is not None:
+                call["tools"] = intern(call["tools"])
+    fields = (
+        "workload", "task_id", "rollout_count", "round", "active_rollouts", "inactive_rollouts",
+        "trajectory_length_mean", "token_reduction", "shared_prefix_saved_tokens",
+        "initial_prompt_saved_tokens", "other_saved_tokens", "mixed_saved_tokens", "unattributed_saved_tokens",
+    )
+    payload = json.dumps({
+        "trajectories": trajectories,
+        "messages": pool,
+        "rounds": [{field: row[field] for field in fields} for row in rounds],
+    }, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    # Captured text is untrusted: prevent closing the JSON script element.
+    payload = payload.replace("<", "\\u003c").replace("&", "\\u0026")
+    template = Path(__file__).with_name("multiturn_interactions.html").read_text(encoding="utf-8")
+    path.write_text(template.replace("__INTERACTION_DATA__", payload), encoding="utf-8")
 
 
 def parse_input(value: str) -> tuple[str, Path]:

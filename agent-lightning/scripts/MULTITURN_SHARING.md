@@ -95,6 +95,7 @@ DP rank 或截断。`summary.json` 用 `sharing_method=final_trajectory_prefix_t
 - `task_distribution.csv`：各档位的 task 分布、覆盖率和 token 加权共享率。
 - `per_task_round.csv`：每个 task、每档 rollout 数量在每轮交互后的轨迹长度和共享率。
 - `round_distribution.csv`：每个 rollout 档位的逐轮汇总、实际参与数量和 token 加权共享率。
+- `interactions.html`：可离线打开的模型交互过程，内嵌采集到的消息文本及逐轮统计。
 
 报告同时展示每 task 和每 rollout 档位的共享来源。归属统计以**省下的重复 token**为单位：
 一个被 k 条轨迹共用的前缀树节点贡献 k−1，不是把 k 个出现位置全部算作节省。
@@ -145,6 +146,34 @@ N/A，不应解释成共享率为零。比例按两位百分数显示，极小�
 `mean`、`p50`、`p95` 则仍是 task 共享率分布，其中包含仅剩一条参与轨迹的零共享率。
 各轮参与样本可能不同，比较趋势时必须同时查看覆盖率；若轨迹轮数不同，最后一轮的参与集合
 也不同于“每条 rollout 各取最终上下文”的最终轨迹表，两者不要求一致。
+
+## 交互过程可视化
+
+默认视图在同一输出目录自动生成 `interactions.html`。重新运行原有分析命令并指定新输出目录，
+然后将 HTML 拷到本机，用浏览器直接打开即可；不需要服务、网络、模型或 tokenizer。
+分析入口与同目录的 `multiturn_interactions.html` 模板需要一起同步到采集机器。
+
+页面支持按数据集、task、rollout 选择轨迹，沿轮次时间线查看输入消息、模型回复、
+工具名称/参数/调用 ID、工具返回，以及当轮输入和输出 token 数。
+工具返回展示在包含它的输入消息中，不将其伪造为单独采集到的工具执行事件。
+默认折叠与上一轮上下文逐条完全一致的消息前缀；勾选“显示完整输入上下文”可展开，
+也可按关键词筛选当前轮消息。这种消息折叠仅用于展示，与基于 token IDs 的共享计算独立。
+
+图表分别展示当前 rollout 的上下文长度和当前 task、N 档位的共享率；后者来自固定前 N 条
+轨迹中当轮仍有调用的集合，并不是当前所选单条 rollout 的共享率。展开统计表可查看
+当轮实际参与数量、轨迹均值及四类共享来源。页面显示所有已纳入分析的 rollout，
+因此选中的某条 rollout 不一定在所选 N 档位的前 N 条中。
+
+文本来源为 calls 格式的 `request.messages` / `response.choices[].message`，或 SWE-bench
+Span 中 `llm.<provider>.messages`、`system`、`tools`、`choices`、`content` 字段；
+缺少 raw 文本时读取已采集的 `gen_ai.prompt.<i>.*` / `gen_ai.completion.<i>.*`。
+同一 rollout/attempt/sequence 的 Span 在 token 去重前收集文本，避免主 Span 的 token
+记录遮住 raw Span 的消息。每轮可查看原始文件位置和文本字段名。文本按纯文本展示，
+其中的 HTML 或脚本不会作为页面代码执行；重复消息在 HTML 数据中只存一份。
+
+页面仅覆盖当前分析接受的有效 token 调用和所选角色，不恢复被跳过的调用或未采集的文本。
+若输入只包含 token IDs，对应轮次显示“未采集到文本”，仍显示长度与共享统计。
+原始采集文件不改写；HTML 内嵌已采集文本，能够独立离线查看，但不是完整原始 Span 的备份。
 
 ## SWE-bench 原始采集结果
 
