@@ -136,7 +136,11 @@ N/A，不应解释成共享率为零。比例按两位百分数显示，极小�
 即使公共前缀长度等于唯一轨迹的长度，也不会产生节省；无公共前缀时单次分叉节省为零。
 仅有两条轨迹时两种方案相同。两种方案的轨迹均值相同，因为原始输入集合相同。
 
-`report.md` 的“单次分叉与前缀树对比”包含最终/逐轮的 task 明细和汇总。
+`report.md` 的“每个 task 的结果”“按 rollout 数量汇总”“按轮次汇总”和“每个 task 的逐轮结果”
+四张主表直接并排显示单次分叉和前缀树的共享结果；汇总表分别显示两种方案的 task 均值、
+P50、P95 和 token 加权共享率。末尾“单次分叉与前缀树对比”还列出公共前缀长度、
+共享后 token 数及前缀树额外节省量。calls/trajectory 视图也将对应方案明确标为“单次分叉”。
+已生成的 Markdown 不会自动更新，需要用当前脚本重新分析到新输出目录。
 JSON/CSV 的 task 明细使用上述 `simple_*` 字段；汇总增加 `simple_total_saved_tokens`、
 `simple_total_grouped_tokens`、`simple_weighted_token_reduction`，以及 `simple_mean`、
 `simple_p50`、`simple_p95` 等 task 共享率分布。加权共享率仍为各 task 可省 token 总和

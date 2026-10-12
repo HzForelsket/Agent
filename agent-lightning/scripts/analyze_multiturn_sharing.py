@@ -1190,6 +1190,7 @@ def render_report(
         "- 最终轨迹长度 = 最后一次调用的 prompt + response 长度；不累加历史调用或训练分段。",
         "- 对所选最终轨迹构建前缀树，所有共同前缀节点只计一次；不要求初始 prompt 相同，也不受初始 prompt 边界限制。",
         "- 共享率 =（独立 token 总数 - 前缀树节点数）/ 独立 token 总数；只共享前缀，不合并分叉后再次出现的相同片段。",
+        "- 单次分叉只共享全组最长公共前缀 L：可省 token = (实际参与数 - 1) × L；下列主表同时展示两种方案。",
         "- 本报告比较采集样本数量，不模拟训练 micro-batch、设备分配或截断，不是实测加速比。",
         "- 汇总表的 task 均值、P50、P95 均为各 task 共享率的统计，不是轨迹长度；N=1 的跨轨迹共享率必为零。",
         "- 前缀中断时，最终上下文不一定包含完整交互历史；训练分段诊断另列于 summary.json，不作为本表分母。",
@@ -1208,8 +1209,8 @@ def render_report(
             "",
             "## 每个 task 的结果",
             "",
-            "| 数据集 | task | rollout 数 | 已采集数 | 交互轮数均值 | 初始 prompt 均值 | 最终轨迹均值 | 最终轨迹 P95 | 独立 token（所选轨迹之和） | 可省 token | 共享比例 | 共享状态 |",
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+            "| 数据集 | task | rollout 数 | 已采集数 | 交互轮数均值 | 初始 prompt 均值 | 最终轨迹均值 | 最终轨迹 P95 | 独立 token（所选轨迹之和） | 单次分叉可省 token | 单次分叉共享比例 | 前缀树可省 token | 前缀树共享比例 | 前缀树共享状态 |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
         ]
     )
     for row in rows:
@@ -1217,7 +1218,9 @@ def render_report(
             f"| {row['workload']} | `{row['task_id']}` | {row['rollout_count']} | {row['available_rollouts']} | "
             f"{row['interaction_rounds_mean']:.2f} | {row['initial_prompt_length_mean']:.2f} | "
             f"{row['final_trajectory_length_mean']:.2f} | {row['final_trajectory_length_p95']:.2f} | "
-            f"{row['independent_total_tokens']} | {row['shared_prefix_saved_tokens']} | {percent(row['token_reduction'])} | "
+            f"{row['independent_total_tokens']} | {row['simple_saved_tokens']} | "
+            f"{percent(row['simple_token_reduction'])} | {row['shared_prefix_saved_tokens']} | "
+            f"{percent(row['token_reduction'])} | "
             f"{sharing_labels[row['sharing_status']]} |"
         )
     lines.extend(
@@ -1225,14 +1228,16 @@ def render_report(
             "",
             "## 按 rollout 数量汇总",
             "",
-            "| 数据集 | 每 task 的 rollout 数 | 纳入 task | 数量不足 task | 所选 rollout 总数 | 独立 token 总和 | task 共享率均值 | 共享率 P50 | 共享率 P95 | token 加权共享率 |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| 数据集 | 每 task 的 rollout 数 | 纳入 task | 数量不足 task | 所选 rollout 总数 | 独立 token 总和 | 单次分叉 task 均值 | 单次分叉 P50 | 单次分叉 P95 | 单次分叉 token 加权共享率 | 前缀树 task 均值 | 前缀树 P50 | 前缀树 P95 | 前缀树 token 加权共享率 |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in summaries:
         lines.append(
             f"| {row['workload']} | {row['rollout_count']} | {row['task_count']} | {row['insufficient_tasks']} | "
-            f"{row['selected_rollouts']} | {row['total_independent_tokens']} | {percent(row['mean'])} | "
+            f"{row['selected_rollouts']} | {row['total_independent_tokens']} | "
+            f"{percent(row['simple_mean'])} | {percent(row['simple_p50'])} | {percent(row['simple_p95'])} | "
+            f"{percent(row['simple_weighted_token_reduction'])} | {percent(row['mean'])} | "
             f"{percent(row['p50'])} | {percent(row['p95'])} | {percent(row['weighted_token_reduction'])} |"
         )
     lines.extend(
@@ -1268,27 +1273,30 @@ def render_report(
         "参与数量可能随轮次下降；仅剩一条时共享率为零，没有参与者的 task 不计入该轮均值。",
         "汇总轨迹均值按实际参与 rollout 加权，共享率按 token 加权，均不跨 task 共享。", "",
         "### 按轮次汇总", "",
-        "| 数据集 | 选样 N | 轮次 | 参与 task / 入选 task | 至少两条参与的 task | 参与 rollout | 未参与 rollout | 轨迹均值（token） | task 共享率均值 | 共享率 P50 | 共享率 P95 | token 加权共享率 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| 数据集 | 选样 N | 轮次 | 参与 task / 入选 task | 至少两条参与的 task | 参与 rollout | 未参与 rollout | 轨迹均值（token） | 单次分叉 task 均值 | 单次分叉 P50 | 单次分叉 P95 | 单次分叉 token 加权共享率 | 前缀树 task 均值 | 前缀树 P50 | 前缀树 P95 | 前缀树 token 加权共享率 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ])
     for row in round_summaries:
         lines.append(
             f"| {row['workload']} | {row['rollout_count']} | {row['round']} | "
             f"{row['active_tasks']} / {row['eligible_tasks']} | {row['tasks_with_multiple_rollouts']} | "
             f"{row['active_rollouts']} | {row['inactive_rollouts']} | {row['trajectory_length_mean']:.2f} | "
+            f"{percent(row['simple_mean'])} | {percent(row['simple_p50'])} | {percent(row['simple_p95'])} | "
+            f"{percent(row['simple_weighted_token_reduction'])} | "
             f"{percent(row['mean'])} | {percent(row['p50'])} | {percent(row['p95'])} | "
             f"{percent(row['weighted_token_reduction'])} |"
         )
     lines.extend([
         "", "### 每个 task 的逐轮结果", "",
-        "| 数据集 | task | 选样 N | 轮次 | 参与 rollout | 未参与 rollout | 轨迹均值（token） | 独立 token | 可省 token | 共享率 |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| 数据集 | task | 选样 N | 轮次 | 参与 rollout | 未参与 rollout | 轨迹均值（token） | 独立 token | 单次分叉可省 token | 单次分叉共享率 | 前缀树可省 token | 前缀树共享率 |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ])
     for row in rounds:
         lines.append(
             f"| {row['workload']} | `{row['task_id']}` | {row['rollout_count']} | {row['round']} | "
             f"{row['active_rollouts']} | {row['inactive_rollouts']} | {row['trajectory_length_mean']:.2f} | "
-            f"{row['independent_total_tokens']} | {row['shared_prefix_saved_tokens']} | "
+            f"{row['independent_total_tokens']} | {row['simple_saved_tokens']} | "
+            f"{percent(row['simple_token_reduction'])} | {row['shared_prefix_saved_tokens']} | "
             f"{percent(row['token_reduction'])} |"
         )
     lines.extend([
@@ -1787,16 +1795,22 @@ def write_sequence_report(root: Path, output: Path, view: str) -> None:
         "| 方案 | token 位置数 | token 减少比例 | 因果注意力对 | 注意力对减少比例 |",
         "|---|---:|---:|---:|---:|",
     ]
+    scheme_labels = {
+        "independent": "独立执行",
+        "simple_sharing": "单次分叉（全组公共前缀）",
+        "cross_trajectory_sharing": "前缀树共享",
+    }
     for row in table:
         reduction = "N/A" if row["token_reduction"] is None else percent(row["token_reduction"])
         pairs = "N/A" if row["causal_pair_reduction"] is None else percent(row["causal_pair_reduction"])
         lines.append(
-            f"| {row['scheme']} | {row['merged_tokens']} | {reduction} | {row['merged_causal_pairs']} | {pairs} |"
+            f"| {scheme_labels[row['scheme']]} | {row['merged_tokens']} | {reduction} | "
+            f"{row['merged_causal_pairs']} | {pairs} |"
         )
     lines.extend(["", "## 统计口径", ""])
     lines.extend(f"- `{key}`: {value}" for key, value in summary["definitions"].items())
     extra = summary["tree_over_simple"]
-    lines.extend(["", f"前缀树相对简单共享额外减少 {extra['saved_tokens']} 个 token；详细比例见 summary.json。"])
+    lines.extend(["", f"前缀树相对单次分叉共享额外减少 {extra['saved_tokens']} 个 token；详细比例见 summary.json。"])
     if view == "calls":
         lines.append(
             f"环境模型调用 {summary['environment_model_calls']} 次，有效 token 数 {summary['valid_environment_tokens']}，不计入 policy 共享。"
