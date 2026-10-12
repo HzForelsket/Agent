@@ -44,7 +44,9 @@ tr.selected{background:#e7f2ef}caption{text-align:left;color:var(--muted);paddin
 <section class="panel"><h2>轨迹概览</h2><div id="overview" class="stats"></div>
 <p class="muted">轮次按分析接受的有效 token 调用和所选角色排列。工具返回出现在携带它的后续输入中。被跳过的调用、缺失文本及未发送给模型的输出不在此页面中。</p>
 <div class="charts"><div><h3>当前 rollout · 逐轮上下文长度</h3><div id="lengthChart"></div></div>
-<div><h3>当前 task / N · 逐轮共享率</h3><div id="sharingChart"></div></div></div>
+<div><h3>当前 task / N · 前缀树共享率</h3><div id="sharingChart"></div></div>
+<div><h3>当前 task / N · 单次分叉共享率</h3><div id="simpleSharingChart"></div></div></div>
+<p class="muted">单次分叉只共享全组最长公共前缀，分叉后各轨迹独立；前缀树还共享子组前缀。两种方案使用相同参与轨迹和 token 分母。</p>
 <details><summary>展开逐轮共享统计</summary><div id="roundTable" class="table-scroll"></div></details>
 </section>
 <section class="panel"><div class="toolbar"><button id="previous">← 上一轮</button><h2 id="roundTitle"></h2><button id="next">下一轮 →</button></div>
@@ -83,8 +85,9 @@ function chart(id,values,format,color){const holder=$(id);holder.replaceChildren
 function renderOverview(){if(!trajectory)return;metrics=data.rounds.filter(r=>r.workload===trajectory.workload&&String(r.task_id)===String(trajectory.task_id)&&String(r.rollout_count)===$("cohort").value);
  const calls=trajectory.calls,last=calls[calls.length-1],overview=$("overview");overview.replaceChildren();stat(overview,"已采集交互轮次",fmt(calls.length));stat(overview,"最终上下文 · token",fmt(last.prompt_tokens+last.response_tokens));stat(overview,"有输入消息记录的轮次",`${calls.filter(c=>c.messages!==null).length} / ${calls.length}`);stat(overview,"有回复消息记录的轮次",`${calls.filter(c=>c.outputs!==null).length} / ${calls.length}`);
  chart("lengthChart",calls.map(c=>c.prompt_tokens+c.response_tokens),fmt,"#087f79");chart("sharingChart",metrics.map(r=>r.token_reduction),pct,"#8262a8");
- const table=el("table"),head=el("tr");for(const label of ["轮次","参与 rollout","轨迹均值 / token","共享率","初始 prompt 可省","后续可省","混合可省","无法归属可省"])head.append(el("th",label));table.append(head);
- for(const row of metrics){const tr=el("tr");if(row.round===round+1)tr.className="selected";for(const value of [row.round,row.active_rollouts,fmt(row.trajectory_length_mean),pct(row.token_reduction),row.initial_prompt_saved_tokens,row.other_saved_tokens,row.mixed_saved_tokens,row.unattributed_saved_tokens])tr.append(el("td",String(value)));table.append(tr);}$("roundTable").replaceChildren(table);
+ chart("simpleSharingChart",metrics.map(r=>r.simple_token_reduction),pct,"#b37c13");
+ const table=el("table"),head=el("tr");for(const label of ["轮次","参与 rollout","轨迹均值 / token","全组公共前缀 / token","单次分叉可省 / token","单次分叉共享率","前缀树共享率","前缀树额外可省 / token","前缀树：初始 prompt 可省","前缀树：后续可省","前缀树：混合可省","前缀树：无法归属可省"])head.append(el("th",label));table.append(head);
+ for(const row of metrics){const tr=el("tr");if(row.round===round+1)tr.className="selected";for(const value of [row.round,row.active_rollouts,fmt(row.trajectory_length_mean),row.common_prefix_tokens,row.simple_saved_tokens,pct(row.simple_token_reduction),pct(row.token_reduction),row.tree_extra_saved_tokens,row.initial_prompt_saved_tokens,row.other_saved_tokens,row.mixed_saved_tokens,row.unattributed_saved_tokens])tr.append(el("td",String(value)));table.append(tr);}$("roundTable").replaceChildren(table);
  $("timeline").replaceChildren();calls.forEach((call,i)=>{const button=el("button",`第 ${i+1} 轮 · ${fmt(call.prompt_tokens+call.response_tokens)} tokens`,i===round?"active":"");button.onclick=()=>{round=i;renderRound();};$("timeline").append(button);});
 }
 function block(parent,value){const box=el("div",undefined,"block");if(value&&typeof value==="object"){
@@ -106,7 +109,7 @@ function renderMessages(id,ids,offset=0){const root=$(id);root.replaceChildren()
  const query=$("search").value.toLocaleLowerCase();let shown=0;ids.forEach((index,i)=>{const message=data.messages[index];if(query&&!pretty(message).toLocaleLowerCase().includes(query))return;root.append(messageCard(message,i+offset));shown++;});if(!shown)root.append(el("p",query?"当前筛选没有匹配消息。":"没有新增消息。","muted"));}
 function renderRound(){if(!trajectory)return;const call=trajectory.calls[round];$("roundTitle").textContent=`第 ${round+1} 轮`;$("previous").disabled=round===0;$("next").disabled=round===trajectory.calls.length-1;
  const stats=$("roundStats");stats.replaceChildren();stat(stats,"输入 token",fmt(call.prompt_tokens));stat(stats,"输出 token",fmt(call.response_tokens));stat(stats,"当轮上下文 token",fmt(call.prompt_tokens+call.response_tokens));
- const metric=metrics.find(r=>r.round===round+1);if(metric){stat(stats,"同 task / N 共享率",pct(metric.token_reduction));stat(stats,"同 task / N 轨迹均值",fmt(metric.trajectory_length_mean));stat(stats,"参与共享统计的 rollout",`${metric.active_rollouts} / ${metric.rollout_count}`);}
+ const metric=metrics.find(r=>r.round===round+1);if(metric){stat(stats,"前缀树共享率",pct(metric.token_reduction));stat(stats,"单次分叉共享率",pct(metric.simple_token_reduction));stat(stats,"全组公共前缀 token",fmt(metric.common_prefix_tokens));stat(stats,"同 task / N 轨迹均值",fmt(metric.trajectory_length_mean));stat(stats,"参与共享统计的 rollout",`${metric.active_rollouts} / ${metric.rollout_count}`);}
  $("cohortNote").textContent=`模型：${call.model||"未记录"} · 原始调用序号：${call.source_turn}。共享率属于同 task 前 N 条 rollout 的当轮集合，不是当前一条轨迹的共享率。`;
  let ids=call.messages,hidden=0;const previous=round?trajectory.calls[round-1]:null;const prior=previous&&previous.messages!==null?[...previous.messages,...(previous.outputs||[])]:[];
  if(ids!==null&&!$("full").checked){while(hidden<ids.length&&hidden<prior.length&&ids[hidden]===prior[hidden])hidden++;ids=ids.slice(hidden);}

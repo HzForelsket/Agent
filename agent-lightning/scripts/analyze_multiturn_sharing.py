@@ -937,6 +937,35 @@ def shared_token_attribution(trajectories: list[dict[str, Any]]) -> dict[str, in
     return totals
 
 
+def simple_sharing_metrics(costs: dict[str, int]) -> dict[str, Any]:
+    """Share only the prefix common to every participating trajectory once."""
+    saved = costs["separate_tokens"] - costs["simple_tokens"]
+    return {
+        "common_prefix_tokens": costs["common_prefix_tokens"],
+        "simple_saved_tokens": saved,
+        "simple_grouped_total_tokens": costs["simple_tokens"],
+        "simple_token_reduction": ratio(saved, costs["separate_tokens"]),
+        "tree_extra_saved_tokens": costs["simple_tokens"] - costs["merged_tokens"],
+    }
+
+
+def summarize_simple_sharing(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate single-branch savings with the same participants as trie sharing."""
+    saved = sum(row["simple_saved_tokens"] for row in rows)
+    independent = sum(row["independent_total_tokens"] for row in rows)
+    return {
+        "simple_total_saved_tokens": saved,
+        "simple_total_grouped_tokens": sum(row["simple_grouped_total_tokens"] for row in rows),
+        "simple_weighted_token_reduction": ratio(saved, independent),
+        "tree_extra_saved_tokens": sum(row["tree_extra_saved_tokens"] for row in rows),
+        **{
+            f"simple_{key}": value
+            for key, value in distribution(row["simple_token_reduction"] for row in rows).items()
+            if key != "count"
+        },
+    }
+
+
 def task_rows(
     workload: str, trajectories: list[dict[str, Any]], counts: list[int]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -1002,9 +1031,7 @@ def task_rows(
                     "grouped_total_tokens": grouped_tokens,
                     "token_reduction": saved_tokens / independent_tokens,
                     "token_work_ratio": independent_tokens / grouped_tokens,
-                    "common_prefix_tokens": costs["common_prefix_tokens"],
-                    "simple_grouped_total_tokens": costs["simple_tokens"],
-                    "simple_token_reduction": (independent_tokens - costs["simple_tokens"]) / independent_tokens,
+                    **simple_sharing_metrics(costs),
                 }
             )
     return rows, skipped
@@ -1035,6 +1062,7 @@ def summarize_rows(rows: list[dict[str, Any]], skipped: list[dict[str, Any]]) ->
                 "weighted_token_reduction": ratio(saved, independent),
                 "total_independent_tokens": independent,
                 "total_saved_tokens": saved,
+                **summarize_simple_sharing(members),
                 **{
                     field: sum(row[field] for row in members)
                     for field in (
@@ -1088,6 +1116,7 @@ def round_rows(
                     "grouped_total_tokens": costs["merged_tokens"],
                     "shared_prefix_saved_tokens": saved,
                     "token_reduction": ratio(saved, independent),
+                    **simple_sharing_metrics(costs),
                     **shared_token_attribution(snapshots),
                 }
             )
@@ -1120,6 +1149,7 @@ def summarize_round_rows(rows: list[dict[str, Any]], cohorts: list[dict[str, Any
                 "total_independent_tokens": independent,
                 "total_saved_tokens": saved,
                 "weighted_token_reduction": ratio(saved, independent),
+                **summarize_simple_sharing(members),
                 **{
                     key: value for key, value in distribution(row["token_reduction"] for row in members).items()
                     if key != "count"
@@ -1261,6 +1291,53 @@ def render_report(
             f"{row['independent_total_tokens']} | {row['shared_prefix_saved_tokens']} | "
             f"{percent(row['token_reduction'])} |"
         )
+    lines.extend([
+        "", "## 单次分叉与前缀树对比", "",
+        "单次分叉只保留一份所有参与轨迹的最长公共前缀 L，分叉后每条独立；不继续共享子组前缀。",
+        "可省 token = (M - 1) × L；共享率 = 可省 token / 独立 token。M 是实际参与数量，逐轮可能小于选样 N。",
+        "两种方案使用相同轨迹、长度均值和分母；前缀树额外可省 = 前缀树可省 - 单次分叉可省。",
+        "公共前缀只从序列开头连续匹配，不包括分叉后再次出现的相同片段。", "",
+    ])
+    for title, entries, per_round in (
+        ("最终轨迹：每 task 对比", rows, False),
+        ("逐轮轨迹：每 task 对比", rounds, True),
+    ):
+        lines.extend([
+            f"### {title}", "",
+            "| 数据集 | task | 选样 N | 轮次 | 参与数 | 全组公共前缀 token | 独立 token | 单次分叉共享后 token | 单次分叉可省 token | 单次分叉共享率 | 前缀树共享后 token | 前缀树共享率 | 前缀树额外可省 token |",
+            "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ])
+        for row in entries:
+            round_label = str(row["round"]) if per_round else "最终"
+            active = row["active_rollouts"] if per_round else row["rollout_count"]
+            lines.append(
+                f"| {row['workload']} | `{row['task_id']}` | {row['rollout_count']} | {round_label} | {active} | "
+                f"{row['common_prefix_tokens']} | {row['independent_total_tokens']} | "
+                f"{row['simple_grouped_total_tokens']} | {row['simple_saved_tokens']} | "
+                f"{percent(row['simple_token_reduction'])} | {row['grouped_total_tokens']} | "
+                f"{percent(row['token_reduction'])} | {row['tree_extra_saved_tokens']} |"
+            )
+        lines.append("")
+    for title, entries, per_round in (
+        ("最终轨迹：汇总对比", summaries, False),
+        ("逐轮轨迹：汇总对比", round_summaries, True),
+    ):
+        lines.extend([
+            f"### {title}", "",
+            "| 数据集 | 选样 N | 轮次 | 参与 task | 单次分叉可省 token | 单次分叉 task 均值 | 单次分叉 P50 | 单次分叉 P95 | 单次分叉加权共享率 | 前缀树加权共享率 | 前缀树额外可省 token |",
+            "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ])
+        for row in entries:
+            round_label = str(row["round"]) if per_round else "最终"
+            tasks = row["active_tasks"] if per_round else row["task_count"]
+            lines.append(
+                f"| {row['workload']} | {row['rollout_count']} | {round_label} | {tasks} | "
+                f"{row['simple_total_saved_tokens']} | {percent(row['simple_mean'])} | "
+                f"{percent(row['simple_p50'])} | {percent(row['simple_p95'])} | "
+                f"{percent(row['simple_weighted_token_reduction'])} | "
+                f"{percent(row['weighted_token_reduction'])} | {row['tree_extra_saved_tokens']} |"
+            )
+        lines.append("")
     if any(report.get("input_diagnostics") for report in workloads.values()):
         lines.extend(["", "## 输入解析诊断", ""])
         for workload, report in workloads.items():
@@ -1807,6 +1884,9 @@ def write_rollout_report(inputs: dict[str, Path], output: Path, role: str, group
             "token_reduction": "shared_prefix_saved_tokens / independent_total_tokens",
             "shared_token_attribution": "Partition saved trie tokens by all occurrences: initial_prompt if every occurrence is inside a preserved initial prompt, other if all are after it, mixed if boundaries disagree, unattributed if any initial-prompt boundary is unverified. The four saved-token counts sum to shared_prefix_saved_tokens.",
             "simple_token_reduction": "Savings from retaining the all-rollout longest common prefix once, divided by independent_total_tokens; reported separately from prefix-tree sharing.",
+            "simple_saved_tokens": "(M - 1) * common_prefix_tokens; M is the actual participant count, including only observed calls in per-round rows. No subgroup prefix sharing after this single branch.",
+            "simple_weighted_token_reduction": "Sum of single-branch savings over tasks / sum of independent tokens, using exactly the same participants as trie sharing. simple_mean and simple_pXX describe task-rate distributions.",
+            "tree_extra_saved_tokens": "Trie savings minus single-branch savings, in tokens, not a percentage.",
             "coverage": "Tasks with fewer than N rollouts are excluded from that cohort size, without replacement.",
             "scope": "Rollout-count comparison, not a micro-batch or DP-rank simulation. Final contexts may omit earlier history after prefix breaks. No measured speedup claim.",
             "training_segment_diagnostics": "All-input training-segment statistics, provided separately; these are not the denominators of the rollout-count report.",
@@ -1877,6 +1957,8 @@ def write_interaction_view(path: Path, trajectories: list[dict[str, Any]], round
     fields = (
         "workload", "task_id", "rollout_count", "round", "active_rollouts", "inactive_rollouts",
         "trajectory_length_mean", "token_reduction", "shared_prefix_saved_tokens",
+        "common_prefix_tokens", "simple_saved_tokens", "simple_grouped_total_tokens",
+        "simple_token_reduction", "tree_extra_saved_tokens",
         "initial_prompt_saved_tokens", "other_saved_tokens", "mixed_saved_tokens", "unattributed_saved_tokens",
     )
     payload = json.dumps({

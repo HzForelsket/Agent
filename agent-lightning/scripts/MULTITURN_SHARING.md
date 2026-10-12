@@ -81,7 +81,9 @@ DP rank 或截断。`summary.json` 用 `sharing_method=final_trajectory_prefix_t
 | `weighted_token_reduction` | 相同 N 下所有纳入 task 的可省 token 总和 / 独立 token 总和 |
 | `common_prefix_tokens` | 所选 N 条最终轨迹的全组最长公共前缀长度 |
 | `simple_grouped_total_tokens` | 仅将全组最长公共前缀保留一次后的 token 数 |
+| `simple_saved_tokens` | 单次分叉共享可省 token，等于 `(实际参与数 - 1) × common_prefix_tokens` |
 | `simple_token_reduction` | 仅共享全组最长公共前缀时的节省比例 |
+| `tree_extra_saved_tokens` | 前缀树比单次分叉额外省下的 token 数 |
 | `sharing_status` | `single_rollout`：只选中一条；`shared`：最终轨迹有可省 token；`no_shared_final_prefix`：最终轨迹之间无共享前缀 |
 | `prefix_breaks` | 所选轨迹的相邻调用发生 token 前缀中断的总次数 |
 | `token_work_ratio` | 独立 token / 共享后 token，不是实测加速比 |
@@ -114,6 +116,34 @@ N=1 时没有第二条轨迹可以共享，因此这些比例必为零；N>1 但
 均为零时也会全零。查看每 task 的“共享状态”区分原因。没有足够 rollout 的档位显示
 N/A，不应解释成共享率为零。比例按两位百分数显示，极小的非零值也可能显示 0.00%；
 此时以 `summary.json` 的原始比例和 `shared_prefix_saved_tokens` 为准。
+
+## 只分叉一次：全组公共前缀共享
+
+默认同时统计前缀树和**单次分叉**两种方案，最终轨迹、每轮轨迹、跨 task 汇总使用同一套
+选样和 token 分母。单次分叉只共享所有参与轨迹从开头连续相同的最长公共前缀 L，
+之后各轨迹独立，即使某个子组仍有相同前缀也不再合并。
+
+若实际参与的轨迹数为 M、独立 token 总数为 T：
+
+```text
+单次分叉可省 token = (M - 1) × L
+单次分叉共享后 token = T - (M - 1) × L
+单次分叉共享率 = (M - 1) × L / T
+前缀树额外可省 token = 前缀树可省 token - 单次分叉可省 token
+```
+
+逐轮统计中 M 是 `active_rollouts`，不是最初选样档位 N。M=1 时两种共享率都为零，
+即使公共前缀长度等于唯一轨迹的长度，也不会产生节省；无公共前缀时单次分叉节省为零。
+仅有两条轨迹时两种方案相同。两种方案的轨迹均值相同，因为原始输入集合相同。
+
+`report.md` 的“单次分叉与前缀树对比”包含最终/逐轮的 task 明细和汇总。
+JSON/CSV 的 task 明细使用上述 `simple_*` 字段；汇总增加 `simple_total_saved_tokens`、
+`simple_total_grouped_tokens`、`simple_weighted_token_reduction`，以及 `simple_mean`、
+`simple_p50`、`simple_p95` 等 task 共享率分布。加权共享率仍为各 task 可省 token 总和
+除以独立 token 总和；没有可用 task 时比例为 N/A。
+
+`interactions.html` 同时显示两种方案的逐轮共享率曲线、当轮指标和对比表。
+共享来源的初始 prompt、后续、混合、无法归属四类仍对应前缀树的节省量。
 
 ## 每轮交互后的共享率和轨迹均值
 
