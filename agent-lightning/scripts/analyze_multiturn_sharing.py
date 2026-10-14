@@ -32,7 +32,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean, pstdev
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 CALL_UNIT = "original_workflow_call_slots"
 TRAJECTORY_UNIT = "one_complete_trajectory_sequence"
@@ -608,6 +608,44 @@ def analyze_trajectory(trajectory: str, turns: list[dict[str, Any]]) -> dict[str
     }
 
 
+def initial_user_input(
+    trajectory: dict[str, Any], encode: Callable[[str], list[int]] | None
+) -> dict[str, Any]:
+    """Read the first user message in the first retained call, independently of its full prompt."""
+    first = trajectory["_ordered_calls"][0]
+    messages = first["interaction"].get("messages")
+    result: dict[str, Any] = {
+        "text": None, "characters": None, "tokens": None,
+        "status": "messages_not_recorded", "message_index": None,
+        "source_turn": first["turn"],
+    }
+    if messages is None:
+        return result
+    result["status"] = "user_message_not_recorded"
+    for index, message in enumerate(messages):
+        if message.get("role") != "user":
+            continue
+        result["message_index"] = index
+        content = message.get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list) and all(
+            isinstance(block, dict) and block.get("type") in {"text", "input_text"}
+            and isinstance(block.get("text"), str) for block in content
+        ):
+            text = "".join(block["text"] for block in content)
+        else:
+            result["status"] = "missing_or_nontext_user_content"
+            return result
+        result.update({
+            "text": text, "characters": len(text),
+            "tokens": len(encode(text)) if encode is not None else None,
+            "status": "tokenized" if encode is not None else "tokenizer_not_provided",
+        })
+        return result
+    return result
+
+
 def analyze_sharing(trajectories: list[dict[str, Any]], requested_group_key: str) -> dict[str, Any]:
     """Measure exact-prompt sharing potential using the production grouping rule."""
     for trajectory in trajectories:
@@ -697,7 +735,7 @@ def trajectory_record(trajectory: dict[str, Any]) -> dict[str, Any]:
         "turns": trajectory["turns"],
         "shared_prompt_fraction": ratio(shared_length, total_length) if shared_length is not None else None,
         "response_length": response_length,
-        "initial_prompt_length": initial_prompt_length,
+        "first_call_prompt_tokens": initial_prompt_length,
         "shared_length": shared_length,
         "total_length": total_length,
         "model_response_length": training["model_response_tokens"],
@@ -806,7 +844,7 @@ def summarize_training(
     mean_fields = (
         "shared_prompt_fraction",
         "response_length",
-        "initial_prompt_length",
+        "first_call_prompt_tokens",
         "shared_length",
         "total_length",
         "model_response_length",
@@ -1019,7 +1057,19 @@ def task_rows(
                     "interaction_rounds_mean": mean(rounds),
                     "interaction_rounds_p50": percentile([float(value) for value in rounds], 0.50),
                     "interaction_rounds_p95": percentile([float(value) for value in rounds], 0.95),
-                    "initial_prompt_length_mean": mean(prompt_lengths),
+                    "first_call_prompt_tokens_mean": mean(prompt_lengths),
+                    "initial_user_characters_mean": field_mean(
+                        [trajectory["initial_user_input"] for trajectory in selected], "characters"
+                    ),
+                    "initial_user_tokens_mean": field_mean(
+                        [trajectory["initial_user_input"] for trajectory in selected], "tokens"
+                    ),
+                    "initial_user_text_rollouts": sum(
+                        trajectory["initial_user_input"]["characters"] is not None for trajectory in selected
+                    ),
+                    "initial_user_tokenized_rollouts": sum(
+                        trajectory["initial_user_input"]["tokens"] is not None for trajectory in selected
+                    ),
                     "final_trajectory_length_mean": mean(final_lengths),
                     "final_trajectory_length_p50": percentile([float(value) for value in final_lengths], 0.50),
                     "final_trajectory_length_p95": percentile([float(value) for value in final_lengths], 0.95),
@@ -1171,6 +1221,11 @@ def percent(value: float | None) -> str:
     return "N/A" if value is None else f"{value * 100:.2f}%"
 
 
+def number(value: float | None) -> str:
+    """Keep unavailable text/token measurements distinct from empty input."""
+    return "N/A" if value is None else f"{value:.2f}"
+
+
 def render_report(
     workloads: dict[str, Any], rows: list[dict[str, Any]], summaries: list[dict[str, Any]],
     rounds: list[dict[str, Any]], round_summaries: list[dict[str, Any]],
@@ -1185,7 +1240,10 @@ def render_report(
         "# 不同 rollout 数量下的多轮轨迹共享分析",
         "",
         "- 每个 task 固定顺序取前 N 条 rollout；编号完整且唯一时按 sample_index/rollout_index 排序，否则按文件首次出现顺序。",
-        "- 各档重新计算所选 rollout 的轮数、初始 prompt、最终轨迹均值和共享率。",
+        "- 首轮完整 prompt 是第一个有效调用的全部 prompt_token_ids，包含系统、用户、工具定义和模板中实际编码的内容。",
+        "- 初始用户输入单独取该调用的首条 user 消息；字符数与独立分词 token 数分别列出，不把整个 prompt 当作用户输入。",
+        "- 用户输入 token 数需提供 --tokenizer，按原始文本独立分词、不添加特殊 token；不代表该消息在完整 prompt 中的精确 token 区间。",
+        "- 用户输入缺失或未分词时对应值为 N/A，均值只统计有值的 rollout，并列出覆盖数。",
         "- 独立 token = 所选 N 条 rollout 的最终轨迹长度之和 = N × 最终轨迹长度均值（未四舍五入）。",
         "- 最终轨迹长度 = 最后一次调用的 prompt + response 长度；不累加历史调用或训练分段。",
         "- 对所选最终轨迹构建前缀树，所有共同前缀节点只计一次；不要求初始 prompt 相同，也不受初始 prompt 边界限制。",
@@ -1209,14 +1267,17 @@ def render_report(
             "",
             "## 每个 task 的结果",
             "",
-            "| 数据集 | task | rollout 数 | 已采集数 | 交互轮数均值 | 初始 prompt 均值 | 最终轨迹均值 | 最终轨迹 P95 | 独立 token（所选轨迹之和） | 单次分叉可省 token | 单次分叉共享比例 | 前缀树可省 token | 前缀树共享比例 | 前缀树共享状态 |",
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+            "| 数据集 | task | rollout 数 | 已采集数 | 交互轮数均值 | 初始用户输入均值（字符） | 初始用户输入均值（独立分词 token） | 用户文本 / 分词覆盖数 | 首轮完整 prompt 均值（token） | 最终轨迹均值 | 最终轨迹 P95 | 独立 token（所选轨迹之和） | 单次分叉可省 token | 单次分叉共享比例 | 前缀树可省 token | 前缀树共享比例 | 前缀树共享状态 |",
+            "|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
         ]
     )
     for row in rows:
         lines.append(
             f"| {row['workload']} | `{row['task_id']}` | {row['rollout_count']} | {row['available_rollouts']} | "
-            f"{row['interaction_rounds_mean']:.2f} | {row['initial_prompt_length_mean']:.2f} | "
+            f"{row['interaction_rounds_mean']:.2f} | {number(row['initial_user_characters_mean'])} | "
+            f"{number(row['initial_user_tokens_mean'])} | "
+            f"{row['initial_user_text_rollouts']} / {row['initial_user_tokenized_rollouts']} | "
+            f"{row['first_call_prompt_tokens_mean']:.2f} | "
             f"{row['final_trajectory_length_mean']:.2f} | {row['final_trajectory_length_p95']:.2f} | "
             f"{row['independent_total_tokens']} | {row['simple_saved_tokens']} | "
             f"{percent(row['simple_token_reduction'])} | {row['shared_prefix_saved_tokens']} | "
@@ -1255,7 +1316,7 @@ def render_report(
         lines.extend([
             "", f"## {title}", "",
             "以下均为省下的重复 token 数，四类之和等于总可省 token；不改变最终轨迹共享率。", "",
-            "| 数据集 | task | rollout 数 | 初始 prompt | 后续部分 | 混合归属 | 无法归属 |",
+            "| 数据集 | task | rollout 数 | 首轮完整 prompt | 后续部分 | 混合归属 | 无法归属 |",
             "|---|---|---:|---:|---:|---:|---:|---:|",
         ])
         for entry in entries:

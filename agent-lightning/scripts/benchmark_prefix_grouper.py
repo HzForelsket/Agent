@@ -197,6 +197,8 @@ def check_stack(stack: dict[str, str], backend: str) -> None:
 def _multiply_workload(workload: dict[str, Any], world_size: int) -> dict[str, Any]:
     result = dict(workload)
     for key in (
+        "sample_count",
+        "prompt_tokens",
         "response_tokens",
         "baseline_dense_model_tokens",
         "prefix_grouper_dense_model_tokens",
@@ -207,6 +209,27 @@ def _multiply_workload(workload: dict[str, Any], world_size: int) -> dict[str, A
     result["scope"] = "global"
     result["world_size"] = world_size
     return result
+
+
+def summarize_input_output(cases: list[dict[str, Any]]) -> dict[str, int | float]:
+    """Summarize one global batch per case, weighting means by sample count."""
+    workloads = [case["workload"] for case in cases]
+    sample_count = sum(work["sample_count"] for work in workloads)
+    prompt_tokens = sum(work["prompt_tokens"] for work in workloads)
+    response_tokens = sum(work["response_tokens"] for work in workloads)
+    total_tokens = prompt_tokens + response_tokens
+    return {
+        "sample_count": sample_count,
+        "prompt_tokens": prompt_tokens,
+        "response_tokens": response_tokens,
+        "prompt_length_mean": prompt_tokens / sample_count,
+        "response_length_mean": response_tokens / sample_count,
+        "prompt_to_response_ratio_mean": sum(
+            work["prompt_to_response_ratio_mean"] * work["sample_count"] for work in workloads
+        ) / sample_count,
+        "prompt_token_share": prompt_tokens / total_tokens,
+        "response_token_share": response_tokens / total_tokens,
+    }
 
 
 def _aggregate_accuracy(rank_values: list[dict[str, Any]]) -> dict[str, Any]:
@@ -389,6 +412,7 @@ def aggregate_model_result(
             for result in rank_results
         ],
         "idle_power": idle_measurement,
+        "input_output_summary": summarize_input_output(cases),
         "cases": cases,
     }
 
@@ -409,6 +433,36 @@ def markdown(results: dict[str, Any]) -> str:
     ]
     if results["profile"]["enabled"]:
         lines.append(f"- Profile：{results['profile']['output_dir']}；{results['profile']['scope']}")
+    lines.extend(
+        [
+            "",
+            "## 输入输出长度与比例",
+            "",
+            "输入指完整 prompt，输出指 response，单位均为 token；使用共享前的逻辑样本长度。",
+            "当前 case 内所有样本等长且无 padding，response 是合成的固定长度序列。",
+            "输入/输出平均比 = mean(prompt_length / response_length)，按样本数加权；"
+            "输入、输出占比分别为对应 token 总数 / (输入 token 总数 + 输出 token 总数)。",
+            "每个 case 统计一个全局 batch；模型汇总合并各 case，不重复计入两条对比路径、"
+            "forward/backward 模式、warmup、计时或功耗重复次数。",
+            "",
+            "| 模型 | 范围 | 共享组 | 样本数 | 输入总 token | 输出总 token | 输入平均长度 | 输出平均长度 | 输入/输出平均比 | 输入占比 | 输出占比 |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for model in results["models"]:
+        rows = [
+            (f"prompt={case['prompt_length']}", case["group_size"], case["workload"])
+            for case in model["cases"]
+        ]
+        rows.append(("全部 case", "—", model["input_output_summary"]))
+        for scope, group_size, work in rows:
+            lines.append(
+                f"| {model['label']} | {scope} | {group_size} | {work['sample_count']} | "
+                f"{work['prompt_tokens']} | {work['response_tokens']} | "
+                f"{work['prompt_length_mean']:.2f} | {work['response_length_mean']:.2f} | "
+                f"{work['prompt_to_response_ratio_mean']:.4f} | "
+                f"{work['prompt_token_share']:.2%} | {work['response_token_share']:.2%} |"
+            )
     lines.extend(
         [
             "",
@@ -626,6 +680,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "global_batch_size": args.batch_size_per_rank * world_size,
         "response_length": args.response_length,
         "ppa_definition": {
+            "input_output": (
+                "共享前完整 prompt 与合成 response 的 token 长度；每 case 统计一个全局 batch，"
+                "不重复计入路径、模式或测量次数。模型汇总按样本数加权平均长度及逐样本 prompt/response 比；"
+                "token 占比按各侧 token 总数 / 两侧 token 总数计算。"
+            ),
             "performance": "各 rank 设备事件延迟的慢端值；吞吐按全局 response token 计算",
             "power": "所有 rank 对应设备的 npu-smi/nvidia-smi 功耗之和",
             "accuracy": "所有 rank 的 response log-prob、logit 和 top-1 一致性",

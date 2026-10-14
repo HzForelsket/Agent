@@ -192,7 +192,7 @@ def make_batch(
 
 
 def workload_metrics(batch: dict[str, Any]) -> dict[str, int | float]:
-    """Describe the dense-token and causal-attention work represented by a local batch."""
+    """Describe token lengths and work for a local, fixed-length batch without padding."""
     response_length = int(batch["responses"].shape[1])
     prompt_length = int(batch["input_ids"].shape[1] - response_length)
     batch_size = int(batch["input_ids"].shape[0])
@@ -209,7 +209,14 @@ def workload_metrics(batch: dict[str, Any]) -> dict[str, int | float]:
         for suffix_length in info.suffix_lens:
             grouped_attention_pairs += int(suffix_length * info.prefix_len + suffix_length * (suffix_length + 1) // 2)
     return {
+        "sample_count": batch_size,
+        "prompt_tokens": batch_size * prompt_length,
         "response_tokens": int(batch["responses"].numel()),
+        "prompt_length_mean": float(prompt_length),
+        "response_length_mean": float(response_length),
+        "prompt_to_response_ratio_mean": prompt_length / response_length,
+        "prompt_token_share": prompt_length / (prompt_length + response_length),
+        "response_token_share": response_length / (prompt_length + response_length),
         "baseline_dense_model_tokens": baseline_dense_tokens,
         "prefix_grouper_dense_model_tokens": grouped_dense_tokens,
         "dense_model_token_saved_ratio": 1.0 - grouped_dense_tokens / baseline_dense_tokens,
