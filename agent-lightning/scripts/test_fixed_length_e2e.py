@@ -5,7 +5,7 @@
 
 Usage (from the repository root, on a machine with a usable accelerator)::
 
-    python scripts/test_fixed_length_e2e.py --model /path/to/model \
+    python scripts/test_fixed_length_e2e.py --mode simple --model /path/to/model \
         --prompt-tokens 128 --response-tokens 32 --output-dir /tmp/fixed-length-e2e
 
 ``--prepare-only`` validates the local tokenizer/context and writes inputs and
@@ -50,6 +50,7 @@ def append_event(path: Path, record: dict[str, Any]) -> None:
 def parse_args() -> argparse.Namespace:
     """Parse and reject invalid resource/length configurations before setup."""
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("no-share", "simple"), default="no-share")
     parser.add_argument("--model", type=Path, required=True, help="Local pretrained model/tokenizer directory.")
     parser.add_argument("--prompt-tokens", type=int, required=True)
     parser.add_argument("--response-tokens", type=int, required=True)
@@ -58,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollouts-per-sample", type=int, default=2)
     parser.add_argument("--n-devices", type=int, default=1)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
-    parser.add_argument("--micro-batch-size", type=int, default=1)
+    parser.add_argument("--micro-batch-size", type=int, help="Defaults to --rollouts-per-sample in both modes.")
     parser.add_argument("--n-runners", type=int, default=2)
     parser.add_argument("--device", choices=("auto", "gpu", "npu"), default="auto")
     parser.add_argument("--seed", type=int, default=42)
@@ -68,6 +69,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
+    if args.micro_batch_size is None:
+        args.micro_batch_size = args.rollouts_per_sample
     for name in (
         "prompt_tokens",
         "response_tokens",
@@ -87,6 +90,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("--tensor-parallel-size must divide --n-devices")
     if args.train_batch_size * args.rollouts_per_sample % (args.n_devices * args.micro_batch_size):
         parser.error("train-batch-size * rollouts-per-sample must be divisible by n-devices * micro-batch-size")
+    if args.mode == "simple":
+        if args.train_batch_size % args.n_devices:
+            parser.error("simple requires --train-batch-size divisible by --n-devices to keep prompt groups intact")
+        if args.micro_batch_size % args.rollouts_per_sample:
+            parser.error("simple requires --micro-batch-size to be a multiple of --rollouts-per-sample")
     if not math.isfinite(args.request_timeout) or args.request_timeout <= 0:
         parser.error("--request-timeout must be finite and positive")
     if not 0 <= args.seed < 2**31:
@@ -127,8 +135,23 @@ def prepare_dataset(args: argparse.Namespace) -> list[dict[str, Any]]:
 
 
 def build_config(args: argparse.Namespace) -> dict[str, Any]:
-    """Use the standard Agent Lightning/VERL FSDP training path."""
-    return {
+    """Select the production standard or simple shared-prefix FSDP path."""
+    # Match the random-token pg-verl-ppa worker's execution settings. In
+    # particular, actor.use_torch_compile alone does not override the FSDP
+    # engine's own default, including its entropy kernel compilation.
+    fsdp_config = {
+        "model_dtype": "bfloat16",
+        "dtype": "bfloat16",
+        "mixed_precision": {
+            "param_dtype": "bfloat16",
+            "reduce_dtype": "float32",
+            "buffer_dtype": "float32",
+        },
+        "use_torch_compile": False,
+        "ulysses_sequence_parallel_size": 1,
+        "seed": args.seed,
+    }
+    config: dict[str, Any] = {
         "algorithm": {"adv_estimator": "grpo", "use_kl_in_reward": False},
         "agentlightning": {"model_name": "fixed-length-e2e", "trace_aggregator": {"level": "transition"}},
         "data": {
@@ -141,7 +164,7 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
         "actor_rollout_ref": {
             "model": {
                 "path": str(args.model),
-                "override_config": {"attn_implementation": "sdpa"},
+                "override_config": {"attn_implementation": "sdpa", "use_cache": False},
                 "use_remove_padding": False,
                 "use_fused_kernels": False,
                 "enable_gradient_checkpointing": True,
@@ -159,6 +182,7 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
                 "max_model_len": args.prompt_tokens + args.response_tokens,
                 "gpu_memory_utilization": 0.35,
                 "log_prob_micro_batch_size_per_gpu": args.micro_batch_size,
+                "log_prob_use_dynamic_bsz": False,
                 "multi_turn": {"enable": False},
             },
             "actor": {
@@ -166,16 +190,19 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
                 "ppo_mini_batch_size": args.train_batch_size,
                 "ppo_micro_batch_size_per_gpu": args.micro_batch_size,
                 "ppo_epochs": 1,
+                "shuffle": False,
+                "use_dynamic_bsz": False,
                 "optim": {"lr": 1e-6},
                 "use_kl_loss": True,
                 "kl_loss_coef": 0.0,
                 "entropy_coeff": 0.0,
                 "use_torch_compile": False,
-                "fsdp_config": {"param_offload": True, "optimizer_offload": True, "model_dtype": "bf16"},
+                "fsdp_config": {**fsdp_config, "param_offload": True, "optimizer_offload": True},
             },
             "ref": {
                 "log_prob_micro_batch_size_per_gpu": args.micro_batch_size,
-                "fsdp_config": {"param_offload": True, "model_dtype": "bf16"},
+                "log_prob_use_dynamic_bsz": False,
+                "fsdp_config": {**fsdp_config, "param_offload": True},
             },
         },
         "trainer": {
@@ -195,6 +222,12 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
             "default_local_dir": str(args.output_dir / "checkpoints"),
         },
     }
+    if args.mode == "simple":
+        # The production worker inherits the same PrefixGrouperTrainingWorker
+        # used by pg-verl-ppa: reuse its packing and attention implementation.
+        config["agentlightning"]["prefix_grouper"] = {"enabled": True}
+        config["actor_rollout_ref"]["model"]["override_config"]["prefix_grouper_npu_backend"] = "fusion"
+    return config
 
 
 def runtime_components(args: argparse.Namespace) -> tuple[Any, Any, Any]:
@@ -224,6 +257,20 @@ def runtime_components(args: argparse.Namespace) -> tuple[Any, Any, Any]:
         counts: Counter[str] = Counter(cast(list[str], batch.non_tensor_batch["data_id_list"]))
         if len(counts) != args.train_batch_size or set(counts.values()) != {args.rollouts_per_sample}:
             raise AssertionError(f"Incomplete GRPO groups: {dict(counts)}")
+        if args.mode == "simple":
+            group_ids: list[int] = [int(value) for value in batch.non_tensor_batch["prefix_group_id"]]
+            groups: dict[int, list[int]] = {}
+            for row, group_id in enumerate(group_ids):
+                groups.setdefault(group_id, []).append(row)
+            if len(groups) != args.train_batch_size:
+                raise AssertionError("simple did not produce one prefix group per prompt")
+            for rows in groups.values():
+                if len(rows) != args.rollouts_per_sample:
+                    raise AssertionError("simple split a prompt's sibling rollouts into different prefix groups")
+                if len({str(batch.non_tensor_batch["data_id_list"][row]) for row in rows}) != 1:
+                    raise AssertionError("simple merged different GRPO groups")
+                if not bool((tensors["prompts"][rows] == tensors["prompts"][rows[0]]).all()):
+                    raise AssertionError("simple prefix group contains unequal prompts")
 
     class FixedLengthDaemon(AgentModeDaemon):
         """Expose token-native completions and observe real trace conversion."""
@@ -253,6 +300,8 @@ def runtime_components(args: argparse.Namespace) -> tuple[Any, Any, Any]:
             *,
             prepare_prefix_groups: bool = False,
         ) -> Any:
+            if prepare_prefix_groups != (args.mode == "simple"):
+                raise AssertionError("Trainer prefix grouping does not match the requested mode")
             batch, metrics = super().get_train_data_batch(
                 max_prompt_length,
                 max_response_length,
@@ -265,6 +314,7 @@ def runtime_components(args: argparse.Namespace) -> tuple[Any, Any, Any]:
                 events_path,
                 {
                     "stage": "trace_conversion",
+                    "mode": args.mode,
                     "step": global_steps,
                     "rows": len(batch),
                     "prompt_tokens": args.prompt_tokens,
@@ -358,6 +408,7 @@ def runtime_components(args: argparse.Namespace) -> tuple[Any, Any, Any]:
                 events_path,
                 {
                     "stage": "rollout",
+                    "mode": args.mode,
                     "rollout_id": rollout.rollout_id,
                     "sample_id": int(task["sample_id"]),
                     "rollout_index": index,
@@ -377,6 +428,12 @@ def runtime_components(args: argparse.Namespace) -> tuple[Any, Any, Any]:
 
         def _update_actor(self, batch: Any) -> Any:
             check_batch(batch)
+            if args.mode == "simple":
+                group_ids = [int(value) for value in batch.non_tensor_batch["prefix_group_id"]]
+                for start in range(0, len(batch), args.micro_batch_size):
+                    counts = Counter(group_ids[start : start + args.micro_batch_size])
+                    if set(counts.values()) != {args.rollouts_per_sample}:
+                        raise AssertionError("Actor micro-batch would split a shared-prefix group")
             for name in ("old_log_probs", "ref_log_prob", "advantages", "returns"):
                 if not bool(torch.isfinite(batch.batch[name]).all()):
                     raise AssertionError(f"Nonfinite training tensor: {name}")
@@ -384,7 +441,15 @@ def runtime_components(args: argparse.Namespace) -> tuple[Any, Any, Any]:
                 raise AssertionError("Actor response mask excludes generated tokens")
             if not bool(batch.batch["advantages"].abs().sum() > 0):
                 raise AssertionError("GRPO produced only zero advantages")
-            append_event(events_path, {"stage": "actor_input", "step": self.global_steps, "rows": len(batch)})
+            append_event(
+                events_path,
+                {
+                    "stage": "actor_input",
+                    "mode": args.mode,
+                    "step": self.global_steps,
+                    "rows": len(batch),
+                },
+            )
             return super()._update_actor(batch)
 
         def _train_step(self, batch_dict: dict[str, Any], *, profile_rollout: bool = False) -> dict[str, Any]:
@@ -396,7 +461,15 @@ def runtime_components(args: argparse.Namespace) -> tuple[Any, Any, Any]:
                     value = value.item()
                 if isinstance(value, (int, float)):
                     numeric[key] = value if math.isfinite(value) else str(value)
-            append_event(events_path, {"stage": "step_metrics", "step": self.global_steps, "metrics": numeric})
+            append_event(
+                events_path,
+                {
+                    "stage": "step_metrics",
+                    "mode": args.mode,
+                    "step": self.global_steps,
+                    "metrics": numeric,
+                },
+            )
             for stage in ("gen", "trace_conversion", "old_log_prob", "ref", "adv", "update_actor"):
                 value = float(metrics[f"timing_s/{stage}"])
                 if not math.isfinite(value) or value <= 0:
@@ -409,7 +482,7 @@ def runtime_components(args: argparse.Namespace) -> tuple[Any, Any, Any]:
                     raise AssertionError(f"Nonfinite actor metric: {key}")
             if float(metrics["actor/lr"]) <= 0:
                 raise AssertionError("Actor learning rate is zero")
-            append_event(events_path, {"stage": "step_passed", "step": self.global_steps})
+            append_event(events_path, {"stage": "step_passed", "mode": args.mode, "step": self.global_steps})
             return metrics
 
     return FixedLengthAgent, FixedLengthDaemon, FixedLengthTrainer
@@ -450,6 +523,7 @@ def run_training(args: argparse.Namespace, dataset: list[dict[str, Any]], config
         args.output_dir / "result.json",
         {
             "status": "passed",
+            "mode": args.mode,
             "steps": args.steps,
             "rollouts": expected,
             "prompt_tokens": args.prompt_tokens,
@@ -488,7 +562,14 @@ def main() -> None:
         write_json(args.output_dir / "dataset.json", dataset)
         write_json(args.output_dir / "config.json", config)
         if args.prepare_only:
-            write_json(args.output_dir / "result.json", {"status": "prepared", "training_executed": False})
+            write_json(
+                args.output_dir / "result.json",
+                {
+                    "status": "prepared",
+                    "mode": args.mode,
+                    "training_executed": False,
+                },
+            )
             print("PREPARED: tokenizer, exact prompt lengths, context budget and config only; E2E not executed.")
             return
         run_training(args, dataset, config)
@@ -500,6 +581,7 @@ def main() -> None:
                 args.output_dir / "failure.json",
                 {
                     "status": "failed",
+                    "mode": args.mode,
                     "error": repr(error),
                     "traceback": traceback.format_exc(),
                     "completed_stages": "See events.jsonl; partial results are not a passed E2E test.",
