@@ -132,16 +132,24 @@ conda run -n agent --no-capture-output python \
 
 输出目录必须尚不存在。生成两个文件：
 
-- `report.md`：中文对比表，包含完整 step 与各阶段耗时、response 吞吐、生产 trainer
-  已记录的显存和其他数值指标，以及降低比例和耗时加速比。
+- `report.md`：首先单独展示完整 step 的总耗时、平均每步耗时（s/step）、速度（steps/s）、
+  整体加速比与节省时间，并按 step 编号列出两种模式的耗时、节省秒数、降低比例和加速比；
+  随后展示各阶段耗时、response 吞吐、生产 trainer 已记录的显存和其他数值指标。
 - `report.json`：相同对比的结构化数据，包含逐指标均值、中位数、标准差、最小/最大值、
   原始样本和完整逐 step 指标。
+
+JSON schema version 为 2，各统计窗口新增 `step_summary`（整体 step 对比）和
+`per_step`（按 step 编号配对的耗时对比）。无数据窗口分别为 `null` 和空列表。
+已有完整运行结果可直接用更新后的报告脚本重新生成报告，无需重新训练。
 
 同时报告全部 steps 和固定排除 step 1 的窗口。默认只有 1 step 时，后者明确标为无数据。
 response 吞吐按窗口内真实 response token 总数除以完整 step 耗时总和计算；
 耗时加速比为 `no-share / simple`，降低比例为 `(no-share - simple) / no-share * 100%`。
 显存只比较原始指标，不把显存比例称为加速比；缺失或非有限的可选指标会列明而不补零。
 step 时间包含 rollout 与训练，不包含模型加载和 Ray 初始化；嵌套阶段不能相加作为总耗时。
+完整 step 直接读取 `timing_s/step`；step 总耗时是所选 steps 的计时之和，不是整个进程的
+墙钟时间。steps/s = step 数 / step 总耗时，整体加速比使用两种模式的总耗时之比，
+不对逐 step 加速比取平均。负的节省时间或降低比例表示 simple 更慢。
 
 报告只接受两种模式均 `status=passed` 的完整运行。会重新核对 rollout 数量、实际长度、
 step 连续性、分组、输入 token IDs、采样 seed/reward、设备、软件版本，以及原始和合并配置。

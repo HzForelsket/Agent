@@ -215,7 +215,14 @@ def summarize(values: list[float]) -> Record:
 def compare_window(baseline: list[Record], simple: list[Record], response_tokens_per_step: int) -> Record:
     """Compare a fixed step window, with missing metrics explicitly listed."""
     if not baseline:
-        return {"step_numbers": [], "metrics": {}, "unavailable_metrics": [], "response_throughput": None}
+        return {
+            "step_numbers": [],
+            "step_summary": None,
+            "per_step": [],
+            "metrics": {},
+            "unavailable_metrics": [],
+            "response_throughput": None,
+        }
     names: set[str] = set()
     for event in baseline + simple:
         names.update(event["metrics"])
@@ -241,9 +248,44 @@ def compare_window(baseline: list[Record], simple: list[Record], response_tokens
         }
     base_time = sum(float(event["metrics"]["timing_s/step"]) for event in baseline)
     simple_time = sum(float(event["metrics"]["timing_s/step"]) for event in simple)
+    per_step: list[Record] = []
+    for base_event, simple_event in zip(baseline, simple, strict=True):
+        if base_event["step"] != simple_event["step"]:
+            raise ValueError("Cannot compare timings for different step numbers")
+        base_seconds = float(base_event["metrics"]["timing_s/step"])
+        simple_seconds = float(simple_event["metrics"]["timing_s/step"])
+        per_step.append(
+            {
+                "step": base_event["step"],
+                "no_share_seconds": base_seconds,
+                "simple_seconds": simple_seconds,
+                "saved_seconds": base_seconds - simple_seconds,
+                "reduction_percent": 100 * (base_seconds - simple_seconds) / base_seconds,
+                "speedup": base_seconds / simple_seconds,
+            }
+        )
+    step_count = len(baseline)
     token_count = len(baseline) * response_tokens_per_step
     return {
         "step_numbers": [event["step"] for event in baseline],
+        "step_summary": {
+            "timing_key": "timing_s/step",
+            "count": step_count,
+            "no_share": {
+                "total_seconds": base_time,
+                "mean_seconds": base_time / step_count,
+                "steps_per_second": step_count / base_time,
+            },
+            "simple": {
+                "total_seconds": simple_time,
+                "mean_seconds": simple_time / step_count,
+                "steps_per_second": step_count / simple_time,
+            },
+            "saved_seconds": base_time - simple_time,
+            "reduction_percent": 100 * (base_time - simple_time) / base_time,
+            "speedup": base_time / simple_time,
+        },
+        "per_step": per_step,
         "metrics": comparisons,
         "unavailable_metrics": unavailable,
         "response_throughput": {
@@ -263,7 +305,7 @@ def build_report(baseline: Record, simple: Record) -> Record:
     args = invariants["args"]
     tokens = args["train_batch_size"] * args["rollouts_per_sample"] * args["response_tokens"]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "comparison_valid": True,
         "sources": {"no_share": baseline["directory"], "simple": simple["directory"]},
@@ -300,7 +342,11 @@ def render_markdown(report: Record) -> str:
         "两次运行均完整通过，已核对输入 token IDs、采样 seed、软件与设备记录、配置和训练步骤。",
         "",
         "耗时加速比 = no-share / simple；降低比例 = (no-share − simple) / no-share × 100%。"
-        "表中数值为逐 step 均值，负的降低比例表示 simple 更高。",
+        "加速比大于 1 表示 simple 更快，负的节省时间或降低比例表示 simple 更慢。",
+        "",
+        "完整 step 直接使用 `timing_s/step`，包含 rollout 和训练，不包含模型加载和 Ray 初始化。"
+        "总耗时为所选 steps 的计时之和，不是整个进程的墙钟时间；不累加内部阶段耗时。"
+        "整体加速比使用总耗时之比，不对逐 step 加速比取平均。",
         "",
     ]
     for name, title in (("all_steps", "全部 steps"), ("excluding_step_1", "排除 step 1")):
@@ -309,6 +355,40 @@ def render_markdown(report: Record) -> str:
         if not window["step_numbers"]:
             lines.extend(["无数据：运行只有一个训练 step。", ""])
             continue
+        summary = window["step_summary"]
+        base_step, simple_step = summary["no_share"], summary["simple"]
+        lines.extend(
+            [
+                "### 完整 step 速度与耗时",
+                "",
+                f"统计 **{summary['count']} steps**；simple 整体加速比 **{summary['speedup']:.3f}×**，"
+                f"节省 **{summary['saved_seconds']:.3f} s**（**{summary['reduction_percent']:.2f}%**）。",
+                "",
+                "| 指标 | no-share | simple |",
+                "| --- | ---: | ---: |",
+                f"| step 总耗时（s） | {base_step['total_seconds']:.6f} | {simple_step['total_seconds']:.6f} |",
+                f"| 平均每步耗时（s/step） | {base_step['mean_seconds']:.6f} | {simple_step['mean_seconds']:.6f} |",
+                f"| step 速度（steps/s） | {base_step['steps_per_second']:.6f} | "
+                f"{simple_step['steps_per_second']:.6f} |",
+                "",
+            ]
+        )
+        if name == "all_steps":
+            lines.extend(
+                [
+                    "### 逐 step 总耗时对比",
+                    "",
+                    "| Step | no-share（s） | simple（s） | 节省（s） | 耗时降低 | 加速比 |",
+                    "| ---: | ---: | ---: | ---: | ---: | ---: |",
+                ]
+            )
+            for row in window["per_step"]:
+                lines.append(
+                    f"| {row['step']} | {row['no_share_seconds']:.6f} | {row['simple_seconds']:.6f} | "
+                    f"{row['saved_seconds']:.6f} | {row['reduction_percent']:.2f}% | {row['speedup']:.3f}× |"
+                )
+            lines.append("")
+        lines.extend(["### 阶段及其他指标（逐 step 均值）", ""])
         throughput = window["response_throughput"]
         lines.extend(
             [
