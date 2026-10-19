@@ -6,11 +6,14 @@
 
 from __future__ import annotations
 
+import logging
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Type, cast
 
 import hydra
 import ray
+from ray.actor import ActorHandle
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import create_rl_sampler, need_critic, need_reference_policy
 
@@ -20,6 +23,8 @@ from agentlightning.store.base import LightningStore
 from agentlightning.types import Dataset
 
 from .dataset import AgentDataset, LoadedDataset
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .daemon import AgentModeDaemon
@@ -125,34 +130,106 @@ def run_ppo(
     configure_model_name(config)
     backend = configure_accelerator(config)
     prepare_model_for_accelerator(config, backend)
-    if not ray.is_initialized():
-        from omegaconf import OmegaConf
+    owns_ray = not ray.is_initialized()
+    runner: ActorHandle[Any] | None = None
+    try:
+        if owns_ray:
+            from omegaconf import OmegaConf
 
-        ray_init_kwargs = cast(
-            dict[str, Any], OmegaConf.to_container(config.ray_kwargs.get("ray_init", {}), resolve=True)
-        )
-        ray.init(**ray_init_kwargs)
+            ray_init_kwargs = cast(
+                dict[str, Any], OmegaConf.to_container(config.ray_kwargs.get("ray_init", {}), resolve=True)
+            )
+            ray.init(**ray_init_kwargs)
 
-    runner = TaskRunner.remote()
-    ray.get(
-        runner.run.remote(  # type: ignore
-            config=config,
-            train_dataset=train_dataset,
-            val_dataset=val_dataset,
-            store=store,
-            llm_proxy=llm_proxy,
-            adapter=adapter,
-            trainer_cls=trainer_cls,
-            daemon_cls=daemon_cls,
+        runner = cast(ActorHandle[Any], TaskRunner.remote())
+        ray.get(
+            runner.run.remote(  # type: ignore
+                config=config,
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                store=store,
+                llm_proxy=llm_proxy,
+                adapter=adapter,
+                trainer_cls=trainer_cls,
+                daemon_cls=daemon_cls,
+            )
         )
-    )
+    finally:
+        failed = sys.exc_info()[0] is not None
+        try:
+            if runner is not None:
+                try:
+                    ray.get(runner.close.remote(), timeout=60)  # type: ignore
+                finally:
+                    ray.kill(runner, no_restart=True)
+        except Exception:
+            logger.exception("Failed to clean up the VERL TaskRunner")
+            if not failed:
+                raise
+        finally:
+            # An existing Ray connection belongs to the caller. Disconnect only
+            # when this invocation initialized it; never stop an external cluster.
+            if owns_ray:
+                ray.shutdown()
 
 
 @ray.remote(num_cpus=1)
 class TaskRunner:
     """Build Agent Lightning on VERL 0.9's unified model-engine workers."""
 
+    def __init__(self) -> None:
+        self._resource_pool_manager: Any = None
+        self._uses_vllm = False
+
     def run(
+        self,
+        config: Any,
+        train_dataset: Dataset[Any] | None,
+        val_dataset: Dataset[Any] | None,
+        store: LightningStore | None,
+        llm_proxy: LLMProxy | None,
+        adapter: TraceAdapter[Any] | None,
+        trainer_cls: Type[AgentLightningTrainer],
+        daemon_cls: Type[AgentModeDaemon],
+    ) -> None:
+        """Always release task-owned resources, including failed initialization."""
+        try:
+            self._run(config, train_dataset, val_dataset, store, llm_proxy, adapter, trainer_cls, daemon_cls)
+        finally:
+            failed = sys.exc_info()[0] is not None
+            try:
+                self.close()
+            except Exception:
+                logger.exception("Failed to release VERL training resources")
+                if not failed:
+                    raise
+
+    def close(self) -> None:
+        """Release rollout subprocesses before removing their training workers."""
+        from ray.util.placement_group import remove_placement_group
+
+        errors: list[Exception] = []
+        try:
+            if self._uses_vllm:
+                from .async_server import shutdown_vllm_servers
+
+                shutdown_vllm_servers()
+        except Exception as error:
+            errors.append(error)
+        finally:
+            if self._resource_pool_manager is not None:
+                for pool in self._resource_pool_manager.resource_pool_dict.values():
+                    for placement_group in pool.pgs or []:
+                        try:
+                            remove_placement_group(placement_group)
+                        except Exception as error:
+                            logger.exception("Failed to remove a training placement group")
+                            errors.append(error)
+                self._resource_pool_manager = None
+        if errors:
+            raise RuntimeError("VERL resource cleanup did not complete successfully") from errors[0]
+
+    def _run(
         self,
         config: Any,
         train_dataset: Dataset[Any] | None,
@@ -183,6 +260,7 @@ class TaskRunner:
             from .async_server import install_vllm_server_patch
 
             install_vllm_server_patch()
+            self._uses_vllm = True
 
         strategy = config.actor_rollout_ref.actor.strategy
         if config.agentlightning.prefix_grouper.enabled:
@@ -216,6 +294,7 @@ class TaskRunner:
         resource_pool_manager = ResourcePoolManager(
             resource_pool_spec=resource_pool_spec, mapping=cast(dict[int, str], mapping)
         )
+        self._resource_pool_manager = resource_pool_manager
 
         reward_kwargs = config.reward.reward_model.get("reward_kwargs", {})
         reward_fn = load_reward_manager(config, tokenizer, **reward_kwargs)

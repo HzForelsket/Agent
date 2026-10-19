@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import random
+import sys
 from contextlib import contextmanager
 from copy import deepcopy
 from pprint import pprint
@@ -39,6 +41,8 @@ from agentlightning.llm_proxy import LLMProxy
 from agentlightning.store.base import LightningStore
 
 from .daemon import AgentModeDaemon
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "AgentLightningTrainer",
@@ -197,17 +201,33 @@ class AgentLightningTrainer(RayPPOTrainer):
         test_data = next(iter(self.val_dataloader))
         test_batch = DataProto.from_single_dict(test_data)
 
-        self.checkpoint_manager.update_weights(self.global_steps)
-        self.agent_mode_daemon.set_up_data_and_server(
-            test_batch.non_tensor_batch,
-            self.llm_server_manager.get_addresses(),
-            is_train=False,
-        )
-        self.agent_mode_daemon.run_until_all_finished()
-        test_metrics = self.agent_mode_daemon.get_test_metrics()
-        self.agent_mode_daemon.clear_data_and_server()
-        self.checkpoint_manager.sleep_replicas()
-        return test_metrics
+        try:
+            self.checkpoint_manager.update_weights(self.global_steps)
+            self.agent_mode_daemon.set_up_data_and_server(
+                test_batch.non_tensor_batch,
+                self.llm_server_manager.get_addresses(),
+                is_train=False,
+            )
+            self.agent_mode_daemon.run_until_all_finished()
+            return self.agent_mode_daemon.get_test_metrics()
+        finally:
+            self._cleanup_rollout()
+
+    def _cleanup_rollout(self, *, profile_rollout: bool = False) -> None:
+        """Attempt every cleanup action without hiding an active training error."""
+        failed = sys.exc_info()[0] is not None
+        actions = [self.agent_mode_daemon.clear_data_and_server, self.checkpoint_manager.sleep_replicas]
+        if profile_rollout:
+            actions.append(self.llm_server_manager.stop_profile)
+        errors = []
+        for action in actions:
+            try:
+                action()
+            except Exception as error:
+                logger.exception("Rollout cleanup failed: %s", action.__name__)
+                errors.append(error)
+        if errors and not failed:
+            raise errors[0]
 
     def _compute_reference_log_prob(self, batch: DataProto) -> DataProto:
         """Use VERL 0.9's TensorDict conversion and fused-reference routing."""
@@ -226,11 +246,11 @@ class AgentLightningTrainer(RayPPOTrainer):
 
             # generate a batch
             with _timer("gen", timing_raw):
-                with _timer("weight_sync", timing_raw):
-                    self.checkpoint_manager.update_weights(self.global_steps)
-                if profile_rollout:
-                    self.llm_server_manager.start_profile()
                 try:
+                    with _timer("weight_sync", timing_raw):
+                        self.checkpoint_manager.update_weights(self.global_steps)
+                    if profile_rollout:
+                        self.llm_server_manager.start_profile()
                     with _timer("rollout_setup", timing_raw):
                         self.agent_mode_daemon.set_up_data_and_server(
                             gen_batch.non_tensor_batch, self.llm_server_manager.get_addresses()
@@ -254,12 +274,9 @@ class AgentLightningTrainer(RayPPOTrainer):
                             prepare_prefix_groups=self.config.agentlightning.prefix_grouper.enabled,
                         )
                     metrics.update(agent_metrics)
-                    with _timer("rollout_cleanup", timing_raw):
-                        self.agent_mode_daemon.clear_data_and_server()
-                        self.checkpoint_manager.sleep_replicas()
                 finally:
-                    if profile_rollout:
-                        self.llm_server_manager.stop_profile()
+                    with _timer("rollout_cleanup", timing_raw):
+                        self._cleanup_rollout(profile_rollout=profile_rollout)
 
             batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
@@ -394,8 +411,7 @@ class AgentLightningTrainer(RayPPOTrainer):
                 # next, round to minibatch size
                 # VERL's actor multiplies the prompt mini-batch by rollout.n.
                 mini_batch_size = (
-                    self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-                    * self.config.actor_rollout_ref.rollout.n
+                    self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
                 )
                 n_transition = len(batch)
                 if self.config.agentlightning.prefix_grouper.enabled:
