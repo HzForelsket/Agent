@@ -28,6 +28,8 @@ from typing import Any, Literal, cast
 import httpx
 from omegaconf import OmegaConf
 from packaging.version import InvalidVersion, Version
+from prefix_grouper_stack import NPU_CANN_VERSION, REQUIRED_STACKS
+from prepare_prefix_grouper_2wikimqa import dataset_source, download_source_rows, prepare_dataset
 from transformers import AutoConfig
 from verl.workers.rollout.utils import get_max_position_embeddings
 
@@ -35,8 +37,6 @@ import agentlightning as agl
 from agentlightning.verl.accelerator import AcceleratorRuntime, Backend, select_accelerator
 from agentlightning.verl.model_download import materialize_model
 from agentlightning.verl.trainer import AgentLightningTrainer
-from prepare_prefix_grouper_2wikimqa import dataset_source, download_source_rows, prepare_dataset
-from prefix_grouper_stack import NPU_CANN_VERSION, REQUIRED_STACKS
 
 BENCHMARK_ID = "pg-2wikimqa-e2e"
 RESULT_SCHEMA_VERSION = 4
@@ -93,7 +93,7 @@ class BenchmarkTrainer(AgentLightningTrainer):
         record: dict[str, Any] = {
             "record_type": "step",
             "schema_version": RESULT_SCHEMA_VERSION,
-            "benchmark_id": BENCHMARK_ID,
+            "benchmark_id": str(config.trainer.benchmark_id),
             "mode": str(config.trainer.benchmark_mode),
             "backend": str(config.trainer.benchmark_backend),
             "global_step": self.global_steps,
@@ -207,7 +207,7 @@ async def wiki_agent(task: dict[str, Any], llm: agl.LLM, rollout: agl.Rollout) -
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": str(task["input"])},
     ]
-    request = {
+    request: dict[str, Any] = {
         "model": llm.model,
         "messages": messages,
         "temperature": 1.0,
@@ -215,6 +215,13 @@ async def wiki_agent(task: dict[str, Any], llm: agl.LLM, rollout: agl.Rollout) -
         "seed": request_seed,
         "return_token_ids": True,
     }
+    if "exact_response_tokens" in task:
+        request["stop"] = []
+        request["extra_body"] = {
+            "min_tokens": int(task["exact_response_tokens"]),
+            "ignore_eos": True,
+            "stop_token_ids": [],
+        }
     headers = {"Authorization": f"Bearer {llm.api_key or 'local-vllm'}"}
     endpoint = llm.endpoint.rstrip("/") + "/chat/completions"
     async with httpx.AsyncClient(timeout=300.0) as client:
@@ -237,7 +244,7 @@ async def wiki_agent(task: dict[str, Any], llm: agl.LLM, rollout: agl.Rollout) -
             {
                 "record_type": "rollout",
                 "schema_version": RESULT_SCHEMA_VERSION,
-                "benchmark_id": BENCHMARK_ID,
+                "benchmark_id": task["benchmark_id"],
                 "sample_id": task["sample_id"],
                 "prompt_tokens": len(prompt_ids),
                 "prompt_token_ids": prompt_ids,
@@ -261,6 +268,9 @@ def load_dataset(
     benchmark_seed: int,
     min_prompt_tokens: int | None,
     max_prompt_tokens: int | None,
+    *,
+    dataset_name: str = DATASET_NAME,
+    benchmark_id: str = BENCHMARK_ID,
 ) -> list[dict[str, Any]]:
     """Load and validate the maintained 2WikiMQA JSONL schema."""
     rows: list[dict[str, Any]] = []
@@ -270,8 +280,8 @@ def load_dataset(
             if not line.strip():
                 continue
             source = cast(dict[str, Any], json.loads(line))
-            if source.get("dataset") != DATASET_NAME:
-                raise ValueError(f"{path}:{line_number} is not marked as {DATASET_NAME}.")
+            if source.get("dataset") != dataset_name:
+                raise ValueError(f"{path}:{line_number} is not marked as {dataset_name}.")
             if source.get("input_policy") != "filter-untruncated":
                 raise ValueError(f"{path}:{line_number} is not an untruncated, token-filtered workload row.")
             sample_id = str(source["sample_id"])
@@ -299,12 +309,15 @@ def load_dataset(
                     "sample_id": sample_id,
                     "prompt_tokens": prompt_tokens,
                     "benchmark_seed": benchmark_seed,
+                    "benchmark_id": benchmark_id,
                 }
             )
     return rows
 
 
-def resolve_workload_limits(args: argparse.Namespace, dataset: list[dict[str, Any]]) -> None:
+def resolve_workload_limits(
+    args: argparse.Namespace, dataset: list[dict[str, Any]], *, exact_response_length: bool = False
+) -> None:
     """Resolve finite engine capacities without adding implicit workload limits."""
     if args.steps is None:
         if len(dataset) % args.train_batch_size:
@@ -323,6 +336,10 @@ def resolve_workload_limits(args: argparse.Namespace, dataset: list[dict[str, An
             f"{model_context_length}-token context. Use a longer-context model or explicit prompt filtering."
         )
     args.resolved_max_prompt_tokens = observed_max_prompt
+    if exact_response_length and (
+        args.max_response_tokens is None or observed_max_prompt + args.max_response_tokens > model_context_length
+    ):
+        raise ValueError("Exact response length requires a positive output budget fitting after every prompt.")
     args.resolved_max_model_len = (
         model_context_length
         if args.max_response_tokens is None
@@ -333,6 +350,8 @@ def resolve_workload_limits(args: argparse.Namespace, dataset: list[dict[str, An
         row["request_max_tokens"] = (
             remaining if args.max_response_tokens is None else min(args.max_response_tokens, remaining)
         )
+        if exact_response_length:
+            row["exact_response_tokens"] = args.max_response_tokens
     args.resolved_max_response_tokens = max(row["request_max_tokens"] for row in dataset)
 
 
@@ -376,6 +395,7 @@ def build_config(
     tensor_model_parallel_size: int,
     metrics_path: Path,
     dataset_size: int,
+    benchmark_id: str = BENCHMARK_ID,
 ) -> dict[str, Any]:
     """Build an accelerator-neutral VERL configuration for the fixed workload."""
     mode: Mode = args.mode
@@ -466,6 +486,7 @@ def build_config(
             "benchmark_metrics_path": str(metrics_path),
             "benchmark_mode": mode,
             "benchmark_backend": backend,
+            "benchmark_id": benchmark_id,
         },
     }
     if mode == "prefix_grouper":
@@ -522,7 +543,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _requested_backend(device: str) -> Backend:
+def requested_backend(device: str) -> Backend:
+    """Resolve the explicit backend for hardware-free configuration preparation."""
     normalized = device.lower()
     if normalized in {"gpu", "cuda"}:
         return "gpu"
@@ -646,6 +668,10 @@ def run_benchmark(
     metrics_path: Path,
     responses_path: Path,
     stack: dict[str, str],
+    *,
+    benchmark_id: str = BENCHMARK_ID,
+    dataset_name: str = DATASET_NAME,
+    response_policy: str | None = None,
 ) -> None:
     """Launch the production Agent Lightning VERL training entrypoint."""
     runtime.set_device()
@@ -653,6 +679,10 @@ def run_benchmark(
     started_at = datetime.now(timezone.utc).isoformat()
     started = time.perf_counter()
     algorithm = agl.VERL(config, trainer_cls=BenchmarkTrainer)
+    (metrics_path.parent / "resolved_config.json").write_text(
+        json.dumps(OmegaConf.to_container(algorithm.config, resolve=True), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     trainer = agl.Trainer(
         algorithm=algorithm,
         n_runners=args.n_runners,
@@ -663,8 +693,8 @@ def run_benchmark(
     record = {
         "record_type": "run",
         "schema_version": RESULT_SCHEMA_VERSION,
-        "benchmark_id": BENCHMARK_ID,
-        "dataset": DATASET_NAME,
+        "benchmark_id": benchmark_id,
+        "dataset": dataset_name,
         "mode": args.mode,
         "backend": runtime.backend,
         "npu_attention_backend": args.npu_attention_backend if args.mode == "prefix_grouper" else None,
@@ -677,7 +707,8 @@ def run_benchmark(
         "micro_batch_size_per_device": args.micro_batch_size_per_device,
         "rollouts_per_sample": args.rollouts_per_sample,
         "input_policy": "filter-untruncated",
-        "response_policy": "model-context" if args.max_response_tokens is None else "truncate-at-max-tokens",
+        "response_policy": response_policy
+        or ("model-context" if args.max_response_tokens is None else "truncate-at-max-tokens"),
         "min_prompt_tokens": args.min_prompt_tokens,
         "max_prompt_tokens": args.max_prompt_tokens,
         "max_response_tokens": args.max_response_tokens,
@@ -724,7 +755,7 @@ def main() -> None:
         raise ValueError("--min-prompt-tokens cannot exceed --max-prompt-tokens.")
     runtime: AcceleratorRuntime | None = None
     if args.dry_run:
-        backend = _requested_backend(args.device)
+        backend = requested_backend(args.device)
         available_devices = None
     else:
         runtime = select_accelerator(args.device)

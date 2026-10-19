@@ -1,102 +1,78 @@
 #!/usr/bin/env python3
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Test real rollout-to-GRPO training with exact prompt/response token lengths.
-
-Usage (from the repository root, on a machine with a usable accelerator)::
+"""Prepare fixed-length chat inputs, then run the shared 2WikiMQA E2E pipeline.
 
     python scripts/test_fixed_length_e2e.py --mode simple --model /path/to/model \
         --prompt-tokens 128 --response-tokens 32 --output-dir /tmp/fixed-length-e2e
 
-``--prepare-only`` validates the local tokenizer/context and writes inputs and
-configuration without starting Ray, loading model weights, or running rollout.
-See FIXED_LENGTH_E2E.md for the acceptance criteria and synthetic reward policy.
+Input lengths include the chat template. Output length is exact, with EOS ignored.
+``--prepare-only --device gpu`` writes the dataset and resolved configuration
+without loading model weights, starting Ray, or running training.
 """
 
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import importlib.metadata
 import json
-import math
 import platform
 import shutil
 import sys
 import traceback
-from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
+BENCHMARK_ID = "fixed-length-e2e"
+DATASET_NAME = "FixedLength"
+
 
 def write_json(path: Path, value: Any) -> None:
-    """Write a human-readable configuration or final result."""
+    """Persist run configuration and completion state."""
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
-def append_event(path: Path, record: dict[str, Any]) -> None:
-    """Persist each completed stage across runner and Ray processes."""
-    with path.open("a", encoding="utf-8") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        try:
-            stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
-            stream.flush()
-        finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-
-
 def parse_args() -> argparse.Namespace:
-    """Parse and reject invalid resource/length configurations before setup."""
+    """Parse dataset lengths and the same resource defaults as the Wiki entrypoint."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("no-share", "simple"), default="no-share")
-    parser.add_argument("--model", type=Path, required=True, help="Local pretrained model/tokenizer directory.")
-    parser.add_argument("--prompt-tokens", type=int, required=True)
-    parser.add_argument("--response-tokens", type=int, required=True)
-    parser.add_argument("--steps", type=int, default=1)
-    parser.add_argument("--train-batch-size", type=int, default=2)
-    parser.add_argument("--rollouts-per-sample", type=int, default=2)
-    parser.add_argument("--n-devices", type=int, default=1)
-    parser.add_argument("--tensor-parallel-size", type=int, default=1)
-    parser.add_argument("--micro-batch-size", type=int, help="Defaults to --rollouts-per-sample in both modes.")
-    parser.add_argument("--n-runners", type=int, default=2)
+    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--prompt-tokens", type=int, required=True, help="Exact input length including chat template.")
+    parser.add_argument("--response-tokens", type=int, required=True, help="Exact generated length; EOS is ignored.")
+    parser.add_argument("--dataset-size", type=int, default=64)
+    parser.add_argument("--steps", type=int, help="Defaults to one full dataset epoch, as in the Wiki entrypoint.")
+    parser.add_argument("--train-batch-size", type=int, default=8)
+    parser.add_argument("--rollouts-per-sample", type=int, default=4)
+    parser.add_argument("--micro-batch-size", type=int, default=2)
+    parser.add_argument("--n-devices", type=int, help="Defaults to the number of visible devices.")
+    parser.add_argument("--tensor-parallel-size", type=int, help="Defaults to --n-devices.")
+    parser.add_argument("--n-runners", type=int, default=16)
     parser.add_argument("--device", choices=("auto", "gpu", "npu"), default="auto")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--request-timeout", type=float, default=300.0)
-    parser.add_argument(
-        "--output-dir", type=Path, required=True, help="New directory; never overwrites an existing run."
-    )
+    parser.add_argument("--seed", type=int, default=20260827)
+    parser.add_argument("--output-dir", type=Path, required=True, help="New run directory; never overwrites a run.")
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
-    if args.micro_batch_size is None:
-        args.micro_batch_size = args.rollouts_per_sample
     for name in (
         "prompt_tokens",
         "response_tokens",
+        "dataset_size",
         "steps",
         "train_batch_size",
         "rollouts_per_sample",
+        "micro_batch_size",
         "n_devices",
         "tensor_parallel_size",
-        "micro_batch_size",
         "n_runners",
     ):
-        if getattr(args, name) <= 0:
+        value = getattr(args, name)
+        if value is not None and value <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.dataset_size < args.train_batch_size:
+        parser.error("--dataset-size must be at least --train-batch-size")
     if args.rollouts_per_sample < 2:
-        parser.error("GRPO requires --rollouts-per-sample >= 2 for a nonzero advantage")
-    if args.n_devices % args.tensor_parallel_size:
-        parser.error("--tensor-parallel-size must divide --n-devices")
-    if args.train_batch_size * args.rollouts_per_sample % (args.n_devices * args.micro_batch_size):
-        parser.error("train-batch-size * rollouts-per-sample must be divisible by n-devices * micro-batch-size")
-    if args.mode == "simple":
-        if args.train_batch_size % args.n_devices:
-            parser.error("simple requires --train-batch-size divisible by --n-devices to keep prompt groups intact")
-        if args.micro_batch_size % args.rollouts_per_sample:
-            parser.error("simple requires --micro-batch-size to be a multiple of --rollouts-per-sample")
-    if not math.isfinite(args.request_timeout) or args.request_timeout <= 0:
-        parser.error("--request-timeout must be finite and positive")
+        parser.error("GRPO requires --rollouts-per-sample >= 2")
     if not 0 <= args.seed < 2**31:
         parser.error("--seed must be in [0, 2**31)")
     args.model = args.model.expanduser().resolve()
@@ -106,436 +82,156 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def prepare_dataset(args: argparse.Namespace) -> list[dict[str, Any]]:
-    """Create deterministic token-native synthetic prompts without retokenization."""
-    from transformers import AutoConfig, AutoTokenizer
+def prepare_dataset(args: argparse.Namespace) -> Path:
+    """Generate exact-length synthetic QA chats in the Wiki dataset schema."""
+    from benchmark_prefix_grouper_2wikimqa_e2e import SYSTEM_PROMPT
+    from prepare_prefix_grouper_2wikimqa import build_user_prompt, chat_length
+    from transformers import AutoTokenizer
 
-    model_config: Any = cast(Any, AutoConfig).from_pretrained(args.model, local_files_only=True)
-    text_config = model_config.get_text_config()
-    context_length = getattr(text_config, "max_position_embeddings", None)
-    if not isinstance(context_length, int):
-        raise ValueError("The model must declare max_position_embeddings for context validation.")
-    if args.prompt_tokens + args.response_tokens > context_length:
-        raise ValueError(
-            f"prompt + response = {args.prompt_tokens + args.response_tokens} exceeds model context {context_length}"
-        )
     tokenizer: Any = cast(Any, AutoTokenizer).from_pretrained(args.model, local_files_only=True)
-    rows: list[dict[str, Any]] = []
-    for sample_id in range(args.train_batch_size):
-        source_ids: list[int] = tokenizer.encode(
-            f"Sample {sample_id}. Continue the following text: The river flows through the quiet valley. ",
-            add_special_tokens=False,
-        )
-        source_ids = [int(token) for token in source_ids if token not in tokenizer.all_special_ids]
-        if not source_ids:
-            raise ValueError("Tokenizer produced no ordinary prompt tokens.")
-        prompt_ids = (source_ids * math.ceil(args.prompt_tokens / len(source_ids)))[: args.prompt_tokens]
-        rows.append({"sample_id": sample_id, "prompt_token_ids": prompt_ids})
-    return rows
+    dataset_path = args.output_dir / "dataset.jsonl"
+    with dataset_path.open("x", encoding="utf-8") as stream:
+        for sample_id in range(args.dataset_size):
+            answer = ("river", "forest", "mountain", "ocean")[sample_id % 4]
+            context = f"Title: Record {sample_id}\nThe answer word in this record is {answer}.\n"
 
+            def prompt_with_padding(count: int) -> str:
+                return build_user_prompt(context + " x" * count, "What is the answer word in this record?")
 
-def build_config(args: argparse.Namespace) -> dict[str, Any]:
-    """Select the production standard or simple shared-prefix FSDP path."""
-    # Match the random-token pg-verl-ppa worker's execution settings. In
-    # particular, actor.use_torch_compile alone does not override the FSDP
-    # engine's own default, including its entropy kernel compilation.
-    fsdp_config = {
-        "model_dtype": "bfloat16",
-        "dtype": "bfloat16",
-        "mixed_precision": {
-            "param_dtype": "bfloat16",
-            "reduce_dtype": "float32",
-            "buffer_dtype": "float32",
-        },
-        "use_torch_compile": False,
-        "ulysses_sequence_parallel_size": 1,
-        "seed": args.seed,
-    }
-    config: dict[str, Any] = {
-        "algorithm": {"adv_estimator": "grpo", "use_kl_in_reward": False},
-        "agentlightning": {"model_name": "fixed-length-e2e", "trace_aggregator": {"level": "transition"}},
-        "data": {
-            "train_batch_size": args.train_batch_size,
-            "max_prompt_length": args.prompt_tokens,
-            "max_response_length": args.response_tokens,
-            "filter_overlong_prompts": False,
-            "seed": args.seed,
-        },
-        "actor_rollout_ref": {
-            "model": {
-                "path": str(args.model),
-                "override_config": {"attn_implementation": "sdpa", "use_cache": False},
-                "use_remove_padding": False,
-                "use_fused_kernels": False,
-                "enable_gradient_checkpointing": True,
-            },
-            "rollout": {
-                "name": "vllm",
-                "mode": "async",
-                "tensor_model_parallel_size": args.tensor_parallel_size,
-                "n": args.rollouts_per_sample,
-                "temperature": 1.0,
-                "top_p": 1.0,
-                "seed": args.seed,
-                "prompt_length": args.prompt_tokens,
-                "response_length": args.response_tokens,
-                "max_model_len": args.prompt_tokens + args.response_tokens,
-                "gpu_memory_utilization": 0.35,
-                "log_prob_micro_batch_size_per_gpu": args.micro_batch_size,
-                "log_prob_use_dynamic_bsz": False,
-                "multi_turn": {"enable": False},
-            },
-            "actor": {
-                "strategy": "fsdp",
-                "ppo_mini_batch_size": args.train_batch_size,
-                "ppo_micro_batch_size_per_gpu": args.micro_batch_size,
-                "ppo_epochs": 1,
-                "shuffle": False,
-                "use_dynamic_bsz": False,
-                "optim": {"lr": 1e-6},
-                "use_kl_loss": True,
-                "kl_loss_coef": 0.0,
-                "entropy_coeff": 0.0,
-                "use_torch_compile": False,
-                "fsdp_config": {**fsdp_config, "param_offload": True, "optimizer_offload": True},
-            },
-            "ref": {
-                "log_prob_micro_batch_size_per_gpu": args.micro_batch_size,
-                "log_prob_use_dynamic_bsz": False,
-                "fsdp_config": {**fsdp_config, "param_offload": True},
-            },
-        },
-        "trainer": {
-            "n_gpus_per_node": args.n_devices,
-            "nnodes": 1,
-            "balance_batch": False,
-            "val_before_train": False,
-            "critic_warmup": 0,
-            "logger": ["console"],
-            "project_name": "FixedLengthE2E",
-            "experiment_name": "fixed-length",
-            "save_freq": -1,
-            "test_freq": -1,
-            "resume_mode": "disable",
-            "total_epochs": args.steps,
-            "total_training_steps": args.steps,
-            "default_local_dir": str(args.output_dir / "checkpoints"),
-        },
-    }
-    if args.mode == "simple":
-        # The production worker inherits the same PrefixGrouperTrainingWorker
-        # used by pg-verl-ppa: reuse its packing and attention implementation.
-        config["agentlightning"]["prefix_grouper"] = {"enabled": True}
-        config["actor_rollout_ref"]["model"]["override_config"]["prefix_grouper_npu_backend"] = "fusion"
-    return config
-
-
-def runtime_components(args: argparse.Namespace) -> tuple[Any, Any, Any]:
-    """Build test observers using the public trainer/daemon extension points."""
-    import httpx
-    import torch
-
-    import agentlightning as agl
-    from agentlightning.verl.daemon import AgentModeDaemon
-    from agentlightning.verl.trainer import AgentLightningTrainer
-
-    events_path = args.output_dir / "events.jsonl"
-    expected_rows = args.train_batch_size * args.rollouts_per_sample
-
-    def check_batch(batch: Any) -> None:
-        tensors = batch.batch
-        if len(batch) != expected_rows:
-            raise AssertionError(f"Expected {expected_rows} training rows, got {len(batch)}")
-        if tuple(tensors["prompts"].shape) != (expected_rows, args.prompt_tokens):
-            raise AssertionError("Training prompt tensor shape does not match the requested length")
-        if tuple(tensors["responses"].shape) != (expected_rows, args.response_tokens):
-            raise AssertionError("Training response tensor shape does not match the requested length")
-        if not bool((tensors["attention_mask"] == 1).all()):
-            raise AssertionError("Training batch contains padding or missing response tokens")
-        if bool(tensors["is_drop_mask"].any()):
-            raise AssertionError("Training batch contains a dropped/truncated prompt")
-        counts: Counter[str] = Counter(cast(list[str], batch.non_tensor_batch["data_id_list"]))
-        if len(counts) != args.train_batch_size or set(counts.values()) != {args.rollouts_per_sample}:
-            raise AssertionError(f"Incomplete GRPO groups: {dict(counts)}")
-        if args.mode == "simple":
-            group_ids: list[int] = [int(value) for value in batch.non_tensor_batch["prefix_group_id"]]
-            groups: dict[int, list[int]] = {}
-            for row, group_id in enumerate(group_ids):
-                groups.setdefault(group_id, []).append(row)
-            if len(groups) != args.train_batch_size:
-                raise AssertionError("simple did not produce one prefix group per prompt")
-            for rows in groups.values():
-                if len(rows) != args.rollouts_per_sample:
-                    raise AssertionError("simple split a prompt's sibling rollouts into different prefix groups")
-                if len({str(batch.non_tensor_batch["data_id_list"][row]) for row in rows}) != 1:
-                    raise AssertionError("simple merged different GRPO groups")
-                if not bool((tensors["prompts"][rows] == tensors["prompts"][rows[0]]).all()):
-                    raise AssertionError("simple prefix group contains unequal prompts")
-
-    class FixedLengthDaemon(AgentModeDaemon):
-        """Expose token-native completions and observe real trace conversion."""
-
-        def _build_rollout_resources(
-            self, llm_resource: agl.LLM, server_addresses: list[str], is_train: bool
-        ) -> agl.NamedResources:
-            resources = super()._build_rollout_resources(llm_resource, server_addresses, is_train)
-            if not server_addresses:
-                raise RuntimeError("No live rollout servers")
-            # Hosted-vLLM LiteLLM routes transform token prompts into chat text.
-            # Use the real training servers' native completion API, then emit the
-            # exact serving IDs through the standard tracer and triplet adapter.
-            for index, address in enumerate(server_addresses):
-                resources[f"completion_{index}"] = agl.LLM(
-                    endpoint=f"http://{address}/v1",
-                    model=self.model_name,
+            minimum_length = chat_length(tokenizer, prompt_with_padding(0))
+            if minimum_length > args.prompt_tokens:
+                raise ValueError(
+                    f"Sample {sample_id} needs at least {minimum_length} prompt tokens including the chat template."
                 )
-            return resources
-
-        def get_train_data_batch(
-            self,
-            max_prompt_length: int,
-            max_response_length: int,
-            device: torch.device,
-            global_steps: int,
-            *,
-            prepare_prefix_groups: bool = False,
-        ) -> Any:
-            if prepare_prefix_groups != (args.mode == "simple"):
-                raise AssertionError("Trainer prefix grouping does not match the requested mode")
-            batch, metrics = super().get_train_data_batch(
-                max_prompt_length,
-                max_response_length,
-                device,
-                global_steps,
-                prepare_prefix_groups=prepare_prefix_groups,
+            lower, upper = 0, args.prompt_tokens
+            while lower <= upper:
+                count = (lower + upper) // 2
+                prompt = prompt_with_padding(count)
+                length = chat_length(tokenizer, prompt)
+                if length == args.prompt_tokens:
+                    break
+                if length < args.prompt_tokens:
+                    lower = count + 1
+                else:
+                    upper = count - 1
+            else:
+                raise ValueError(f"Tokenizer cannot render sample {sample_id} at exactly {args.prompt_tokens} tokens.")
+            prompt_ids = tokenizer.apply_chat_template(
+                [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                tokenize=True,
             )
-            check_batch(batch)
-            append_event(
-                events_path,
-                {
-                    "stage": "trace_conversion",
-                    "mode": args.mode,
-                    "step": global_steps,
-                    "rows": len(batch),
-                    "prompt_tokens": args.prompt_tokens,
-                    "response_tokens": args.response_tokens,
-                },
-            )
-            return batch, metrics
-
-    class FixedLengthAgent(agl.LitAgent[dict[str, Any]]):
-        """Generate real tokens and supply a deterministic, nonconstant test reward."""
-
-        async def rollout_async(
-            self, task: dict[str, Any], resources: agl.NamedResources, rollout: agl.Rollout
-        ) -> float:
-            metadata = rollout.metadata or {}
-            index = metadata.get("rollout_index")
-            if type(index) is not int or not 0 <= index < args.rollouts_per_sample:
-                raise AssertionError("Missing or invalid rollout_index")
-            endpoints = [
-                value
-                for key, value in sorted(resources.items())
-                if key.startswith("completion_") and isinstance(value, agl.LLM)
-            ]
-            if not endpoints:
-                raise RuntimeError("No completion LLM resource")
-            server_index = (int(task["sample_id"]) * int(args.rollouts_per_sample) + index) % len(endpoints)
-            llm: agl.LLM = endpoints[server_index]
-            prompt_ids = [int(token) for token in task["prompt_token_ids"]]
-            seed_bytes = f"{args.seed}:{task['sample_id']}:{index}".encode()
-            request_seed = int.from_bytes(hashlib.sha256(seed_bytes).digest()[:4], "big") % 2**31
-            request = {
-                "model": llm.model,
-                "prompt": prompt_ids,
-                "max_tokens": args.response_tokens,
-                "min_tokens": args.response_tokens,
-                "ignore_eos": True,
-                "stop": [],
-                "stop_token_ids": [],
-                "add_special_tokens": False,
-                "return_token_ids": True,
-                "temperature": 1.0,
-                "top_p": 1.0,
-                "seed": request_seed,
-                "n": 1,
-                "stream": False,
-                "echo": False,
+            if hasattr(prompt_ids, "keys"):
+                prompt_ids = prompt_ids["input_ids"]
+            row = {
+                "dataset": DATASET_NAME,
+                "sample_id": str(sample_id),
+                "prompt": prompt,
+                "answers": [answer],
+                "prompt_tokens": len(prompt_ids),
+                "prompt_token_ids": [int(token) for token in prompt_ids],
+                "input_policy": "filter-untruncated",
             }
-            async with httpx.AsyncClient(timeout=args.request_timeout) as client:
-                response = await client.post(llm.endpoint.rstrip("/") + "/completions", json=request)
-                response.raise_for_status()
-                payload = response.json()
-            choices = payload.get("choices", [])
-            if len(choices) != 1:
-                raise AssertionError(f"Expected one completion, got {len(choices)}")
-            choice = choices[0]
-            actual_prompt = choice.get("prompt_token_ids")
-            raw_response_ids: Any = choice.get("token_ids")
-            if actual_prompt != prompt_ids or len(prompt_ids) != args.prompt_tokens:
-                raise AssertionError("Serving prompt token IDs differ from the exact input")
-            if (
-                not isinstance(raw_response_ids, list)
-                or len(cast(list[Any], raw_response_ids)) != args.response_tokens
-                or not all(type(token) is int for token in cast(list[Any], raw_response_ids))
-            ):
-                raise AssertionError(f"Serving response must contain exactly {args.response_tokens} token IDs")
-            response_ids = cast(list[int], raw_response_ids)
-            if choice.get("finish_reason") != "length":
-                raise AssertionError(f"Unexpected finish_reason: {choice.get('finish_reason')}")
-            usage = payload.get("usage", {})
-            if (
-                usage.get("prompt_tokens") != args.prompt_tokens
-                or usage.get("completion_tokens") != args.response_tokens
-            ):
-                raise AssertionError(f"Serving usage does not match the requested lengths: {usage}")
-            tracer = agl.get_active_tracer()
-            if tracer is None:
-                raise RuntimeError("No active Agent Lightning tracer")
-            tracer.create_span(
-                "litellm_request",
-                attributes={
-                    "gen_ai.request.model": llm.model,
-                    "gen_ai.response.id": payload["id"],
-                    "prompt_token_ids": actual_prompt,
-                    "response_token_ids": response_ids,
-                },
-            )
-            # Deliberately synthetic: distinct group rewards exercise GRPO even
-            # when the model emits identical completions. This is not a quality score.
-            reward = index / (args.rollouts_per_sample - 1)
-            append_event(
-                events_path,
-                {
-                    "stage": "rollout",
-                    "mode": args.mode,
-                    "rollout_id": rollout.rollout_id,
-                    "sample_id": int(task["sample_id"]),
-                    "rollout_index": index,
-                    "request_seed": request_seed,
-                    "reward": reward,
-                    "prompt_token_ids": actual_prompt,
-                    "response_token_ids": response_ids,
-                    "prompt_tokens": len(actual_prompt),
-                    "response_tokens": len(response_ids),
-                    "finish_reason": choice["finish_reason"],
-                },
-            )
-            return reward
-
-    class FixedLengthTrainer(AgentLightningTrainer):
-        """Check the batch immediately before the production actor update."""
-
-        def _update_actor(self, batch: Any) -> Any:
-            check_batch(batch)
-            if args.mode == "simple":
-                group_ids = [int(value) for value in batch.non_tensor_batch["prefix_group_id"]]
-                for start in range(0, len(batch), args.micro_batch_size):
-                    counts = Counter(group_ids[start : start + args.micro_batch_size])
-                    if set(counts.values()) != {args.rollouts_per_sample}:
-                        raise AssertionError("Actor micro-batch would split a shared-prefix group")
-            for name in ("old_log_probs", "ref_log_prob", "advantages", "returns"):
-                if not bool(torch.isfinite(batch.batch[name]).all()):
-                    raise AssertionError(f"Nonfinite training tensor: {name}")
-            if not bool((batch.batch["response_mask"] == 1).all()):
-                raise AssertionError("Actor response mask excludes generated tokens")
-            if not bool(batch.batch["advantages"].abs().sum() > 0):
-                raise AssertionError("GRPO produced only zero advantages")
-            append_event(
-                events_path,
-                {
-                    "stage": "actor_input",
-                    "mode": args.mode,
-                    "step": self.global_steps,
-                    "rows": len(batch),
-                },
-            )
-            return super()._update_actor(batch)
-
-        def _train_step(self, batch_dict: dict[str, Any], *, profile_rollout: bool = False) -> dict[str, Any]:
-            metrics: dict[str, Any] = cast(Any, super())._train_step(batch_dict, profile_rollout=profile_rollout)
-            # Save available measurements before evaluating the pass criteria.
-            numeric = {}
-            for key, value in metrics.items():
-                if hasattr(value, "item"):
-                    value = value.item()
-                if isinstance(value, (int, float)):
-                    numeric[key] = value if math.isfinite(value) else str(value)
-            append_event(
-                events_path,
-                {
-                    "stage": "step_metrics",
-                    "mode": args.mode,
-                    "step": self.global_steps,
-                    "metrics": numeric,
-                },
-            )
-            for stage in ("gen", "trace_conversion", "old_log_prob", "ref", "adv", "update_actor"):
-                value = float(metrics[f"timing_s/{stage}"])
-                if not math.isfinite(value) or value <= 0:
-                    raise AssertionError(f"Training stage did not complete: {stage}")
-            grad_norm = float(metrics["actor/grad_norm"])
-            if not math.isfinite(grad_norm) or grad_norm <= 0:
-                raise AssertionError(f"Expected a finite nonzero actor gradient, got {grad_norm}")
-            for key in ("actor/pg_loss", "actor/lr"):
-                if not math.isfinite(float(metrics[key])):
-                    raise AssertionError(f"Nonfinite actor metric: {key}")
-            if float(metrics["actor/lr"]) <= 0:
-                raise AssertionError("Actor learning rate is zero")
-            append_event(events_path, {"stage": "step_passed", "mode": args.mode, "step": self.global_steps})
-            return metrics
-
-    return FixedLengthAgent, FixedLengthDaemon, FixedLengthTrainer
+            stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        stream.flush()
+    return dataset_path
 
 
-def run_training(args: argparse.Namespace, dataset: list[dict[str, Any]], config: dict[str, Any]) -> None:
-    """Run the ordinary trainer and require all requested steps and rollouts."""
+def wiki_arguments(args: argparse.Namespace, dataset_path: Path) -> argparse.Namespace:
+    """Translate the fixed-length input options to the common execution contract."""
+    return argparse.Namespace(
+        **{
+            **vars(args),
+            "mode": "prefix_grouper" if args.mode == "simple" else "baseline",
+            "model": str(args.model),
+            "model_ref": str(args.model),
+            "model_name": "fixed-length-e2e",
+            "dataset_path": dataset_path,
+            "dataset_source": {
+                "kind": "synthetic-fixed-length-chat",
+                "sha256": hashlib.sha256(dataset_path.read_bytes()).hexdigest(),
+            },
+            "min_prompt_tokens": args.prompt_tokens,
+            "max_prompt_tokens": args.prompt_tokens,
+            "max_response_tokens": args.response_tokens,
+            "micro_batch_size_per_device": args.micro_batch_size,
+            "n_devices_per_node": args.n_devices,
+            "tensor_model_parallel_size": args.tensor_parallel_size,
+            "npu_attention_backend": "fusion",
+        }
+    )
+
+
+def run(args: argparse.Namespace) -> None:
+    """Reuse Wiki configuration, agent, trainer, rollout path, and metric recording."""
+    import benchmark_prefix_grouper_2wikimqa_e2e as wiki
+    from omegaconf import OmegaConf
+
     import agentlightning as agl
     from agentlightning.verl.accelerator import select_accelerator
 
-    runtime = select_accelerator(args.device)
-    if runtime.module.device_count() < args.n_devices:
-        raise ValueError(f"Requested {args.n_devices} devices, found {runtime.module.device_count()}")
-    runtime.set_device()
-    write_json(args.output_dir / "device.json", {"backend": runtime.backend, "name": runtime.device_name()})
-    agent_cls, daemon_cls, trainer_cls = runtime_components(args)
-    algorithm = agl.VERL(config, trainer_cls=trainer_cls, daemon_cls=daemon_cls)
-    from omegaconf import OmegaConf
-
-    write_json(args.output_dir / "resolved_config.json", OmegaConf.to_container(algorithm.config, resolve=True))
-    trainer = agl.Trainer(
-        algorithm=algorithm,
-        n_runners=args.n_runners,
-        tracer=agl.OtelTracer(),
-        adapter=agl.LlmProxyTraceToTriplet(),
+    dataset_path = prepare_dataset(args)
+    common_args = wiki_arguments(args, dataset_path)
+    runtime = None if args.prepare_only else select_accelerator(args.device)
+    backend = wiki.requested_backend(args.device) if runtime is None else runtime.backend
+    available_devices = None if runtime is None else int(runtime.module.device_count())
+    stack = wiki.installed_stack(backend)
+    wiki.check_stack(backend, stack)
+    devices, tensor_parallel_size = wiki.resolve_resources(common_args, available_devices)
+    dataset = wiki.load_dataset(
+        dataset_path,
+        args.seed,
+        args.prompt_tokens,
+        args.prompt_tokens,
+        dataset_name=DATASET_NAME,
+        benchmark_id=BENCHMARK_ID,
     )
-    trainer.fit(agent_cls(), train_dataset=dataset, val_dataset=dataset)
-    events = [json.loads(line) for line in (args.output_dir / "events.jsonl").read_text().splitlines()]
-    for stage in ("trace_conversion", "actor_input", "step_metrics", "step_passed"):
-        steps = [event["step"] for event in events if event["stage"] == stage]
-        if sorted(steps) != list(range(1, args.steps + 1)):
-            raise AssertionError(f"Incomplete or duplicate {stage} stages: {steps}")
-    rollouts = [event for event in events if event["stage"] == "rollout"]
-    expected = args.steps * args.train_batch_size * args.rollouts_per_sample
-    if len(rollouts) != expected or len({event["rollout_id"] for event in rollouts}) != expected:
-        raise AssertionError(f"Expected {expected} distinct successful rollouts, got {len(rollouts)} records")
+    wiki.resolve_workload_limits(common_args, dataset, exact_response_length=True)
+    config = wiki.build_config(
+        args=common_args,
+        backend=backend,
+        n_devices_per_node=devices,
+        tensor_model_parallel_size=tensor_parallel_size,
+        metrics_path=args.output_dir / "metrics.jsonl",
+        dataset_size=len(dataset),
+        benchmark_id=BENCHMARK_ID,
+    )
+    write_json(args.output_dir / "config.json", config)
+    if args.prepare_only:
+        # Wiki dry-run also resolves VERL configuration without creating workers.
+        algorithm = agl.VERL(config, trainer_cls=wiki.BenchmarkTrainer)
+        write_json(args.output_dir / "resolved_config.json", OmegaConf.to_container(algorithm.config, resolve=True))
+        write_json(args.output_dir / "result.json", {"status": "prepared", "training_executed": False})
+        print(f"PREPARED: {dataset_path}; training was not executed.", flush=True)
+        return
+    if runtime is None:
+        raise RuntimeError("Training requires an accelerator runtime.")
+    metrics_path, responses_path = wiki.prepare_outputs(args.output_dir, overwrite=False)
+    wiki.run_benchmark(
+        common_args,
+        runtime,
+        dataset,
+        config,
+        metrics_path,
+        responses_path,
+        stack,
+        benchmark_id=BENCHMARK_ID,
+        dataset_name=DATASET_NAME,
+        response_policy="exact-tokens",
+    )
+    # Length/completeness checks run after the timed training pipeline.
+    from report_fixed_length_e2e import load_fixed_artifacts
+
+    load_fixed_artifacts(args.output_dir, common_args.mode)
     write_json(
         args.output_dir / "result.json",
-        {
-            "status": "passed",
-            "mode": args.mode,
-            "steps": args.steps,
-            "rollouts": expected,
-            "prompt_tokens": args.prompt_tokens,
-            "response_tokens": args.response_tokens,
-            "reward_policy": "synthetic-rollout-index",
-            "nonzero_actor_gradient": True,
-        },
+        {"status": "passed", "mode": args.mode, "steps": common_args.steps, "response_tokens": args.response_tokens},
     )
+    print(f"PASSED: {args.output_dir / 'result.json'}", flush=True)
 
 
 def main() -> None:
-    """Prepare durable run metadata before any model/runtime initialization."""
+    """Persist preparation metadata and retain completed results on failure."""
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=False)
     print(f"OUTPUT_DIR={args.output_dir}", flush=True)
@@ -557,42 +253,21 @@ def main() -> None:
                 "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
             },
         )
-        dataset = prepare_dataset(args)
-        config = build_config(args)
-        write_json(args.output_dir / "dataset.json", dataset)
-        write_json(args.output_dir / "config.json", config)
-        if args.prepare_only:
-            write_json(
-                args.output_dir / "result.json",
-                {
-                    "status": "prepared",
-                    "mode": args.mode,
-                    "training_executed": False,
-                },
-            )
-            print("PREPARED: tokenizer, exact prompt lengths, context budget and config only; E2E not executed.")
-            return
-        run_training(args, dataset, config)
-        print(f"PASSED: {args.output_dir / 'result.json'}", flush=True)
+        run(args)
     except BaseException as error:
-        events_path = args.output_dir / "events.jsonl"
-        if events_path.exists() and events_path.stat().st_size:
+        completed = any(
+            path.exists() and path.stat().st_size
+            for path in (args.output_dir / "responses.jsonl", args.output_dir / "metrics.jsonl")
+        )
+        if completed:
             write_json(
                 args.output_dir / "failure.json",
-                {
-                    "status": "failed",
-                    "mode": args.mode,
-                    "error": repr(error),
-                    "traceback": traceback.format_exc(),
-                    "completed_stages": "See events.jsonl; partial results are not a passed E2E test.",
-                },
+                {"status": "failed", "error": repr(error), "traceback": traceback.format_exc()},
             )
-            print(f"FAILED: partial stage evidence retained in {args.output_dir}", file=sys.stderr, flush=True)
+            print(f"FAILED: partial results retained in {args.output_dir}", file=sys.stderr, flush=True)
         else:
             shutil.rmtree(args.output_dir)
-            print(
-                "FAILED before any rollout/training stage completed; removed failed output directory.", file=sys.stderr
-            )
+            print("FAILED before any rollout/step completed; removed failed output directory.", file=sys.stderr)
         raise
 
 

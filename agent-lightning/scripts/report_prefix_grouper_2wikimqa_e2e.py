@@ -167,18 +167,18 @@ def _require_float(record: Record, key: str, context: str) -> float:
     return value
 
 
-def _require_mode_record(record: Record, *, record_type: str, mode: str, context: str) -> None:
+def _require_mode_record(record: Record, *, record_type: str, mode: str, context: str, benchmark_id: str) -> None:
     if record.get("record_type") != record_type:
         raise ValueError(f"{context} has unexpected record_type {record.get('record_type')!r}.")
     if record.get("schema_version") != RESULT_SCHEMA_VERSION:
         raise ValueError(f"{context} does not use result schema {RESULT_SCHEMA_VERSION}.")
-    if record.get("benchmark_id") != BENCHMARK_ID:
-        raise ValueError(f"{context} is not a {BENCHMARK_ID} artifact.")
+    if record.get("benchmark_id") != benchmark_id:
+        raise ValueError(f"{context} is not a {benchmark_id} artifact.")
     if record_type == "step" and record.get("mode") != mode:
         raise ValueError(f"{context} has mode {record.get('mode')!r}; expected {mode!r}.")
 
 
-def load_artifacts(directory: Path, expected_mode: str) -> RunArtifacts:
+def load_artifacts(directory: Path, expected_mode: str, *, benchmark_id: str = BENCHMARK_ID) -> RunArtifacts:
     """Load one mode and enforce the maintained result schema."""
     resolved = directory.resolve()
     metrics_path = resolved / "metrics.jsonl"
@@ -192,7 +192,9 @@ def load_artifacts(directory: Path, expected_mode: str) -> RunArtifacts:
     if len(run_records) != 1:
         raise ValueError(f"{metrics_path} must contain exactly one run record; found {len(run_records)}.")
     run = run_records[0]
-    _require_mode_record(run, record_type="run", mode=expected_mode, context=str(metrics_path))
+    _require_mode_record(
+        run, record_type="run", mode=expected_mode, context=str(metrics_path), benchmark_id=benchmark_id
+    )
     if run.get("mode") != expected_mode:
         raise ValueError(f"{metrics_path} has mode {run.get('mode')!r}; expected {expected_mode!r}.")
 
@@ -204,7 +206,13 @@ def load_artifacts(directory: Path, expected_mode: str) -> RunArtifacts:
     if global_steps != list(range(1, expected_steps + 1)):
         raise ValueError(f"{metrics_path} has non-contiguous global steps: {global_steps}")
     for index, record in enumerate(ordered_steps, start=1):
-        _require_mode_record(record, record_type="step", mode=expected_mode, context=f"{metrics_path} step {index}")
+        _require_mode_record(
+            record,
+            record_type="step",
+            mode=expected_mode,
+            context=f"{metrics_path} step {index}",
+            benchmark_id=benchmark_id,
+        )
         if record.get("backend") != run.get("backend"):
             raise ValueError(f"{metrics_path} step {index} backend does not match its run record.")
 
@@ -215,6 +223,7 @@ def load_artifacts(directory: Path, expected_mode: str) -> RunArtifacts:
             record_type="rollout",
             mode=expected_mode,
             context=f"{responses_path} record {index}",
+            benchmark_id=benchmark_id,
         )
     expected_responses = (
         expected_steps
@@ -229,11 +238,13 @@ def load_artifacts(directory: Path, expected_mode: str) -> RunArtifacts:
     return RunArtifacts(resolved, metrics_path, responses_path, run, ordered_steps, responses)
 
 
-def validate_comparable(baseline: RunArtifacts, prefix: RunArtifacts) -> dict[str, Any]:
+def validate_comparable(
+    baseline: RunArtifacts, prefix: RunArtifacts, *, comparable_run_fields: tuple[str, ...] = COMPARABLE_RUN_FIELDS
+) -> dict[str, Any]:
     """Reject a comparison unless every controlled run field matches."""
     mismatches: dict[str, dict[str, Any]] = {}
     invariants: dict[str, Any] = {}
-    for field in COMPARABLE_RUN_FIELDS:
+    for field in comparable_run_fields:
         baseline_value = baseline.run.get(field)
         prefix_value = prefix.run.get(field)
         if baseline_value != prefix_value:
@@ -420,9 +431,11 @@ def _response_length_summary(records: list[Record], path: Path) -> Record:
     }
 
 
-def build_report(baseline: RunArtifacts, prefix: RunArtifacts) -> Record:
+def build_report(
+    baseline: RunArtifacts, prefix: RunArtifacts, *, comparable_run_fields: tuple[str, ...] = COMPARABLE_RUN_FIELDS
+) -> Record:
     """Build a comparison report after strict equivalence checks."""
-    invariants = validate_comparable(baseline, prefix)
+    invariants = validate_comparable(baseline, prefix, comparable_run_fields=comparable_run_fields)
     baseline_metric_names = _metric_names(baseline.steps)
     prefix_metric_names = _metric_names(prefix.steps)
     common_metric_names = sorted(baseline_metric_names & prefix_metric_names)
@@ -454,7 +467,7 @@ def build_report(baseline: RunArtifacts, prefix: RunArtifacts) -> Record:
     wall_prefix = _require_float(prefix.run, "wall_seconds", str(prefix.metrics_path))
     return {
         "schema_version": 1,
-        "benchmark_id": BENCHMARK_ID,
+        "benchmark_id": invariants["benchmark_id"],
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "comparison_valid": True,
         "sources": {
@@ -556,16 +569,18 @@ def render_markdown(report: Record) -> str:
         if response_limit is None
         else f"输出最多 {response_limit} tokens（同时受模型上下文约束）"
     )
+    if invariants["response_policy"] == "exact-tokens":
+        response_description = f"输出精确 {response_limit} tokens（忽略 EOS，禁止提前停止）"
     lines = [
-        "# PrefixGrouper 2WikiMQA 训练端到端基准报告",
+        f"# PrefixGrouper {invariants['dataset']} 训练端到端基准报告",
         "",
-        f"- Benchmark ID：`{BENCHMARK_ID}`",
+        f"- Benchmark ID：`{report['benchmark_id']}`",
         f"- 后端：`{invariants['backend']}`；设备：`{invariants['device_name']}`",
         f"- 模型：`{invariants['model_name']}`（来源：`{invariants['model_ref']}`；本地：`{invariants['model_path']}`）",
         f"- 数据：`{invariants['dataset']}`，{invariants['dataset_rows']} rows",
         f"- 输入：原始 prompt 范围 {prompt_range} tokens；{response_description}",
         f"- Steps：{invariants['steps']}；steady-state 排除 step 1",
-        f"- 比较条件校验：通过（{len(COMPARABLE_RUN_FIELDS)} 个受控字段一致）",
+        f"- 比较条件校验：通过（{len(invariants)} 个受控字段一致）",
         "",
         "## 整次运行",
         "",
@@ -605,7 +620,7 @@ def render_markdown(report: Record) -> str:
         "| 指标 | Baseline mean | PrefixGrouper mean | 差值 |",
         "|---|---:|---:|---:|",
     ]
-    for metric, display_name in (("reward", "2WikiMQA F1"), ("exact_reward", "Exact match")):
+    for metric, display_name in (("reward", f"{invariants['dataset']} F1"), ("exact_reward", "Exact match")):
         item = quality_metrics[metric]
         lines.append(
             f"| {display_name} | {_format_number(cast(Record, item['baseline'])['mean'])} | "
