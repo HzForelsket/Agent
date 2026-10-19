@@ -6,6 +6,12 @@
 `response_token_ids`、实际 token 数和 `finish_reason`。
 采集仍是一次模型调用完成一条单轮问答，不改变训练或采样逻辑。
 
+诊断训练侧共享开销时，在正式入口的 `--mode prefix_grouper` 命令中增加
+`--prefix-timing`（默认关闭）。old/reference log-prob 与 actor update 的分项写入
+`metrics.jsonl`，比较报告增加 host / device event 区间 / calls 表。
+详细计时口径及限制见 [固定长度入口说明](FIXED_LENGTH_E2E.md)。
+开启计时会增加 event、hook 及 batch 末等待开销，正式速度比较应关闭该参数。
+
 统计脚本只需 Python 标准库，不启动模型。下面的 `G` 必须换成采集时
 `--rollouts-per-sample` 的值；输入选择同一次运行的 responses 文件。
 独立基线与共享估计使用完全相同的样本，无需再生成一批共享样本。

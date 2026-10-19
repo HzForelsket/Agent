@@ -65,6 +65,24 @@ conda run -n agent --no-capture-output python scripts/test_fixed_length_e2e.py \
 可用 `--steps` 限制训练步数。NPU 训练只可在另一台有真实可用 NPU 的机器执行，
 沿用 Wiki 的固定软件栈；本工作区不运行 NPU 端到端训练。
 
+在 `simple` 命令中增加 `--prefix-timing`，记录共享前缀操作的诊断耗时；默认关闭。
+Wiki 入口的 `--mode prefix_grouper` 支持同一参数。
+指标写入现有 `metrics.jsonl`，前缀为
+`prefix_timing/{old_log_prob|ref|update_actor}/{forward|backward}/...`；报告增加分项表。
+例如 `forward/qkv_ungroup/host_s`、`forward/prefix_repeat/device_interval_s`、
+`forward/LinearUngroupFunction/calls`、`backward/LinearUngroupFunction/calls`。
+自定义 Function 的类名来自 worker 实际导入的 PrefixGrouper，
+便于核对两台机器执行的是哪种拆分实现；类级区间包含在对应的上层操作区间内。
+
+每项记录 host 秒数、设备 event 区间秒数和调用次数，按 step 累加微批与 PPO iteration，
+再取 DP rank 均值。forward 包括 checkpoint 重算；backward 分项仅覆盖 PrefixGrouper
+自定义 Function，不覆盖内置 repeat/cat 和 attention 的完整反向。
+`model_and_logits` 是包含模型与输出处理的总区间，`group_metadata` 与 `logits_split`
+也包含子项，不可逐行相加。device event 区间包含 stream 等待和主机下发空隙，
+不等于纯 kernel 执行时间，也不能与 host 时间相加。
+不在每个操作后同步，仅在 engine batch 末等待已记录的 event；读取和等待时间单列为
+`prefix_timing/{stage}/event_readback_host_s`。诊断自身会干扰阶段耗时，正式速度比较应关闭此参数。
+
 只准备数据集与配置时增加 `--prepare-only`。此时必须明确给出 `--device gpu|npu`
 和 `--n-devices`，与 Wiki 的 dry-run 一样不探测设备、不加载权重、不启动 Ray。
 

@@ -50,6 +50,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tensor-parallel-size", type=int, help="Defaults to --n-devices.")
     parser.add_argument("--n-runners", type=int, default=16)
     parser.add_argument("--device", choices=("auto", "gpu", "npu"), default="auto")
+    parser.add_argument(
+        "--prefix-timing", action="store_true", help="Record shared-prefix operation timings in simple mode."
+    )
     parser.add_argument("--seed", type=int, default=20260827)
     parser.add_argument("--output-dir", type=Path, required=True, help="New run directory; never overwrites a run.")
     parser.add_argument("--prepare-only", action="store_true")

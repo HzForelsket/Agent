@@ -494,6 +494,8 @@ def build_config(
         config["actor_rollout_ref"]["model"]["override_config"][
             "prefix_grouper_npu_backend"
         ] = args.npu_attention_backend
+        if args.prefix_timing:
+            config["actor_rollout_ref"]["model"]["override_config"]["prefix_grouper_timing"] = True
     return config
 
 
@@ -503,6 +505,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("baseline", "prefix_grouper"), required=True)
     parser.add_argument("--device", choices=("auto", "gpu", "cuda", "npu"), default="auto")
     parser.add_argument("--npu-attention-backend", choices=("fusion", "custom"), default="fusion")
+    parser.add_argument(
+        "--prefix-timing", action="store_true", help="Record diagnostic shared-prefix operation timings (PG mode)."
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Pretrained model ID or local model directory.")
     parser.add_argument(
         "--model-name",
@@ -698,6 +703,7 @@ def run_benchmark(
         "mode": args.mode,
         "backend": runtime.backend,
         "npu_attention_backend": args.npu_attention_backend if args.mode == "prefix_grouper" else None,
+        "prefix_timing_enabled": args.mode == "prefix_grouper" and args.prefix_timing,
         "device_name": runtime.device_name(),
         "started_at": started_at,
         "wall_seconds": time.perf_counter() - started,

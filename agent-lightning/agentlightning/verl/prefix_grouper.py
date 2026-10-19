@@ -26,10 +26,12 @@ from verl.models.transformers.monkey_patch import apply_prefix_grouper_patch as 
 from verl.trainer.ppo import prefix_grouper_utils as _verl_prefix_grouper_utils
 from verl.trainer.ppo.prefix_grouper_utils import build_position_ids_for_prefix_grouper, pg_forward
 from verl.utils import tensordict_utils as tu
-from verl.utils.torch_functional import logprobs_from_logits_v2
 from verl.utils.device import get_device_id, get_device_name
+from verl.utils.torch_functional import logprobs_from_logits_v2
 from verl.workers.engine.fsdp import FSDPEngineWithLMHead
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
+
+from .prefix_grouper_timing import PrefixTiming, install_prefix_timing_hooks, measure_prefix, timed_prefix
 
 __all__ = [
     "PrefixGrouperActorRolloutRefWorker",
@@ -211,33 +213,35 @@ def _sdpa_prefix_grouper_wrapper(original_fn):
                 raise ValueError("Custom shared-prefix attention does not support sliding-window attention.")
             if kwargs.get("softcap") not in (None, 0.0) or not kwargs.get("is_causal", True):
                 raise ValueError("Custom shared-prefix attention requires causal attention without softcap.")
-            return _npu_compact_attention(
-                prefix_grouper, query, key, value, dropout=dropout, scaling=scaling
-            ), None
+            return _npu_compact_attention(prefix_grouper, query, key, value, dropout=dropout, scaling=scaling), None
 
         def attention_forward(inner_query, inner_key, inner_value, padding_mask, *_args, **_kwargs):
-            inner_key = _repeat_kv(inner_key, inner_query.shape[1])
-            inner_value = _repeat_kv(inner_value, inner_query.shape[1])
-            causal_mask = _causal_sdpa_mask(padding_mask, inner_query.shape[2], inner_key.shape[2])
+            with measure_prefix("forward/kv_head_expand"):
+                inner_key = _repeat_kv(inner_key, inner_query.shape[1])
+                inner_value = _repeat_kv(inner_value, inner_query.shape[1])
+            with measure_prefix("forward/causal_mask"):
+                causal_mask = _causal_sdpa_mask(padding_mask, inner_query.shape[2], inner_key.shape[2])
             scale = float(scaling) if scaling is not None else inner_query.shape[-1] ** -0.5
-            if inner_query.device.type == "npu":
-                return _npu_bnsd_attention(
+            attention_name = "prefix_attention" if inner_query.shape[0] == query.shape[0] else "suffix_attention"
+            with measure_prefix(f"forward/{attention_name}"):
+                if inner_query.device.type == "npu":
+                    return _npu_bnsd_attention(
+                        inner_query,
+                        inner_key,
+                        inner_value,
+                        causal_mask,
+                        dropout=dropout,
+                        scaling=scale,
+                    )
+                output = torch.nn.functional.scaled_dot_product_attention(
                     inner_query,
                     inner_key,
                     inner_value,
-                    causal_mask,
-                    dropout=dropout,
-                    scaling=scale,
+                    attn_mask=causal_mask,
+                    dropout_p=dropout,
+                    scale=scale,
                 )
-            output = torch.nn.functional.scaled_dot_product_attention(
-                inner_query,
-                inner_key,
-                inner_value,
-                attn_mask=causal_mask,
-                dropout_p=dropout,
-                scale=scale,
-            )
-            return output.transpose(1, 2).contiguous()
+                return output.transpose(1, 2).contiguous()
 
         return prefix_grouper.forward(attention_forward, query, key, value), None
 
@@ -251,13 +255,15 @@ def _batch_repeat_cat_without_device_scalar(
     cat_dim: int,
 ) -> torch.Tensor:
     """Repeat prefixes without asking the accelerator to infer a data-dependent shape."""
-    repeated_prefix = torch.repeat_interleave(
-        prefix,
-        self.num_samples.to(prefix.device),
-        dim=0,
-        output_size=suffix.shape[0],
-    )
-    return torch.cat((repeated_prefix, suffix), dim=cat_dim)
+    with measure_prefix("forward/prefix_repeat"):
+        repeated_prefix = torch.repeat_interleave(
+            prefix,
+            self.num_samples.to(prefix.device),
+            dim=0,
+            output_size=suffix.shape[0],
+        )
+    with measure_prefix("forward/prefix_suffix_cat"):
+        return torch.cat((repeated_prefix, suffix), dim=cat_dim)
 
 
 def apply_prefix_grouper_patch() -> None:
@@ -283,31 +289,42 @@ def build_prefix_grouper(
     device: torch.device,
 ) -> PrefixGrouper:
     """Build shape metadata on CPU and move each cached tensor to the accelerator once."""
-    prefix_grouper = PrefixGrouper.from_ungrouped_masks(
-        prefix_mask=prefix_mask.detach().cpu(),
-        suffix_mask=suffix_mask.detach().cpu(),
-        group_sizes=group_sizes,
-        padding_mode="right",
-        device=torch.device("cpu"),
-    )
+    with measure_prefix("forward/group_masks_to_cpu"):
+        prefix_mask_cpu = prefix_mask.detach().cpu()
+        suffix_mask_cpu = suffix_mask.detach().cpu()
+    with measure_prefix("forward/group_metadata_cpu"):
+        prefix_grouper = PrefixGrouper.from_ungrouped_masks(
+            prefix_mask=prefix_mask_cpu,
+            suffix_mask=suffix_mask_cpu,
+            group_sizes=group_sizes,
+            padding_mode="right",
+            device=torch.device("cpu"),
+        )
 
-    # Compute packing maps on the host once per batch, not inside each attention layer.
-    compact_indices = prefix_grouper.padding_mask.flatten().nonzero(as_tuple=True)[0]
-    restore_indices = torch.full((prefix_grouper.padding_mask.numel(),), compact_indices.numel(), dtype=torch.int64)
-    restore_indices[compact_indices] = torch.arange(compact_indices.numel(), dtype=torch.int64)
-    prefix_grouper.group_info.compact_indices = compact_indices
-    prefix_grouper.group_info.restore_indices = restore_indices
+        # Compute packing maps on the host once per batch, not inside each attention layer.
+        compact_indices = prefix_grouper.padding_mask.flatten().nonzero(as_tuple=True)[0]
+        restore_indices = torch.full((prefix_grouper.padding_mask.numel(),), compact_indices.numel(), dtype=torch.int64)
+        restore_indices[compact_indices] = torch.arange(compact_indices.numel(), dtype=torch.int64)
+        prefix_grouper.group_info.compact_indices = compact_indices
+        prefix_grouper.group_info.restore_indices = restore_indices
 
-    moved_tensors: dict[int, torch.Tensor] = {}
-    for name, value in vars(prefix_grouper.group_info).items():
-        if not torch.is_tensor(value):
-            continue
-        moved = moved_tensors.get(id(value))
-        if moved is None:
-            moved = value.to(device)
-            moved_tensors[id(value)] = moved
-        setattr(prefix_grouper.group_info, name, moved)
+    with measure_prefix("forward/group_metadata_to_device"):
+        moved_tensors: dict[int, torch.Tensor] = {}
+        for name, value in vars(prefix_grouper.group_info).items():
+            if not torch.is_tensor(value):
+                continue
+            moved = moved_tensors.get(id(value))
+            if moved is None:
+                moved = value.to(device)
+                moved_tensors[id(value)] = moved
+            setattr(prefix_grouper.group_info, name, moved)
     return prefix_grouper
+
+
+# These wrappers preserve the existing implementation and include CPU metadata
+# creation, CPU/device transfers and nested-tensor restoration in their ranges.
+build_prefix_grouper = timed_prefix("forward/group_metadata", build_prefix_grouper)
+build_position_ids_for_prefix_grouper = timed_prefix("forward/position_ids", build_position_ids_for_prefix_grouper)
 
 
 def _check_verl_version() -> None:
@@ -375,6 +392,9 @@ def _response_values_to_nested(
     return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
 
 
+_response_values_to_nested = timed_prefix("forward/restore_nested", _response_values_to_nested)
+
+
 def forward_with_prefix_grouper(
     micro_batch: TensorDict | dict[str, Any],
     model: torch.nn.Module,
@@ -395,46 +415,49 @@ def forward_with_prefix_grouper(
     if "multi_modal_inputs" in micro_batch:
         return None
 
-    prompts = micro_batch["prompts"]
-    responses = micro_batch["responses"]
-    response_mask = micro_batch["response_mask"].bool()
-    input_ids = micro_batch["input_ids"]
+    with measure_prefix("forward/batch_prepare"):
+        prompts = micro_batch["prompts"]
+        responses = micro_batch["responses"]
+        response_mask = micro_batch["response_mask"].bool()
+        input_ids = micro_batch["input_ids"]
 
-    if prompts.is_nested or responses.is_nested:
-        raise ValueError("PrefixGrouper requires the padded prompts and responses retained by VERL 0.9.")
+        if prompts.is_nested or responses.is_nested:
+            raise ValueError("PrefixGrouper requires the padded prompts and responses retained by VERL 0.9.")
 
-    if "attention_mask" in micro_batch and not micro_batch["attention_mask"].is_nested:
-        attention_mask = micro_batch["attention_mask"].bool()
-        prompt_mask = attention_mask[:, : prompts.shape[1]]
-        suffix_mask = attention_mask[:, prompts.shape[1] :]
-    else:
-        pad_token_id = int(tu.get_non_tensor_data(micro_batch, "pad_token_id", 0))
-        prompt_mask = prompts.ne(pad_token_id)
-        suffix_mask = responses.ne(pad_token_id)
-    if suffix_mask.shape != responses.shape or response_mask.shape != responses.shape:
-        raise ValueError("PrefixGrouper requires response IDs, attention mask and response mask to have equal shapes.")
-    if (response_mask & ~suffix_mask).any():
-        raise ValueError("PrefixGrouper response_mask cannot select padded suffix positions.")
-    group_ids = (
-        tu.get(micro_batch, "prefix_group_id")
-        if isinstance(micro_batch, TensorDict)
-        else micro_batch.get("prefix_group_id")
-    )
-    if group_ids is None or len(group_ids) != prompts.shape[0]:
-        raise ValueError("PrefixGrouper requires one verified prefix_group_id per sample from the data daemon.")
-    grouped: OrderedDict[int, list[int]] = OrderedDict()
-    for row, group_id in enumerate(group_ids):
-        grouped.setdefault(int(group_id), []).append(row)
-    groups = list(grouped.values())
-    if all(len(group) == 1 for group in groups):
-        return None
+        if "attention_mask" in micro_batch and not micro_batch["attention_mask"].is_nested:
+            attention_mask = micro_batch["attention_mask"].bool()
+            prompt_mask = attention_mask[:, : prompts.shape[1]]
+            suffix_mask = attention_mask[:, prompts.shape[1] :]
+        else:
+            pad_token_id = int(tu.get_non_tensor_data(micro_batch, "pad_token_id", 0))
+            prompt_mask = prompts.ne(pad_token_id)
+            suffix_mask = responses.ne(pad_token_id)
+        if suffix_mask.shape != responses.shape or response_mask.shape != responses.shape:
+            raise ValueError(
+                "PrefixGrouper requires response IDs, attention mask and response mask to have equal shapes."
+            )
+        if (response_mask & ~suffix_mask).any():
+            raise ValueError("PrefixGrouper response_mask cannot select padded suffix positions.")
+        group_ids = (
+            tu.get(micro_batch, "prefix_group_id")
+            if isinstance(micro_batch, TensorDict)
+            else micro_batch.get("prefix_group_id")
+        )
+        if group_ids is None or len(group_ids) != prompts.shape[0]:
+            raise ValueError("PrefixGrouper requires one verified prefix_group_id per sample from the data daemon.")
+        grouped: OrderedDict[int, list[int]] = OrderedDict()
+        for row, group_id in enumerate(group_ids):
+            grouped.setdefault(int(group_id), []).append(row)
+        groups = list(grouped.values())
+        if all(len(group) == 1 for group in groups):
+            return None
 
-    order, inverse_order = _group_order(groups, prompts.device)
-    representatives = torch.tensor([group[0] for group in groups], dtype=torch.long, device=prompts.device)
-    prefix_ids = prompts.index_select(0, representatives)
-    prefix_mask = prompt_mask.index_select(0, representatives)
-    ordered_responses = responses.index_select(0, order)
-    ordered_suffix_mask = suffix_mask.index_select(0, order)
+        order, inverse_order = _group_order(groups, prompts.device)
+        representatives = torch.tensor([group[0] for group in groups], dtype=torch.long, device=prompts.device)
+        prefix_ids = prompts.index_select(0, representatives)
+        prefix_mask = prompt_mask.index_select(0, representatives)
+        ordered_responses = responses.index_select(0, order)
+        ordered_suffix_mask = suffix_mask.index_select(0, order)
 
     prefix_grouper = build_prefix_grouper(
         prefix_mask=prefix_mask,
@@ -467,12 +490,13 @@ def forward_with_prefix_grouper(
         entropy_fn=entropy_fn,
     )
 
-    log_probs = log_probs.masked_fill(~grouped_suffix_mask.bool(), 0).index_select(0, inverse_order)
-    if entropy is not None:
-        entropy = entropy.masked_fill(~grouped_suffix_mask.bool(), 0).index_select(0, inverse_order)
+    with measure_prefix("forward/restore_order"):
+        log_probs = log_probs.masked_fill(~grouped_suffix_mask.bool(), 0).index_select(0, inverse_order)
+        if entropy is not None:
+            entropy = entropy.masked_fill(~grouped_suffix_mask.bool(), 0).index_select(0, inverse_order)
 
-    prompt_lengths = prompt_mask.sum(dim=-1)
-    suffix_lengths = suffix_mask.sum(dim=-1)
+        prompt_lengths = prompt_mask.sum(dim=-1)
+        suffix_lengths = suffix_mask.sum(dim=-1)
     output = {
         "log_probs": _response_values_to_nested(
             log_probs,
@@ -489,6 +513,33 @@ def forward_with_prefix_grouper(
             suffix_lengths=suffix_lengths,
         )
     return output
+
+
+def _timed_forward_backward_batch(
+    engine: FSDPEngineWithLMHead, data: TensorDict, loss_function: Any, forward_only: bool = False
+) -> dict[str, Any]:
+    timing = PrefixTiming(torch.device(get_device_name(), get_device_id()))
+    with timing.activate():
+        output = FSDPEngineWithLMHead.forward_backward_batch(engine, data, loss_function, forward_only)
+    # One value per local batch. VERL gathers these lists across DP ranks; unlike
+    # per-micro-batch loss metrics these are already summed over micro-batches.
+    output["metrics"].update({key: [value] for key, value in timing.finish().items()})
+    return output
+
+
+_TIMING_PATCHED = False
+
+
+def _install_timing_hooks() -> None:
+    global _TIMING_PATCHED, pg_forward
+    if _TIMING_PATCHED:
+        return
+    install_prefix_timing_hooks(PrefixGrouper)
+    pg_forward = timed_prefix("forward/model_and_logits", pg_forward)
+    _verl_prefix_grouper_utils.logprobs_from_logits = timed_prefix(
+        "forward/log_probs", _verl_prefix_grouper_utils.logprobs_from_logits
+    )
+    _TIMING_PATCHED = True
 
 
 def _prefix_grouper_forward_step(
@@ -599,6 +650,12 @@ class PrefixGrouperTrainingWorker(TrainingWorker):
         if not isinstance(self.engine, FSDPEngineWithLMHead):
             raise TypeError(f"Expected FSDPEngineWithLMHead, found {type(self.engine).__name__}.")
         self.engine.forward_step = MethodType(_prefix_grouper_forward_step, self.engine)
+        if getattr(hf_config, "prefix_grouper_timing", False):
+            _install_timing_hooks()
+            self.engine.forward_backward_batch = MethodType(_timed_forward_backward_batch, self.engine)
+            self.engine.compute_entropy_from_logits = timed_prefix(
+                "forward/entropy", self.engine.compute_entropy_from_logits
+            )
 
 
 class PrefixGrouperActorRolloutRefWorker(ActorRolloutRefWorker):

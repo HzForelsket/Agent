@@ -459,6 +459,9 @@ def build_report(
                 _require_int(record, "global_step", str(baseline.metrics_path)) for record in baseline_steps
             ],
             "metrics": compare_summaries(baseline_summary, prefix_summary),
+            "prefix_timing": _summarize_steps(
+                prefix_steps, sorted(metric for metric in prefix_metric_names if metric.startswith("prefix_timing/"))
+            ),
         }
 
     baseline_responses = _response_summary(baseline.responses, baseline.responses_path)
@@ -470,6 +473,7 @@ def build_report(
         "benchmark_id": invariants["benchmark_id"],
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "comparison_valid": True,
+        "prefix_timing_enabled": prefix.run.get("prefix_timing_enabled", False),
         "sources": {
             "baseline_metrics": str(baseline.metrics_path),
             "baseline_responses": str(baseline.responses_path),
@@ -502,6 +506,11 @@ def build_report(
             "steady_state excludes global step 1 as warmup and includes every remaining step",
             "speedup uses baseline/prefix for lower-is-better metrics and prefix/baseline for higher-is-better metrics",
             "the report preserves raw measurements and does not by itself prove hardware correctness or causality",
+            "prefix_timing values sum micro-batches and PPO iterations per step, then average over DP ranks",
+            "prefix_timing forward includes checkpoint recomputation; nested ranges are inclusive and cannot be summed",
+            "backward operation rows cover PrefixGrouper custom Functions, not all built-in or attention backward",
+            "device intervals include stream stalls and CPU submission gaps, not only kernel execution",
+            "prefix timing instrumentation perturbs stage timings; use uninstrumented runs for speed comparisons",
         ],
     }
 
@@ -649,6 +658,46 @@ def render_markdown(report: Record) -> str:
             f"| {mode} | {length_summary['truncated_count']} / {stats['count']} | "
             f"{length_summary['truncation_rate']:.2%} | {values} |"
         )
+    if report["prefix_timing_enabled"]:
+        lines.extend(
+            [
+                "",
+                "## 共享前缀操作计时（诊断）",
+                "",
+                "每 step 累加 micro-batch / PPO iteration 后取 DP rank 均值；forward 包括 checkpoint 重算。",
+                "host_s 是主机区间，device_interval_s 是 event 区间（含 stream 等待和主机下发空隙），两者不能相加。",
+                "model_and_logits、group_metadata、logits_split 等含嵌套子项，各行也不能直接相加。",
+                "backward 分项覆盖 PrefixGrouper 自定义 Function；不包含内置 repeat/cat、attention 等完整反向。",
+                "attention、log_probs、entropy 是计算对照项；分项数值不等于相对 baseline 的净开销。",
+                "开启诊断会增加 event、hook 和 batch 末等待开销；加速比应使用未开启诊断的运行。",
+            ]
+        )
+        for window in ("all_steps", "steady_state"):
+            timings = report["windows"][window].get("prefix_timing", {})
+            if not timings:
+                continue
+            lines.extend(
+                [
+                    "",
+                    f"### {window}",
+                    "",
+                    "| 阶段 / 操作 | host (s/step) | device interval (s/step) | calls/step |",
+                    "|---|---:|---:|---:|",
+                ]
+            )
+            roots = sorted(
+                key.removesuffix("/calls") for key in timings if key.endswith("/calls") and timings[key]["max"] > 0
+            )
+            for root in roots:
+                values = [
+                    timings.get(f"{root}/{field}", {}).get("mean") for field in ("host_s", "device_interval_s", "calls")
+                ]
+                lines.append(
+                    f"| {root.removeprefix('prefix_timing/')} | " + " | ".join(_format_number(v) for v in values) + " |"
+                )
+            for key, stats in sorted(timings.items()):
+                if key.endswith("event_readback_host_s"):
+                    lines.append(f"\n`{key}`（batch 末等待及 event 读取）：{_format_number(stats['mean'])} s/step。")
     lines.extend(
         [
             "",

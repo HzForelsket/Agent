@@ -11,7 +11,7 @@ import sys
 from contextlib import contextmanager
 from copy import deepcopy
 from pprint import pprint
-from typing import Dict, Tuple, Type
+from typing import Any, Dict, Tuple, Type
 
 import numpy as np
 import torch
@@ -33,8 +33,10 @@ from verl.trainer.ppo.ray_trainer import (
     compute_advantage,
     compute_response_mask,
 )
+from verl.utils import tensordict_utils as tu
 from verl.utils.metric import reduce_metrics
 from verl.utils.tracking import Tracking
+from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 from agentlightning.adapter import TraceAdapter, TraceToTripletBase
 from agentlightning.llm_proxy import LLMProxy
@@ -231,13 +233,60 @@ class AgentLightningTrainer(RayPPOTrainer):
 
     def _compute_reference_log_prob(self, batch: DataProto) -> DataProto:
         """Use VERL 0.9's TensorDict conversion and fused-reference routing."""
+        if self.config.actor_rollout_ref.model.override_config.get("prefix_grouper_timing", False):
+            return self._compute_log_prob_with_prefix_timing(batch, reference=True)[0]
         return super()._compute_ref_log_prob(batch)
+
+    def _compute_old_log_prob(self, batch: DataProto) -> tuple[DataProto, Any]:
+        if self.config.actor_rollout_ref.model.override_config.get("prefix_grouper_timing", False):
+            return self._compute_log_prob_with_prefix_timing(batch, reference=False)
+        return super()._compute_old_log_prob(batch)
+
+    def _compute_log_prob_with_prefix_timing(self, batch: DataProto, *, reference: bool) -> tuple[DataProto, Any]:
+        """Preserve worker diagnostics otherwise discarded by VERL's inference helpers."""
+        batch_td = left_right_2_no_padding(batch.to_tensordict())
+        calculate_sum_pi_squared = not reference and self.config.actor_rollout_ref.actor.get(
+            "calculate_sum_pi_squared", False
+        )
+        metadata = {"calculate_entropy": not reference, "compute_loss": False}
+        if reference and self.ref_in_actor:
+            metadata["no_lora_adapter"] = True
+        if not reference:
+            metadata["calculate_sum_pi_squared"] = calculate_sum_pi_squared
+        tu.assign_non_tensor(batch_td, **metadata)
+        if reference and not self.ref_in_actor:
+            output = self.ref_policy_wg.compute_ref_log_prob(batch_td)
+        else:
+            output = self.actor_rollout_wg.compute_log_prob(batch_td)
+        worker_metrics = tu.get(output, "metrics")
+        stage = "ref" if reference else "old_log_prob"
+        for key, value in worker_metrics.items():
+            if key.startswith("prefix_timing/"):
+                # Each entry is a local-batch total, gathered across DP ranks.
+                self._prefix_timing_metrics[f"prefix_timing/{stage}/{key.removeprefix('prefix_timing/')}"] = float(
+                    np.asarray(value, dtype=float).mean()
+                )
+        log_probs = no_padding_2_padding(tu.get(output, "log_probs"), batch_td).float()
+        if reference:
+            result = {"ref_log_prob": log_probs}
+        else:
+            entropy = no_padding_2_padding(tu.get(output, "entropy"), batch_td)
+            result = {"old_log_probs": log_probs, "entropys": entropy.float()}
+            routed_experts = tu.get(output, "routed_experts")
+            if routed_experts is not None:
+                result["routed_experts"] = routed_experts
+            if calculate_sum_pi_squared:
+                sum_pi_squared = tu.get(output, "sum_pi_squared")
+                if sum_pi_squared is not None:
+                    result["sum_pi_squared"] = no_padding_2_padding(sum_pi_squared, batch_td).float()
+        return DataProto.from_tensordict(tu.get_tensordict(result)), worker_metrics.get("mfu")
 
     def _train_step(self, batch_dict: dict, *, profile_rollout: bool = False) -> dict:
         # Isolate in a separate method to automatically recycle the variables before validation.
         batch: DataProto = DataProto.from_single_dict(batch_dict)
         metrics = {}
         timing_raw = {}
+        self._prefix_timing_metrics = {}
 
         with _timer("step", timing_raw):
 
@@ -450,7 +499,21 @@ class AgentLightningTrainer(RayPPOTrainer):
                     batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                     actor_output = self._update_actor(batch)
                 actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                iterations = (
+                    len(batch)
+                    // (self.config.actor_rollout_ref.actor.ppo_mini_batch_size * rollout_config.n)
+                    * self.config.actor_rollout_ref.actor.ppo_epochs
+                )
+                for key in list(actor_output_metrics):
+                    if key.startswith("actor/prefix_timing/"):
+                        # VERL averages mini-batch metrics; convert the local
+                        # batch totals to a per-step total, averaged over DP.
+                        name = key.removeprefix("actor/prefix_timing/")
+                        self._prefix_timing_metrics[f"prefix_timing/update_actor/{name}"] = (
+                            actor_output_metrics.pop(key) * iterations
+                        )
                 metrics.update(actor_output_metrics)
+            metrics.update(self._prefix_timing_metrics)
 
             # Log rollout generations if enabled
             rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
